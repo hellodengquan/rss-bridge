@@ -474,3 +474,313 @@ Response → 发送给浏览器
 3. **配置驱动启禁**：`enabled_bridges` 配置决定哪些桥接器对外可见，支持通配符 `*`
 4. **实例化延迟**：FrontpageAction/ListAction 遍历时才通过 `BridgeFactory::create()` 实例化，避免不必要的对象创建
 5. **两种暴露方式**：FrontpageAction 渲染 HTML 卡片（仅启用），ListAction 返回 JSON（含未启用的 status 标记）
+
+---
+
+## 补充 A：桥接器加载失败的错误处理和剔除策略
+
+RSS-Bridge 的错误处理策略是**"软失败、可观测、不中断"**——单个桥接器故障不会导致整体服务崩溃，但会通过日志和前端警告暴露出来。
+
+### A.1 配置声明但文件不存在（missingEnabledBridges）
+
+**文件**: `lib/BridgeFactory.php:25-41`
+
+```php
+foreach ($enabledBridges as $enabledBridge) {
+    if ($enabledBridge === '*') {
+        $this->enabledBridges = $this->bridgeClassNames;
+        break;
+    }
+    $bridgeClassName = $this->createBridgeClassName($enabledBridge);
+    if ($bridgeClassName) {
+        $this->enabledBridges[] = $bridgeClassName;
+    } else {
+        // 关键：记录到 missingEnabledBridges，同时打 info 日志
+        $this->missingEnabledBridges[] = $enabledBridge;
+        $this->logger->info(sprintf('Bridge not found: %s', $enabledBridge));
+    }
+}
+```
+
+**处理策略**：
+- 不抛异常、不中断启动流程
+- 将缺失的桥接器名存入 `$this->missingEnabledBridges` 数组
+- 通过 `Logger::info()` 记录到日志（级别为 INFO，生产环境默认不输出）
+
+### A.2 前端页面警告
+
+**文件**: `actions/FrontpageAction.php:22-27`
+
+```php
+foreach ($this->bridgeFactory->getMissingEnabledBridges() as $missingEnabledBridge) {
+    $messages[] = [
+        'body'  => sprintf('Warning : Bridge "%s" not found', $missingEnabledBridge),
+        'level' => 'warning'
+    ];
+}
+```
+
+`$messages` 最终通过模板变量传递到首页顶部，以黄色警告条形式展示给管理员。
+
+### A.3 DisplayAction 请求时的失败场景
+
+**文件**: `actions/DisplayAction.php:21-38`
+
+当用户通过 URL 直接请求某个桥接器时（`?action=display&bridge=Xxx`），会触发三道校验：
+
+| 校验项 | 代码位置 | 失败行为 |
+|--------|----------|----------|
+| bridge 参数是否存在 | 第 25-27 行 | 返回 400 + 错误页 "Missing bridge name parameter" |
+| 桥接器类是否存在（文件系统扫描） | 第 28-31 行 | 返回 404 + 错误页 "Bridge not found" |
+| 桥接器是否在启用列表 | 第 36-38 行 | 返回 400 + 错误页 "This bridge is not whitelisted" |
+
+### A.4 类加载本身的失败（PHP Fatal Error）
+
+**autoloader 层** (`lib/bootstrap.php:29-44`)：只做 `require $file`，不 catch。如果桥接器文件有语法错误或依赖缺失，将触发 PHP Fatal Error，被 `index.php` 中的 `register_shutdown_function` 捕获并记录到错误日志：
+
+```php
+// index.php:47-59
+register_shutdown_function(function () use ($logger) {
+    $error = error_get_last();
+    if ($error) {
+        $logger->error(sprintf('(shutdown) %s: %s in %s line %s', ...));
+    }
+});
+```
+
+**注意**：这是进程级的 shutdown handler，单个桥接器文件语法错误不会导致整个进程崩溃（PHP-FPM 模式下每个请求独立进程），但会让该请求的响应中断。
+
+### A.5 实例化失败
+
+`BridgeFactory::create()` (`lib/BridgeFactory.php:44-47`) 直接 `new $name($cache, $logger)`，没有 try-catch。如果桥接器构造函数抛异常，会冒泡到外层 `ExceptionMiddleware` 处理，渲染异常页面并打 error 日志。
+
+### A.6 ConnectivityAction（调试模式下的健康检查）
+
+**文件**: `actions/ConnectivityAction.php`
+
+仅在 `env=dev` 时可用，可手动检查单个桥接器目标站点的 HTTP 可达性：
+
+```
+?action=connectivity          → 返回 JS 自动探测页面，逐个发起 AJAX
+?action=connectivity&bridge=X → 返回 JSON: {bridge, successful, http_code}
+```
+
+探测逻辑：对 `$bridge::URI` 发起 cURL 请求（超时 5 秒），HTTP 200 视为成功。
+
+---
+
+## 补充 B：桥接器版本兼容性与升级路径
+
+RSS-Bridge 本身没有严格的桥接器版本号体系，兼容性主要通过**基类约束 + 单元测试**来保证。
+
+### B.1 系统版本标识
+
+**文件**: `lib/Configuration.php:10`
+
+```php
+private const VERSION = '2025-08-05';
+```
+
+RSS-Bridge 使用日期格式（`YYYY-MM-DD`）作为版本号，通过 `Configuration::getVersion()` 对外暴露（若检测到 `.git/HEAD` 会附加分支名和 commit 短哈希）。
+
+### B.2 PHP 版本下限
+
+**文件**: `index.php:3-6`
+
+```php
+if (version_compare(\PHP_VERSION, '7.4.0') === -1) {
+    http_response_code(500);
+    exit("RSS-Bridge requires minimum PHP version 7.4\n");
+}
+```
+
+系统启动即硬校验 PHP ≥ 7.4，不满足直接 500 退出。
+
+### B.3 桥接器实现规范测试（BridgeImplementationTest）
+
+**文件**: `tests/BridgeImplementationTest.php`
+
+这是桥接器兼容性的核心防线，覆盖所有 `bridges/*Bridge.php` 文件（通过 `dataBridgesProvider` 用 `glob` 自动枚举）。
+
+#### 测试项一览
+
+| 测试方法 | 校验内容 | 对应代码行 |
+|----------|----------|-----------|
+| `testClassName` | 类名首字母大写、不含空格、以 `Bridge` 结尾 | 17-23 |
+| `testClassType` | 必须是 `BridgeAbstract` 的实例（含 `FeedExpander` 子类） | 28-32 |
+| `testConstants` | `NAME/URI/DESCRIPTION/MAINTAINER` 必须为非空字符串；`PARAMETERS` 必须为数组；`CACHE_TIMEOUT` 必须为 ≥0 的整数 | 37-53 |
+| `testParameters` | 多 context 时 context 名必须为非空字符串；参数 `name` 非空；`type` 只能是 `text/number/list/checkbox`；`list` 类型必须有 `values` 数组；`required` 仅适用于 `text/number`；`pattern/title/exampleValue/defaultValue` 校验 | 58-158 |
+| `testMethodValues` | `getDescription/getMaintainer/getName/getURI/getIcon` 返回值类型及非空 | 163-185 |
+| `testUri` | `URI` 常量和 `getURI()` 返回值必须通过 `FILTER_VALIDATE_URL` | 190-196 |
+
+#### 测试执行方式
+
+```bash
+vendor/bin/phpunit tests/BridgeImplementationTest.php
+```
+
+该测试被 CI workflow (`.github/workflows/tests.yml`) 纳入 PR 检查，任何桥接器新增或修改若不符合规范会直接阻断合并。
+
+### B.4 FeedExpander：桥接器升级兼容基类
+
+**文件**: `lib/FeedExpander.php`
+
+`FeedExpander` 是 `BridgeAbstract` 的子类，专为**已有 RSS/Atom Feed 的扩展增强**场景设计。它是桥接器升级的主要兼容路径——当目标站点本身有 Feed 但需要扩展内容（补全摘要、解析全文、添加图片等），新写法应继承 `FeedExpander` 而非直接继承 `BridgeAbstract`。
+
+```php
+abstract class FeedExpander extends BridgeAbstract
+{
+    // 封装了 Feed 抓取、解析、裁剪逻辑
+    public function collectExpandableDatas(string $url, $maxItems = -1, $headers = [])
+
+    // 子类覆写此方法对每条 item 做转换（默认原样返回）
+    protected function parseItem(array $item) { return $item; }
+
+    // 子类可覆写此方法对原始 XML 做预处理
+    protected function prepareXml(string $xmlString): string
+
+    // Feed 元数据优先取真实解析结果，降级到常量
+    public function getURI()  { return $this->feed['uri']   ?? parent::getURI(); }
+    public function getName() { return $this->feed['title'] ?? parent::getName(); }
+    public function getIcon() { return $this->feed['icon']  ?? parent::getIcon(); }
+}
+```
+
+目前已有 **大量桥接器通过 `FeedExpander` 实现**（搜索 `extends FeedExpander` 可得数十个），包括 `WordPressBridge`、`TagesschauBridge`、`TheGuardianBridge`、`SubstackBridge` 等主流桥接器。
+
+### B.5 升级兼容策略总结
+
+| 变更场景 | 兼容策略 |
+|----------|----------|
+| 目标站点从无 Feed → 有 Feed | 桥接器可从 `extends BridgeAbstract` 改为 `extends FeedExpander`，接口保持兼容 |
+| 目标站点 Feed 格式变化 | 在 `prepareXml()` 中做 XML 修复，或在 `parseItem()` 中转换字段 |
+| BridgeAbstract 新增抽象方法 | 现有桥接器自动触发测试失败，PR 流水线阻断 |
+| 参数定义规范变更 | `BridgeImplementationTest::testParameters` 自动覆盖，不合规桥接器被标记 |
+| PHP 版本升级 | `index.php` 硬校验 + CI phpunit.xml 中指定版本矩阵 |
+
+**没有**针对单个桥接器的"废弃/Deprecated"标记机制，不兼容的桥接器直接通过测试失败暴露，由维护者在 PR 中修复。
+
+---
+
+## 补充 C：前端列表渲染时的过滤与排序逻辑
+
+### C.1 排序策略
+
+**后端不排序**，完全依赖文件系统顺序。
+
+**排序来源**：`BridgeFactory` 构造时使用 `scandir(__DIR__ . '/../bridges/')`（`lib/BridgeFactory.php:19`）。PHP 的 `scandir()` 按**字母升序**返回目录条目，因此桥接器卡片的默认展示顺序就是文件名的 A-Z 字典序（例如 `ABCNewsBridge` 排在最前，`ZeitBridge` 排在最后）。
+
+```
+bridges/
+  ABCNewsBridge.php      ← 第 1 个
+  ABolaBridge.php        ← 第 2 个
+  ...
+  ZeitBridge.php         ← 最后一个
+```
+
+**注意**：PHP `scandir()` 对大小写敏感，大写字母排在小写字母前面（ASCII 码顺序）。项目中所有桥接器文件名均以大写开头，因此实际表现为标准的字典序。
+
+### C.2 后端无过滤
+
+`FrontpageAction` 只做**启禁过滤**（`isEnabled()` 判断），不做关键字过滤、分类过滤等任何业务过滤。所有启用的桥接器都会渲染到页面，过滤完全由前端 JavaScript 完成。
+
+### C.3 前端实时搜索过滤
+
+**文件**: `static/rss-bridge.js:1-30`
+
+```javascript
+function rssbridge_list_search() {
+    var search = document.getElementById('searchfield').value;
+
+    var bridgeCards = document.querySelectorAll('section.bridge-card');
+    for (var i = 0; i < bridgeCards.length; i++) {
+        var bridgeName        = bridgeCards[i].getAttribute('data-ref');
+        var bridgeShortName   = bridgeCards[i].getAttribute('data-short-name');
+        var bridgeDescription = bridgeCards[i].querySelector('.description');
+        var bridgeUrlElement  = bridgeCards[i].getElementsByTagName('a')[0];
+        var bridgeUrl         = bridgeUrlElement.toString();
+
+        bridgeCards[i].style.display = 'none';          // 默认隐藏
+        if (!bridgeName || !bridgeUrl) { continue; }
+
+        var searchRegex = new RegExp(search, 'i');      // 不区分大小写
+        if (bridgeName.match(searchRegex))        { bridgeCards[i].style.display = 'block'; }
+        if (bridgeShortName.match(searchRegex))   { bridgeCards[i].style.display = 'block'; }
+        if (bridgeDescription.textContent.match(searchRegex)) { bridgeCards[i].style.display = 'block'; }
+        if (bridgeUrl.match(searchRegex))         { bridgeCards[i].style.display = 'block'; }
+    }
+}
+```
+
+#### 过滤字段
+
+| 字段来源 | DOM 位置 | 说明 |
+|----------|----------|------|
+| `data-ref` | `<section class="bridge-card" data-ref="DemoBridge">` | 桥接器显示名称（`$bridge->getName()`） |
+| `data-short-name` | `<section data-short-name="DemoBridge">` | 类短名（ReflectionClass::getShortName()） |
+| `.description` 文本 | `<p class="description">...</p>` | 桥接器描述 |
+| 首个 `<a>` href | `<h2><a href="https://...">...</a></h2>` | 桥接器目标站点 URL |
+
+#### 匹配规则
+- **不区分大小写**（正则 `'i'` 标志）
+- **或关系**：四个字段中任一匹配即显示卡片
+- **支持正则**：直接用用户输入构造 `RegExp`（用户可输入 `github|gitlab` 这类模式）
+- **实时触发**：`onchange` + `onkeyup` 双事件绑定（`templates/frontpage.html.php:15-17`）
+
+#### 搜索框初始化
+
+```php
+// templates/frontpage.html.php
+<script>
+    document.addEventListener('DOMContentLoaded', rssbridge_toggle_bridge);  // URL hash 展开
+    document.addEventListener('DOMContentLoaded', rssbridge_list_search);   // 初始执行一次过滤
+    document.addEventListener('DOMContentLoaded', rssbridge_feed_finder);   // Feed Finder 按钮绑定
+</script>
+```
+
+页面加载完成即执行一次 `rssbridge_list_search()`——此时搜索框为空，`new RegExp('')` 匹配所有内容，因此全部卡片默认显示。
+
+### C.4 锚点跳转与自动展开
+
+**文件**: `static/rss-bridge.js:32-39`
+
+```javascript
+function rssbridge_toggle_bridge() {
+    var fragment = window.location.hash.substr(1);   // 例如 "#bridge-DemoBridge"
+    var bridge = document.getElementById(fragment);
+    if (bridge !== null) {
+        bridge.getElementsByClassName('showmore-box')[0].checked = true;  // 自动勾选展开
+    }
+}
+```
+
+当 URL 带 `#bridge-DemoBridge` 这样的 hash 时（如从搜索引擎点击或管理员分享链接），对应桥接器卡片的 "Show more" 复选框会被自动勾选，展开参数表单区。
+
+### C.5 Feed Finder（URL → 桥接器反向匹配）
+
+**文件**: `static/rss-bridge.js:47-124`
+
+这是与搜索过滤互补的另一种发现方式：用户粘贴一个目标页面 URL，前端调用 `?action=findfeed` 后端接口，后端遍历所有桥接器的 `detectParameters($url)` 方法进行匹配，匹配成功的桥接器以 `.search-result` 卡片渲染在搜索栏下方。
+
+```javascript
+async function rssbridge_feed_search(event) {
+    const input = document.getElementById('searchfield');
+    let baseurl = window.location.protocol + window.location.pathname;
+    let url = baseurl + '?action=findfeed&format=Html&url=' + content;
+    const response = await fetch(url);
+    const data = await response.json();
+    rss_bridge_feed_display_found_feed(data);  // 渲染匹配结果
+}
+```
+
+### C.6 过滤与排序策略总结
+
+| 维度 | 行为 | 实现位置 |
+|------|------|----------|
+| 默认排序 | 按文件名字母升序（A→Z） | `scandir()` 天然顺序 |
+| 自定义排序 | 无任何排序接口 | — |
+| 启禁过滤 | 后端 `isEnabled()` 判断，未启用的桥接器不渲染 | `actions/FrontpageAction.php:31` |
+| 关键字过滤 | 前端 JS，4 字段 OR 正则匹配，不区分大小写 | `static/rss-bridge.js:1-30` |
+| 分类/标签过滤 | 不支持（桥接器无分类体系） | — |
+| URL 反向匹配 | 前端 AJAX + 后端 `detectParameters()` | `?action=findfeed` |
+| 锚点自动展开 | URL `#bridge-Xxx` 自动展开对应卡片 | `static/rss-bridge.js:32-39` |
