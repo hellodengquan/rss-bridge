@@ -784,3 +784,466 @@ async function rssbridge_feed_search(event) {
 | 分类/标签过滤 | 不支持（桥接器无分类体系） | — |
 | URL 反向匹配 | 前端 AJAX + 后端 `detectParameters()` | `?action=findfeed` |
 | 锚点自动展开 | URL `#bridge-Xxx` 自动展开对应卡片 | `static/rss-bridge.js:32-39` |
+
+---
+
+## 补充 D：桥接器请求外部网站的限流与缓存机制
+
+RSS-Bridge 的限流和缓存分为三层：**HTTP 请求层缓存**、**桥接器级缓存**、**Feed 响应层缓存**，每层独立运作、协同生效。
+
+### D.1 限流控制
+
+RSS-Bridge 本身**没有全局请求限流中间件**，但通过以下机制间接实现速率控制：
+
+#### 桥接器缓存超时（CACHE_TIMEOUT）
+
+**文件**: `lib/BridgeAbstract.php:18, 114-117`
+
+```php
+const CACHE_TIMEOUT = 3600;  // 默认 1 小时
+
+public function getCacheTimeout()
+{
+    return static::CACHE_TIMEOUT;
+}
+```
+
+每个桥接器通过 `CACHE_TIMEOUT` 常量声明自己的缓存 TTL（秒）。这是最核心的"限流"手段——同一参数的 Feed 请求在 TTL 内不会重复执行 `collectData()`，从而避免频繁请求目标网站。
+
+各桥接器根据目标站点更新频率自行设定：
+- 高频更新：`Vk2Bridge` 300 秒、`VixenBridge` 60 秒
+- 中频更新：多数桥接器 3600 秒（1 小时）
+- 低频更新：`WarhammerComBridge` 86400 秒（1 天）、`UnsplashBridge` 43200 秒（12 小时）
+
+#### 用户自定义缓存超时
+
+**文件**: `actions/FrontpageAction.php:74-80` + `config.default.ini.php:68`
+
+```ini
+[cache]
+custom_timeout = false   ; 默认关闭
+```
+
+如果 `cache.custom_timeout = true`，前端每个桥接器卡片会多出一个"Cache timeout in seconds"输入框，用户可在请求时通过 `_cache_timeout` 参数自定义单次请求的缓存 TTL。
+
+```php
+// actions/DisplayAction.php:57-62
+$ttl = $request->get('_cache_timeout');
+if (Configuration::getConfig('cache', 'custom_timeout') && isset($ttl)) {
+    $ttl = (int) $ttl;
+} else {
+    $ttl = $bridge->getCacheTimeout();
+}
+```
+
+#### 连接超时与最大文件大小
+
+**文件**: `lib/http.php:71, 94-98, 119-131`
+
+```php
+// 默认配置
+'timeout' => 5,            // HTTP 请求超时 5 秒
+'max_filesize' => null,    // 响应体大小限制
+'max_redirections' => 5,   // 最多 5 次重定向
+```
+
+`max_filesize` 通过 `CURLOPT_MAXFILESIZE`（检查 Content-Length 头）和 `CURLOPT_PROGRESSFUNCTION`（流式传输中实时监控）双重保障，防止目标站点返回超大响应拖垮服务。配置项 `http.max_filesize` 单位为 MB（默认 20）。
+
+### D.2 HTTP 请求层缓存（getContents）
+
+**文件**: `lib/contents.php:36-138`
+
+`getContents()` 是所有桥接器发起 HTTP 请求的标准入口，内置了完整的 HTTP 缓存机制。
+
+#### 缓存 Key 生成
+
+```php
+$cacheKey = implode('_', ['server',  $url, $requestBodyHash]);
+```
+
+Key 由三部分组成：前缀 `server_` + URL + POST body 的 MD5（仅 POST 请求有）。
+
+#### 缓存命中流程
+
+```
+请求进入
+    │
+    ▼
+查 cache_key 是否命中
+    ├─ 命中 → 提取 Last-Modified 和 ETag
+    │          → 加入请求头（If-Modified-Since / If-None-Match）
+    │          → 发请求
+    │              ├─ 304 Not Modified → 直接使用缓存 body
+    │              └─ 200 OK → 更新缓存（TTL 10 天）
+    └─ 未命中 → 直接发请求 → 200 时写入缓存（TTL 10 天）
+```
+
+#### 缓存 TTL 与策略
+
+- **成功响应（200/201/202）**：缓存 10 天（864000 秒），除非响应头 `Cache-Control` 含 `no-cache` / `no-store`
+- **重定向（301/302/303）**：TODO 注释，未实现缓存
+- **304 Not Modified**：复用缓存 body，不更新 TTL
+- **其他状态码**：抛出 `HttpException`，不缓存
+
+注意：这层缓存是**原始 HTTP 响应缓存**，与桥接器的 `CACHE_TIMEOUT` 无关，TTL 固定 10 天（但 HTTP 缓存协商机制会在内容变化时自动刷新）。
+
+### D.3 页面 DOM 缓存（getSimpleHTMLDOMCached）
+
+**文件**: `lib/contents.php:219-251`
+
+桥接器可以调用 `getSimpleHTMLDOMCached($url, $ttl)` 来缓存解析后的 simple_html_dom 对象，默认 TTL 86400 秒（1 天）。
+
+```php
+function getSimpleHTMLDOMCached($url, $ttl = 86400, ...): \simple_html_dom {
+    $cacheKey = 'pages_' . $url;
+    $content = $cache->get($cacheKey);
+    if (!$content) {
+        $content = getContents($url, ...);
+        $cache->set($cacheKey, $content, $ttl);
+    }
+    return str_get_html($content, ...);
+}
+```
+
+这层缓存的 key 前缀是 `pages_`，与 `getContents()` 的 `server_` 前缀不冲突，相当于二级缓存。
+
+### D.4 桥接器内部缓存（loadCacheValue / saveCacheValue）
+
+**文件**: `lib/BridgeAbstract.php:325-333`
+
+桥接器可以通过这两个方法存取自定义缓存数据，Key 会自动加上桥接器短名前缀隔离。
+
+```php
+protected function loadCacheValue(string $key, $default = null)
+{
+    return $this->cache->get($this->getShortName() . '_' . $key, $default);
+}
+
+protected function saveCacheValue(string $key, $value, int $ttl = 86400)
+{
+    $this->cache->set($this->getShortName() . '_' . $key, $value, $ttl);
+}
+```
+
+常用于存储桥接器内部状态，比如 API 访问令牌、分页游标等。
+
+### D.5 Feed 响应层缓存（CacheMiddleware）
+
+**文件**: `middlewares/CacheMiddleware.php`
+
+这是最外层的缓存，对整个 `DisplayAction` 的 HTTP 响应做缓存。
+
+```php
+// 仅对 DisplayAction 生效
+if ($action !== 'DisplayAction') {
+    return $next($request);
+}
+
+$cacheKey = 'http_' . json_encode($request->toArray());
+$cachedResponse = $this->cache->get($cacheKey);
+```
+
+#### 缓存策略
+
+| 响应状态码 | 缓存 TTL | 说明 |
+|-----------|----------|------|
+| 200 | 由桥接器 `CACHE_TIMEOUT` 决定 | DisplayAction 内部已自行缓存，这里做占位 |
+| 400 / 403 / 404 / 429 / 500 / 503 | 5 分钟 + 随机 1~10 分钟 | 错误响应缓存，防止雪崩 |
+| 其他 | 5 分钟 | 兜底 |
+
+额外支持 `If-Modified-Since` 协商缓存，客户端带该头且缓存未过期时返回 304。
+
+#### 缓存清理
+
+每 100 个请求随机触发一次 `$this->cache->prune()`，清理过期的缓存条目。
+
+### D.6 缓存后端实现
+
+**文件**: `caches/` 目录 + `lib/CacheFactory.php`
+
+| 缓存实现 | 文件 | 特点 |
+|---------|------|------|
+| FileCache | `caches/FileCache.php` | 默认，文件系统存储，每个 key 一个文件 |
+| SQLiteCache | `caches/SQLiteCache.php` | SQLite 单文件存储，适合大量小 key |
+| MemcachedCache | `caches/MemcachedCache.php` | 分布式内存缓存 |
+| ArrayCache | `caches/ArrayCache.php` | 进程内数组，调试模式默认使用 |
+| NullCache | `caches/NullCache.php` | 空实现，永不命中 |
+
+通过 `cache.type` 配置切换，默认 `file`。
+
+### D.7 代理与绕过
+
+**文件**: `lib/contents.php:100-102` + `actions/DisplayAction.php:40-48`
+
+可配置全局 HTTP 代理（`proxy.url`），所有 `getContents()` 请求自动走代理。如果 `proxy.by_bridge = true`，每个桥接器卡片会多出一个"Disable proxy"复选框，用户可通过 `_noproxy` 参数单次绕过代理。
+
+---
+
+## 补充 E：用户自定义桥接器的热加载与隔离
+
+需要先明确：**RSS-Bridge 没有正式的"用户自定义桥接器"功能，也没有热加载机制**。所有桥接器都是通过放置在 `bridges/` 目录下的 PHP 文件实现的，属于同一代码池。但可以从以下几个角度理解"自定义"和"隔离"的实践方式。
+
+### E.1 没有热加载，但 PHP 本身是"热"的
+
+由于 RSS-Bridge 是 PHP 程序（无状态、每次请求独立执行），"热加载"的含义与常驻进程框架不同：
+
+- **文件系统级热加载**：往 `bridges/` 目录放入新的 `XxxBridge.php` 文件后，下一个请求就能自动发现并加载它——因为 `BridgeFactory` 每次实例化都会重新 `scandir()` 扫描目录
+- **代码级热加载**：修改已有桥接器文件后，下一个请求会自动加载新代码（PHP-FPM 模式下除非开启了 opcache 且未过期）
+- **无热卸载**：文件删除后桥接器自动消失，但不会影响正在处理中的请求
+
+**关键位置**：`lib/BridgeFactory.php:19-23`
+
+```php
+foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+    if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+        $this->bridgeClassNames[] = $m[1];
+    }
+}
+```
+
+每次请求都会重新扫描目录，这是一种朴素但有效的"热加载"实现。
+
+### E.2 白名单机制：启禁隔离
+
+**文件**: `lib/Configuration.php:46-53`
+
+虽然没有用户级隔离，但可以通过 `whitelist.txt`（旧式）或 `enabled_bridges` 配置实现**桥接器级别的启禁隔离**。
+
+```
+whitelist.txt 内容：
+*                      ← 全部启用
+# 或逐行列出：
+CssSelectorBridge
+FilterBridge
+Youtube
+```
+
+白名单文件与 `config.ini.php` 的关系：白名单文件存在时**覆盖**配置中的 `enabled_bridges`。
+
+### E.3 自定义桥接器的实践方式
+
+如果用户需要添加自定义桥接器，标准做法是：
+
+1. 将 `XxxBridge.php` 文件放入 `bridges/` 目录
+2. 确保类继承 `BridgeAbstract` 并符合命名约定
+3. 在 `config.ini.php` 的 `enabled_bridges` 中添加（若不是 `*` 模式）
+4. 刷新页面即可看到
+
+不需要重启服务，不需要注册命令，也不需要清理缓存（除非 Feed 结果已被缓存）。
+
+### E.4 contrib/ 目录
+
+项目根目录有一个 `contrib/` 目录（目前只有 `.gitkeep` 占位文件），从命名和开源项目惯例来看，这是预留的"用户贡献/自定义"目录，但**当前代码并未扫描该目录**。桥接器只能放在 `bridges/` 目录下才能被发现。
+
+### E.5 隔离现状与局限
+
+| 隔离维度 | 是否支持 | 说明 |
+|---------|---------|------|
+| 代码隔离 | 部分 | 每个桥接器一个类文件，但共享全局命名空间和 autoloader |
+| 权限隔离 | 不支持 | 所有桥接器运行在同一进程、同一权限下 |
+| 资源隔离 | 不支持 | 共享缓存、共享 HTTP 客户端、共享内存限制 |
+| 启禁隔离 | 支持 | 通过 `enabled_bridges` / `whitelist.txt` 控制哪些桥接器可见 |
+| 配置隔离 | 支持 | 每个桥接器有独立的配置段（如 `[TelegramBridge] max_pages = 1`） |
+| 缓存隔离 | 自动 | 缓存 key 自动带桥接器短名前缀（`loadCacheValue`） |
+
+**安全注意**：由于桥接器是原生 PHP 代码，自定义桥接器拥有与主程序完全相同的权限（可读写文件、发起网络请求等），添加不受信任的桥接器存在安全风险。
+
+### E.6 与 WordPress 插件模式的对比
+
+RSS-Bridge 的桥接器模式与 WordPress 插件有本质区别：
+
+| 特性 | RSS-Bridge 桥接器 | WordPress 插件 |
+|------|------------------|---------------|
+| 注册机制 | 文件系统约定（自动扫描） | 插件头注释 + 主动激活 |
+| 生命周期 | 请求级（每次重新扫描） | 持久化（激活状态存数据库） |
+| 隔离程度 | 弱（同进程同权限） | 弱（同进程同权限，但有钩子机制） |
+| 热加载 | 天然支持（PHP 无状态） | 需要手动激活/停用 |
+| 管理界面 | 无（改配置文件） | 有后台插件管理页 |
+
+---
+
+## 补充 F：桥接器抓取失败的重试与降级链路
+
+抓取失败是 RSS-Bridge 的常见场景（目标站点改版、限流、网络波动等）。系统设计了一套分层重试与降级机制，从底层 HTTP 到上层 Feed 输出逐层兜底。
+
+### F.1 第一层：HTTP 请求重试
+
+**文件**: `lib/http.php:170-192`
+
+最底层的 `CurlHttpClient::request()` 内置了网络级重试：
+
+```php
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        break;  // 请求成功
+    }
+    if ($tries <= $config['retries']) {
+        continue;  // 继续重试
+    }
+    // 达到最大重试次数，抛异常
+    throw new HttpException(sprintf('cURL error %s: %s ...', ...));
+}
+```
+
+**重试规则**：
+- 触发条件：`curl_exec()` 返回 `false`（网络连接失败、超时、DNS 解析失败等）
+- 重试次数：由 `http.retries` 配置控制，默认 1 次（即总共尝试 2 次：初始 + 1 次重试）
+- 重试间隔：无退避，立即重试
+- 不重试的情况：HTTP 错误状态码（如 404、500）不会触发重试，因为 `curl_exec` 不会返回 false
+- 最大重定向：`max_redirections` 默认 5 次
+
+### F.2 第二层：HTTP 缓存降级（304 / 过期缓存）
+
+**文件**: `lib/contents.php:73-89, 126-129`
+
+当本地有缓存但资源可能过期时，`getContents()` 会发送条件请求实现"软降级"：
+
+```
+有本地缓存
+    │
+    ▼
+发条件请求（带 If-Modified-Since / If-None-Match）
+    ├─ 200 OK → 用新内容，更新缓存
+    └─ 304 Not Modified → 用缓存内容（静默降级，用户无感知）
+```
+
+如果目标站点完全不可达，**这层不会直接降级返回过期缓存**，而是直接抛异常（因为 `curl_exec` 失败 → 重试 → 抛 HttpException）。
+
+### F.3 第三层：Feed 响应缓存降级
+
+**文件**: `middlewares/CacheMiddleware.php:48-50`
+
+`CacheMiddleware` 对错误响应也做缓存（5~15 分钟随机 TTL），防止错误雪崩：
+
+```php
+} elseif (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+    // Cache these responses for about ~10 mins on average
+    $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+}
+```
+
+但这是**缓存错误**而不是降级返回旧数据。如果桥接器本次抓取失败，用户会看到错误，而不是上一次成功的 Feed。
+
+### F.4 第四层：错误报告阈值与输出模式
+
+**文件**: `actions/DisplayAction.php:107-123`
+
+真正的"降级"策略体现在错误输出模式上。系统不会一出错就把错误暴露给用户，而是通过 `error.report_limit` 控制错误报告频率。
+
+#### 错误计数器
+
+```php
+// 记录错误次数（缓存中存储，TTL 5 天）
+$cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+$report = $this->cache->get($cacheKey);
+if ($report) {
+    $report = Json::decode($report);
+    $report['count']++;
+} else {
+    $report = ['error' => $code, 'time' => time(), 'count' => 1];
+}
+$this->cache->set($cacheKey, Json::encode($report), 86400 * 5);
+```
+
+#### 三种错误输出模式
+
+由 `error.output` 配置控制：
+
+| 模式 | 行为 | 适用场景 |
+|------|------|----------|
+| `feed`（默认） | 错误次数达到 `report_limit` 后，在 Feed 中插入一条错误项作为降级 | 生产环境，保持 Feed 可用 |
+| `http` | 错误次数达到 `report_limit` 后，直接返回 HTTP 500 错误页 | 调试环境，快速发现问题 |
+| `none` | 静默忽略错误，返回空 Feed | 对可用性要求极高的场景 |
+
+`report_limit` 默认值为 1（即每次出错都报告）。调高此值可以过滤偶发错误，只在持续失败时才通知用户。
+
+### F.5 限流异常的特殊处理
+
+**文件**: `lib/utils.php:264-267` + `actions/DisplayAction.php:94-96`
+
+桥接器可以通过 `throwRateLimitException()` 主动抛出限流异常，这是一种**受控失败**：
+
+```php
+function throwRateLimitException(string $message = '')
+{
+    throw new RateLimitException($message);
+}
+```
+
+`DisplayAction` 捕获到 `RateLimitException` 时，直接返回 HTTP 429 状态码：
+
+```php
+} elseif ($e instanceof RateLimitException) {
+    $this->logger->debug(...);
+    return new Response(render(...), 429);
+}
+```
+
+这比通用异常多了一层语义——告诉调用方"这是限流，不是程序 bug"，方便上层做退避重试。
+
+### F.6 CloudFlare 检测
+
+**文件**: `lib/http.php:38-56`
+
+系统内置了 CloudFlare 拦截检测，通过响应体中的 `<title>` 标签判断：
+
+```php
+final class CloudFlareException extends HttpException
+{
+    public static function isCloudFlareResponse(Response $response): bool
+    {
+        $cloudflareTitles = [
+            '<title>Just a moment...',
+            '<title>Please Wait...',
+            '<title>Attention Required!',
+            '<title>Security | Glassdoor',
+            '<title>Access denied</title>',
+        ];
+        // ...
+    }
+}
+```
+
+`HttpException::fromResponse()` 会自动识别 CloudFlare 拦截并返回 `CloudFlareException` 子类。目前代码中没有针对 CloudFlare 的特殊降级逻辑（如自动切换代理），但子类化为后续扩展预留了空间。
+
+### F.7 完整失败链路时序
+
+```
+桥接器 collectData() 发起请求
+    │
+    ▼
+getContents()
+    │
+    ├─ 查缓存 → 命中 → 发条件请求 → 304 → 用缓存（成功路径）
+    │
+    └─ 网络请求
+         │
+         ├─ curl_exec 失败 → 重试 N 次 → 仍失败 → 抛 HttpException
+         │
+         └─ HTTP 错误码（4xx/5xx）→ 抛 HttpException
+              │
+              ▼
+DisplayAction catch
+    │
+    ├─ RateLimitException → 返回 429 + 异常页
+    ├─ ClientException    → 打 debug 日志
+    └─ 其他 Exception      → 打 error 日志
+         │
+         ├─ 检查错误次数 < report_limit → 静默（返回空 Feed？不，实际会抛出）
+         └─ 错误次数 >= report_limit
+              │
+              ├─ error.output = feed → 错误项插入 Feed
+              ├─ error.output = http → 返回 500 异常页
+              └─ error.output = none → 空 Feed
+```
+
+### F.8 关键局限
+
+1. **无 stale-while-revalidate**：缓存过期后若目标站点不可达，不会返回过期内容兜底
+2. **无熔断机制**：某个桥接器持续失败不会自动"熔断"停用，每次请求都会重试
+3. **无退避策略**：HTTP 重试是立即重试，没有指数退避
+4. **无降级数据**：失败时不会返回上一次成功的旧 Feed 数据（除非缓存层恰好命中）
+5. **重试仅限网络层**：HTTP 429/503 等应用层限流不会触发重试
