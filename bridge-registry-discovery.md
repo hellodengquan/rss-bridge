@@ -1760,3 +1760,567 @@ $this->cache->set($cacheKey, Json::encode($report), 86400 * 5);
 7. **无用户/权限系统**：除可选的 `authentication.token` 全局 API Token 外无认证
 
 这与 RSS-Bridge 的定位一致——它是一个**轻量级的 Feed 生成中间件**，而非一个需要运维后台的完整服务。管理员通过传统服务器管理方式（SSH、日志、配置文件）即可完成维护。
+
+---
+
+## 补充 J：桥接器测试与本地开发流程
+
+RSS-Bridge 的本地开发环境非常轻量，PHP 的 shared-nothing 架构让"改代码→刷新浏览器"的传统工作流完全适用，但仍有完整的测试体系和编码规范。
+
+### J.1 本地开发环境搭建
+
+#### 方式一：PHP 内置 HTTP 服务器（最快）
+
+PHP ≥ 7.4 自带开发服务器，零依赖启动：
+
+```bash
+cd /path/to/rss-bridge
+php -S localhost:8000
+# 浏览器访问 http://localhost:8000
+```
+
+特点：
+- 零配置启动，修改代码后刷新浏览器即可生效
+- 单进程单线程，无法模拟真实并发
+- 适合单个桥接器的快速迭代
+
+#### 方式二：Docker / Docker Compose
+
+项目提供 `docs/04_For_Developers/07_Development_Environment_Setup.md 有 Docker 化说明，以及 `config/php-fpm.conf 和 config/php.ini 提供基础配置。开发者也可以使用官方镜像或自建 nginx + php-fpm 组合。
+
+#### 方式三：GitHub Codespaces
+
+项目有专门的教程（docs/04_For_Developers/06_Github_Codespaces_Tutorial.md），可一键在云端启动开发环境。
+
+#### 开发环境关键配置建议（config.ini.php 片段）：
+
+```ini
+[system]
+; 允许 ConnectivityAction 等开发工具
+env = "dev"
+
+[cache]
+; 开发阶段禁用磁盘缓存，使用内存缓存
+type = "array"
+
+[error]
+; 调试时直接暴露错误
+output = "http"
+report_limit = 1
+```
+
+### J.2 测试体系
+
+RSS-Bridge 使用 **PHPUnit** 作为测试框架，composer.json 声明了 `phpunit/phpunit` 作为 dev 依赖。
+
+#### 安装测试依赖
+
+```bash
+composer install
+```
+
+#### 运行全部测试
+
+```bash
+./vendor/bin/phpunit
+```
+
+#### 仅运行桥接器规范测试
+
+```bash
+./vendor/bin/phpunit tests/BridgeImplementationTest.php
+```
+
+这是最重要的测试，自动遍历 `bridges/` 下的所有 `*Bridge.php` 文件，逐一检查：
+
+| 测试方法 | 检查内容 |
+|-----------|---------|
+| `testClassName` | 类名：首字母大写、不含空格、以 `Bridge` 结尾 |
+| `testClassType` | 必须是 `BridgeAbstract`（含 `FeedExpander` 子孙）的实例 |
+| `testConstants` | `NAME/URI/DESCRIPTION/MAINTAINER` 非空字符串；`PARAMETERS` 是数组；`CACHE_TIMEOUT` 是 ≥0 的整数 |
+| `testParameters` | 参数定义校验：context 名、type（text/number/list/checkbox、required 有效性、list 类型必须有 values 数组 等 |
+| `testMethodValues` | `getDescription/getMaintainer/getName/getURI/getIcon` 返回值类型 |
+| `testUri` | `URI` 常量通过 `FILTER_VALIDATE_URL` 过滤器 |
+
+#### 格式化测试
+
+```bash
+./vendor/bin/phpunit tests/Formats/
+```
+
+`tests/Formats/` 包含所有格式实现测试，使用 `samples/` 目录下的 JSON 输入对照 expected* 目录下的 XML/JSON 预期输出做精确匹配。
+
+#### 单项桥接器测试
+
+少数桥接器有自己的专项测试，例如 `tests/RedditBridgeTest.php`，测试 RedditBridge 的解析逻辑。
+
+### J.3 代码风格检查
+
+使用 **PHP_CodeSniffer（phpcs），规范文件为 `phpcs.xml`：
+
+```bash
+./vendor/bin/phpcs --standard=phpcs.xml --warning-severity=0 --extensions=php -p ./
+```
+
+主要编码规范：
+
+| 规范项 | 要求 |
+|-------|------|
+| 文件末尾换行 | 必须 |
+| 缩进 | 空格缩进（非 Tab） |
+| 最大行长度 | 180 字符 |
+| 字符串 | 优先单引号，除非需要变量替换或转义 |
+| 常量 | UPPER_CASE |
+| true/false/null | 小写 |
+| 类名 | PascalCase |
+| 数组语法 | 短数组 `[]` 而非 `array()` |
+| 控制结构 | 多行块，`elseif` 而非 `else if` |
+| 方法声明 | `abstract`/`final` 在可见性之前，`static` 在可见性之后 |
+
+### J.4 调试技巧
+
+1. **禁用缓存**（开发时使用 `cache.type = "array"` 或注释掉 `CacheMiddleware`
+
+2. **手动调试输出**：在桥接器代码中 `var_dump()` / `print_r()` 查看变量，浏览器直接查看
+
+3. **ConnectivityAction 连通性探测**：开发环境访问 `?action=connectivity` 批量检查所有桥接器目标站点可达性
+
+4. **ListAction 查看元数据**：访问 `?action=list` 查看所有桥接器的参数、状态、描述等 JSON 元数据
+
+5. **特定桥接器 HTML 预览**：选 `format=Html` 得到人类可读输出，便于检查条目是否正确
+
+6. **错误输出模式**：开发时设 `error.output = "http"` 快速暴露异常栈
+
+### J.5 单个桥接器的开发-测试循环
+
+```
+1. 在 bridges/ 下创建 MyBridge.php 类
+   ↓
+2. 刷新首页 → 桥接器卡片出现
+   ↓
+3. 浏览器访问 → 参数表单填入测试值
+   ↓
+4. 点 Generate feed → 检查 Html 格式输出
+   ↓
+5. 运行 BridgeImplementationTest 检查规范
+   ↓
+6. 运行 phpcs 检查编码风格
+   ↓
+7. 修复 → 刷新检查
+```
+
+由于每次请求独立执行，代码修改立即生效，无需重启服务或重新编译。
+
+---
+
+## 补充 K：社区贡献新桥接器的入门指南
+
+RSS-Bridge 采用 **GitHub PR 模式**接受社区贡献，遵循「fork → 新建分支 → 开发 → 提 PR → CI 检查 → 维护者 review → 合并」的标准流程。
+
+### K.1 贡献前检查清单
+
+在提交 PR 之前，确保满足以下条件：
+
+- [ ] 桥接器文件名 `XxxBridge.php`，类名 `XxxBridge`，放在 `bridges/` 目录
+- [ ] 类继承 `BridgeAbstract` 或 `FeedExpander`
+- [ ] `NAME / URI / DESCRIPTION / MAINTAINER` 四个常量都有值且非空
+- [ ] `CACHE_TIMEOUT` 设置合理（默认 3600 秒）
+- [ ] `PARAMETERS` 定义正确（如无参数则空数组 `[]`）
+- [ ] 实现 `collectData()` 方法，产出至少一条或多条 `$this->items`
+- [ ] 目标站点确实**没有**官方 RSS/Atom Feed（桥接器的存在意义）
+- [ ] 不涉及版权风险、不违反目标站点 ToS
+- [ ] 本地跑通 `./vendor/bin/phpunit tests/BridgeImplementationTest.php`
+- [ ] 本地跑通 `./vendor/bin/phpcs` 无错误
+
+### K.2 最简桥接器骨架
+
+```php
+<?php
+
+class XxxBridge extends BridgeAbstract
+{
+    const MAINTAINER = '你的 GitHub 用户名';
+    const NAME = 'Xxx';
+    const URI = 'https://xxx.com/';
+    const DESCRIPTION = 'Returns the latest posts from Xxx.com';
+    const CACHE_TIMEOUT = 3600;
+    const PARAMETERS = [
+        'global' => [
+            'limit' => [
+                'name' => 'Maximum number of items to return',
+                'type' => 'number',
+                'defaultValue' => 10,
+            ]
+        ]
+    ];
+
+    public function collectData()
+    {
+        $html = getSimpleHTMLDOM(self::URI);
+        foreach ($html->find('article') as $element) {
+            $item = [];
+            $item['uri'] = $element->find('a', 0)->href;
+            $item['title'] = $element->find('h2', 0)->plaintext;
+            $item['content'] = $element->find('div.content', 0)->innertext;
+            $this->items[] = $item;
+        }
+    }
+
+    public function getName()
+    {
+        return self::NAME . ' : Latest posts';
+    }
+}
+```
+
+### K.3 常用工具函数速查
+
+桥接器开发中最常用的 API：
+
+| 函数 | 用途 | 位置 |
+|-----|------|------|
+| `getContents($url, $headers, $curlOptions, $returnHeader)` | 发起 HTTP GET 请求，返回响应体 | `lib/contents.php` |
+| `getSimpleHTMLDOM($url, $header, $opts, $returnHeader)` | 获取并解析 HTML 返回 simple_html_dom 对象 | `lib/contents.php` |
+| `getSimpleHTMLDOMCached($url, $ttl)` | 缓存版 getSimpleHTMLDOM | `lib/contents.php` |
+| `getContents($url, $postData)` | 带 POST 请求 | `lib/contents.php` |
+| `$this->getInput($name)` | 获取请求参数值 | `BridgeAbstract` |
+| `$this->getOption($name)` | 获取 `const CONFIGURATION 中的配置值 | `BridgeAbstract` |
+| `$this->loadCacheValue($key)` | 读取桥接器私有缓存 | `BridgeAbstract` |
+| `$this->saveCacheValue($key, $value, $ttl)` | 写入桥接器私有缓存 | `BridgeAbstract` |
+| `$this->getURI()` | 获取桥接器 URI（覆写返回动态 URI） | `BridgeAbstract` |
+| `$this->getName()` | 同上，覆写返回动态名称 | `BridgeAbstract` |
+| `defaultLinkTo($html, $baseUri)` | 相对链接转绝对链接 | `lib/utils.php` |
+| `throwClientException($msg)` | 抛出客户端异常 | `lib/utils.php` |
+| `throwRateLimitException($msg)` | 抛出 429 限流异常 | `lib/utils.php` |
+| `returnClientError($msg)` | 返回 400 错误 | `lib/utils.php` |
+| `returnServerError($msg)` | 返回 500 错误 | `lib/utils.php` |
+| `returnError($msg, $code)` | 返回指定状态码错误 | `lib/utils.php` |
+
+### K.4 选择继承哪一个基类
+
+| 基类 | 适用场景 |
+|------|---------|
+| `BridgeAbstract` | 从零开始，目标站点没有现成 Feed |
+| `FeedExpander` | 目标站点已有 RSS/Atom Feed，需要增强内容（全文抓取、补充字段 |
+
+`FeedExpander` 的典型使用方式：
+
+```php
+class MySiteBridge extends FeedExpander
+{
+    // 覆写此方法对每条 Feed 条目做处理
+    protected function parseItem(array $item)
+    {
+        // 读取 $item['uri'] 获取全文、补全摘要、提取图片等
+        return $item;
+    }
+
+    // 覆写此方法对原始 XML 做预处理
+    protected function prepareXml(string $xmlString): string
+    {
+        return $xmlString;
+    }
+}
+```
+
+### K.5 detectParameters 实现（可选，但推荐）
+
+如果希望桥接器能被「从 URL 反向识别，需要实现 `detectParameters($url)` 静态方法，返回参数数组，或定义 `TEST_DETECT_PARAMETERS` 常量：
+
+```php
+const TEST_DETECT_PARAMETERS = [
+    'https://example.com/user/johndoe' => ['context' => 'By user', 'u' => 'johndoe'],
+    'https://example.com/tag/news'   => ['context' => 'By tag', 't' => 'news'],
+];
+```
+
+此常量由 `DetectAction` 使用，支持用户粘贴目标页面 URL 后自动匹配并生成桥接器实例。
+
+### K.6 PR 提交流程
+
+1. **Fork 仓库**：在 GitHub 上 fork `RSS-Bridge/rss-bridge` 仓库
+2. **新建分支**：`git checkout -b feature/add-xxx-bridge`
+3. **开发**：写桥接器代码，本地测试通过
+4. **提交**：commit message 建议格式 `feat: add XxxBridge for ...`
+5. **推送**：`git push origin feature/add-xxx-bridge`
+6. **开 PR**：在 GitHub 上从你的分支提 PR 到 master 分支
+7. **CI 自动检查**：GitHub Actions 自动运行：
+   - `phpunit` 单元测试（含 BridgeImplementationTest）
+   - `phpcs` 代码风格检查
+8. **Review**：维护者 review，提出修改意见
+9. **合并**：检查通过后合并入 master
+
+### K.7 常见 Review 常被 Review 指出的问题
+
+1. **PARAMETERS 定义使用了错误的 type 类型（只有 text/number/list/checkbox 四种合法值）
+2. **没有设置 `CACHE_TIMEOUT` 过低导致对目标站点压力过大（<300 秒会被质疑）
+3. **collectData() 中直接使用了未过滤的用户输入构造 URL（需 urlencode）
+4. **相对链接未用 `defaultLinkTo()` 转为绝对链接
+5. **HTML 解析使用了脆弱的 XPath/CSS 选择器过于复杂
+6. **条目缺少 `timestamp` 没有设置（导致 Feed 阅读器无法排序）
+7. **目标站点其实有官方 Feed 没有用 `FeedExpander`
+8. **`NAME 太长或太模糊（建议用 `MAINTAINER 填真实 GitHub 用户名方便追责）
+9. **代码中留下了调试代码 `var_dump`/`print_r`/`die` 等
+10. **缺少中文/非英文注释（要求英文注释）
+
+### K.8 桥接器维护责任
+
+`MAINTAINER` 常量中的 GitHub 用户名即认领该桥接器的"第一响应人"，当桥接器失效、目标站点改版时，CI 失败或用户报 issue 时会被 @。社区对未响应三个月以上且没有维护者的桥接器可能被移到 `abandoned 标签标记，欢迎新的维护者认领。
+
+---
+
+## 补充 L：桥接器请求中的 Cookie / Session 持久化处理
+
+RSS-Bridge 没有内置的 Cookie Jar 或 Session 管理机制，所有 Cookie 处理完全由桥接器自行管理。不同桥接器根据各自目标站点的认证需求采用不同的策略。总结现有的五种实现模式。
+
+### L.1 模式一：配置注入静态 Cookie（CURLOPT_COOKIE）
+
+**代表桥接器**：`PixivBridge`、`MediapartBridge`、`ManyVidsBridge`、`ScribbleHubBridge`、`HeiseBridge`
+
+这是最简单直接的做法：管理员在 `config.ini.php` 配置段中配置 Session Cookie 值，桥接器发起请求时通过 `CURLOPT_COOKIE` cURL 选项注入。
+
+#### 示例：MediapartBridge
+
+```php
+// bridges/MediapartBridge.php
+const CONFIGURATION = [
+    'MPSESSID' => [
+        'required' => false,
+        'title' => 'Value of the session cookie MPSESSID'
+    ]
+];
+
+public function collectData()
+{
+    // ...
+    $mpsessid = $this->getOption('MPSESSID');
+    if ($mpsessid) {
+        $opt = [CURLOPT_COOKIE => 'MPSESSID=' . $mpsessid];
+        $articleHtml = getSimpleHTMLDOMCached($articleUri, 3600, [], $opt);
+    }
+}
+```
+
+**特点**：
+- Cookie 值固定，用户提供，管理员配置
+- 不处理 Cookie 过期失效需要手动更新配置
+- 实现简单，适合 Cookie 长期有效的长时效 Session
+
+#### 示例：ManyVidsBridge
+
+```php
+// bridges/ManyVidsBridge.php
+$opt = [CURLOPT_COOKIE => 'sfwtoggle=false'];
+$html = getSimpleHTMLDOMCached($this->getURI() . '...', 86400, [], $opt);
+```
+
+**适合场景**：无需认证，只是需要在 SFW/NSFW 切换。
+
+### L.2 模式二：Header 方式注入 Cookie Header 字符串）
+
+**代表桥接器**：`SubstackBridge`、`InstagramBridge`、`PornhubBridge`、`GovTrackBridge`、`HeiseBridge`、`FurAffinityBridge`
+
+通过 `getContents($url, $headers)` 第二个参数传入自定义 HTTP 头数组，包含 `Cookie: ...` 行。
+
+#### 示例：SubstackBridge
+
+```php
+// bridges/SubstackBridge.php
+const CONFIGURATION = [
+    'substack_sid' => ['required' => false],
+    'substack_at'  => ['required' => false],
+];
+
+$cookies = [
+    'substack_sid=' . $this->getOption('substack_sid'),
+    'substack_at='  . $this->getOption('substack_at'),
+];
+$html = getContents($articleUri, [
+    'User-Agent: Mozilla/5.0 ...',
+    'Cookie: ' . implode('; ', $cookies)
+]);
+```
+
+#### 示例：InstagramBridge
+
+```php
+// bridges/InstagramBridge.php
+$headers[] = 'cookie: sessionid=' . $sessionId . '; ds_user_id=' . $dsUserId;
+return getContents($uri, $headers);
+```
+
+**与 CURLOPT_COOKIE 的区别**：Header 方式是字符串形式更灵活，可与其他自定义 Header 组合使用，但需要自己构造 `name=value` 格式。
+
+### L.3 模式三：首请求提取 Set-Cookie 响应头提取持久化缓存）
+
+**代表桥接器**：`FB2Bridge`（Facebook 桥接器）
+
+Facebook 对没有任何请求会先访问一次目标页面，从响应中获取初始 Cookie，再带着这些 Cookie 后续请求。
+
+#### FB2Bridge::getCookies() 实现
+
+```php
+// bridges/FB2Bridge.php:247-268
+private function getCookies($pageURL)
+{
+    $ctx = stream_context_create([
+        'http' => [
+            'user_agent' => Configuration::getConfig('http', 'useragent'),
+            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        ]
+    ]);
+    $a = file_get_contents($pageURL, 0, $ctx);
+
+    $cookies = '';
+    foreach ($http_response_header as $hdr) {
+        if (strpos($hdr, 'Set-Cookie') !== false) {
+            $cLine = explode(':', $hdr)[1];
+            $cLine = explode(';', $cLine)[0];
+            $cookies .= ';' . $cLine;
+        }
+    }
+
+    return substr($cookies, 1);  // 去掉开头的分号
+}
+```
+
+**流程**：
+
+```
+1. 用 file_get_contents 访问目标页面
+2. 遍历 $http_response_header 提取所有 Set-Cookie 行
+3. 去掉 expires/path/domain 等属性，只保留 name=value 部分
+4. 用 ; 拼接所有 Cookie
+5. 后续请求用 stream_context_create 注入 Cookie Header
+```
+
+**特点**：
+- PHP 内置的 `file_get_contents` + `$http_response_header`（注意：这是 PHP 的特殊变量）
+- 每次请求重新获取，不持久化到缓存（因为 Facebook Cookie 可能刷新
+- 对 CSRF token 类场景
+
+### L.4 模式四：Set-Cookie 响应头提取 + 缓存持久化缓存持久化）
+
+**代表桥接器**：`PepperBridgeAbstract`（Dealabs 等 Pepper 系桥接器）
+
+这是最完整的持久化方案：访问一次请求 → 提取响应 `Set-Cookie` Header → 提取 name=value → 存入缓存 → 后续请求使用缓存的 Cookie → 过期自动刷新。
+
+#### PepperBridgeAbstract 实现
+
+```php
+// bridges/PepperBridgeAbstract.php
+
+// 请求前从缓存加载 Cookie
+$cookiesHeaderValue = $this->getCookiesHeaderValue($url);
+
+// 构造请求 Header
+"Cookie: $cookiesHeaderValue",
+
+// 请求后从响应提取并持久化
+private function refreshCookies($uri, $postData, $postHeaders): void
+{
+    $response = getContents($uri, $postHeaders, $postData, true);
+    $setCookieHeaders = $response->getHeader('set-cookie', true);
+    $cookies = array_map(fn($c): string => explode(';', $c)[0], $setCookieHeaders);
+    $this->saveCacheValue('cookies', implode('; ', $cookies);
+    // 默认 CACHE_TIMEOUT 默认 1 小时
+}
+
+private function getCookiesHeaderValue(string $url): string
+{
+    return $this->loadCacheValue('cookies', '');
+}
+```
+
+**流程**：
+
+```
+发起请求前
+    ├─ 缓存有 Cookie → 使用缓存
+    └─ 缓存无 → 访问请求时自动触发 refreshCookies() 重新获取
+         ↓
+发起请求（带 Cookie
+         ↓
+请求成功
+    ├─ 响应有 Set-Cookie → 解析提取 name=value
+    └─ 存入缓存，TTL 1 小时
+```
+
+### L.5 模式五：响应 Set-Cookie + Session ID 持久化 + 动态刷新）
+
+**代表桥接器**：`PixivBridge`
+
+最复杂的完整链路，除了缓存 PHPSESSID 还会检查响应头更新 Session。
+
+#### PixivBridge 实现
+
+```php
+// bridges/PixivBridge.php
+
+// 获取（三级降级：缓存 → 配置
+private function getCookie(): string
+{
+    $value = $this->loadCacheValue('cookie');
+    if (!$value) {
+        $value = $this->getOption('cookie');
+        // 30 天 + 1 天给刷新
+        $this->saveCacheValue('cookie', $this->getOption('cookie'), 2678400);
+    }
+    return $value;
+}
+
+// 请求注入
+$curlOptions[CURLOPT_COOKIE] = 'PHPSESSID=' . $cookie_str;
+
+// 响应检查响应 Set-Cookie 更新
+if (array_key_exists('set-cookie', $headers)) {
+    foreach ($headers['set-cookie'] as $value) {
+        parse_str(strtr($value, ['&' => '%26', '+' => '%2B', ';' => '&'), $cookie);
+        if ($cookie['PHPSESSID'] != $this->getCookie()) {
+            // Session ID 变了，刷新缓存
+            $this->saveCacheValue('cookie', $cookie['PHPSESSID']);
+        }
+    }
+}
+```
+
+**完整链路**：
+
+```
+用户配置 cookie → 配置 → 存入缓存（30+1 天
+         ↓
+发起请求 CURLOPT_COOKIE=PHPSESSID=xxx
+         ↓
+收到响应 → 检查响应 Set-Cookie 中 PHPSESSID 变化？
+    ├─ 变化了 → 存入缓存（无缝续期）
+    └─ 没变 → 不做处理
+```
+
+### L.6 Cookie 处理模式对比表
+
+| 模式 | 代表桥接器 | 适用场景 | Cookie 来源 | 持久化 | 自动续期 |
+|------|------------|---------|-----------|--------|---------|
+| 配置静态 Cookie | Mediapart / ManyVids / ScribbleHub | 长期有效 Cookie、管理员配置静态值 | config.ini.php | 无 | 否 |
+| Header Cookie 字符串 | Substack / Instagram / Pornhub / GovTrack / Heise | Header Cookie 需要多个组合多个自定义组合其他自定义 Header | config.ini.php | 无 | 否 |
+| 首请求提取 | FB2Bridge | 需要先访问拿 Cookie | 首请求响应 Set-Cookie | 请求内变量 | 每次请求重新获取 |
+| Set-Cookie + 缓存 | PepperBridgeAbstract | 需要多步维持登录态 | Set-Cookie + 缓存 | 缓存 | TTL 过期自动刷新 |
+| Set-Cookie + 缓存 + 动态刷新 | PixivBridge | 需要 Session ID 动态变化续期 | Set-Cookie 自动 | 缓存 31 天 | 是 |
+
+### L.7 CURLOPT_COOKIE vs Header Cookie 字符串
+
+两种方式的差异：
+
+| 方式 | 语法 | 适用场景 |
+|------|------|---------|
+| `CURLOPT_COOKIE` | `[CURLOPT_COOKIE => 'name=value; name2=value2']` | 只需 Cookie，不需要其他 Header 简单场景 |
+| Header 字符串 | `['Cookie: name=value; name2=value2']` | 需要同时设置 User-Agent / Referer 等场景 |
+
+**注意**：`getContents()` 的第四个参数如果传了 CURLOPT_COOKIE，与 Header 数组的 Cookie Header 不能同时设置，否则可能冲突。
+
+### L.8 安全与隐私考虑
+
+1. **Cookie 配置值包含敏感信息，`config.ini.php` 不应提交到公开仓库
+2. `MAINTAINER 不应在示例值中放真实 Cookie
+3. 日志不应打日志输出 Cookie 值
+4. `error.output = "feed" 模式下，错误项不要把 Cookie 暴露给用户
+5. `ConnectivityAction 探测不要使用真实 Cookie 仅访问 URI）
