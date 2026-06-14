@@ -949,3 +949,598 @@ rssbridge_cache_latency_seconds{backend="file",operation="get",quantile="0.99"} 
 | **Redis 监控** | RedisCache 内存/命中率/eviction | `redis-cli INFO stats` |
 | **HTTP 响应时间监控** | 整体缓存效果 | 对比有缓存/无缓存时的响应时间 |
 | **日志分析** | 缓存异常 | 解析日志中的 `warning`/`error` 级别缓存消息 |
+
+---
+
+## 十三、缓存集群与分片策略
+
+### 13.1 当前状态：不支持集群
+
+RSS-Bridge 当前的所有缓存后端都是**单节点设计**，没有内置的集群或分片能力：
+
+| 后端 | 集群支持 | 分片能力 | 一致性散列 |
+|------|---------|---------|-----------|
+| **NullCache** | — | — | — |
+| **ArrayCache** | 否（进程内） | 否 | — |
+| **FileCache** | 否（单机磁盘） | 否 | — |
+| **SQLiteCache** | 否（单机文件） | 否 | — |
+| **MemcachedCache** | **部分**（客户端支持多节点） | 否（无一致性散列） | 否（取模分片） |
+| **Redis**（假想） | 依赖 Redis Cluster / 哨兵 | 依赖服务端分片 | 服务端管理 |
+
+**关键发现**：`MemcachedCache` 当前的实现（`caches/MemcachedCache.php:16-20`）只调用了一次 `addServer($host, $port)`，仅支持单个 Memcached 节点：
+
+```php
+$this->conn = new \Memcached();
+if (!$this->conn->addServer($host, $port)) {
+    throw new \Exception('Unable to add memcached server');
+}
+```
+
+虽然 PHP 的 `Memcached` 扩展本身支持多节点和一致性散列选项，但 RSS-Bridge 并未暴露这些配置。
+
+### 13.2 多节点部署时的缓存一致性问题
+
+RSS-Bridge 在多实例（多机器/多 PHP-FPM 进程池）部署时，不同后端的缓存共享能力差异显著：
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  RSS-Bridge  │     │  RSS-Bridge  │     │  RSS-Bridge  │
+│  Instance A  │     │  Instance B  │     │  Instance C  │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       ▼                    ▼                    ▼
+┌──────────────────────────────────────────────────────────┐
+│                    缓存后端                              │
+│                                                          │
+│  FileCache   → 各实例写本地磁盘，完全隔离，无共享        │
+│  SQLiteCache → 各实例写本地文件，完全隔离，无共享        │
+│  ArrayCache  → 各实例内存独立，完全隔离，无共享          │
+│  Memcached   → 所有实例连同一个 Memcached，可共享        │
+│  Redis       → 所有实例连同一个 Redis，可共享            │
+└──────────────────────────────────────────────────────────┘
+```
+
+**FileCache / SQLiteCache 在多实例下的问题**：
+- **缓存命中率低**：每个实例独立缓存，相同的请求被不同实例命中时仍然要回源
+- **缓存不一致**：不同实例看到的缓存状态可能不同（用户看到的内容因负载均衡路由到不同实例而不同）
+- **浪费存储**：N 个实例就有 N 份重复缓存数据
+- **目标站点压力放大**：回源请求量随实例数线性增长
+
+**结论**：多节点部署必须使用 MemcachedCache 或 RedisCache，否则缓存基本失效。
+
+### 13.3 Memcached 多节点与取模分片
+
+PHP `Memcached` 扩展原生支持多节点，使用方式是多次调用 `addServer()`：
+
+```php
+// MemcachedCache 当前只加一个节点，扩展后可加多个
+$conn = new \Memcached();
+$conn->addServer('cache-01', 11211);
+$conn->addServer('cache-02', 11211);
+$conn->addServer('cache-03', 11211);
+```
+
+**默认分片算法**：PHP Memcached 默认使用 **取模哈希**（`hash(key) % N`），其中 N 为节点数。
+
+```
+key → crc32(key) → % 3 → 选择节点 0/1/2
+
+例如:
+  "http_abc"  →  1542  →  % 3 = 0  →  cache-01
+  "http_def"  →  9876  →  % 3 = 0  →  cache-01
+  "http_ghi"  →  7341  →  % 3 = 1  →  cache-02
+  "http_jkl"  →  5612  →  % 3 = 2  →  cache-03
+```
+
+**取模分片的致命缺陷**：当节点数变化时（如增减节点），几乎所有 key 的映射都会改变，导致**大规模缓存失效**。
+
+从 3 节点扩展到 4 节点时，大约 `3/4`（75%）的 key 会映射到新的节点，缓存命中率骤降，目标站点压力激增。
+
+### 13.4 一致性散列策略
+
+一致性散列（Consistent Hashing）通过将 key 和节点都映射到一个 0~2^32 的环形空间来解决取模分片的问题：
+
+```
+         0
+         │
+   2^32 ─┼─ node-01 (虚拟点1, 虚拟点2, ...)
+         │
+         ├── key A → 找到顺时针最近节点 = node-03
+         │
+         ┼─ node-02
+         │
+         ├── key B → 找到顺时针最近节点 = node-02
+         │
+         ┼─ node-03
+         │
+     2^32-1
+```
+
+**PHP Memcached 原生支持**：通过 `setOption(\Memcached::OPT_DISTRIBUTION, \Memcached::DISTRIBUTION_CONSISTENT)` 启用。
+
+一致性散列的效果：
+- 增加 1 个节点：只有约 `1/N` 的 key 需要迁移，其余保持稳定
+- 减少 1 个节点：只有该节点上的 key 需要重新分配
+
+**RSS-Bridge 中启用的方式**（需修改 `MemcachedCache`）：
+
+```php
+class MemcachedCache implements CacheInterface
+{
+    public function __construct(Logger $logger, array $servers)
+    {
+        $this->conn = new \Memcached();
+        $this->conn->setOption(\Memcached::OPT_DISTRIBUTION, \Memcached::DISTRIBUTION_CONSISTENT);
+        $this->conn->setOption(\Memcached::OPT_LIBKETAMA_COMPATIBLE, true); // Ketama 算法
+        foreach ($servers as $server) {
+            $this->conn->addServer($server['host'], $server['port']);
+        }
+    }
+}
+```
+
+同时需要在 `CacheFactory` 中读取 `MemcachedCache.servers` 配置数组而非单个 `host`/`port`。
+
+### 13.5 集群架构设计
+
+#### 方案一：Memcached + 客户端分片（一致性散列）
+
+```
+┌──────────────┐
+│ RSS-Bridge   │
+│ 所有实例     │──┐
+└──────────────┘  │
+                  │  客户端一致性散列
+┌──────────────┐  │  (PHP Memcached 扩展内置)
+│ RSS-Bridge   │──┤
+│ 所有实例     │  │
+└──────────────┘  │
+                  ▼
+        ┌───────────────────────────────┐
+        │ cache-01  cache-02  cache-03  │
+        │ (32GB)    (32GB)    (32GB)    │
+        └───────────────────────────────┘
+        总容量 ~96GB，无副本，单节点故障丢 1/N 数据
+```
+
+**优缺点**：
+- ✅ 简单，不依赖额外代理层
+- ✅ PHP Memcached 原生支持，配置即开
+- ❌ 节点故障时该节点数据丢失（回源压力上升）
+- ❌ 所有 RSS-Bridge 实例配置必须完全一致（节点列表顺序会影响散列）
+
+#### 方案二：Twemproxy / Nutcracker 代理分片
+
+```
+                    ┌────────────────────┐
+                    │   Twemproxy        │
+                    │  (代理层，统一端口) │
+                    └────────┬───────────┘
+                             │  代理端一致性散列
+        ┌────────────────────┼────────────────────┐
+        ▼                    ▼                    ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Memcached-01 │     │ Memcached-02 │     │ Memcached-03 │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+**优缺点**：
+- ✅ 客户端零改造，RSS-Bridge 认为自己只连一个 Memcached
+- ✅ 代理层管理节点增删，对应用透明
+- ❌ 增加新的基础设施组件和故障点
+- ❌ 代理本身可能成为性能瓶颈
+
+#### 方案三：Redis Cluster（服务端分片）
+
+```
+                    Redis Cluster（6 节点，3 主 3 从）
+        ┌────────────────────────────────────────────────────┐
+        │                                                    │
+        │  Master-01 ── Slave-01   (slot 0-5460)            │
+        │  Master-02 ── Slave-02   (slot 5461-10922)        │
+        │  Master-03 ── Slave-03   (slot 10923-16383)       │
+        │                                                    │
+        └────────────────────┬───────────────────────────────┘
+                             │  MOVED/ASK 重定向协议
+                    ┌────────┴──────────┐
+                    │  RSS-Bridge 集群   │
+                    │  (phpredis 扩展)   │
+                    └───────────────────┘
+```
+
+**优缺点**：
+- ✅ 服务端管理分片，客户端只需连接任意节点
+- ✅ 支持主从复制，节点故障自动故障转移
+- ✅ 可水平扩展（增加 master 节点 + 重新分片）
+- ❌ 需要 Redis 技术栈支持
+- ❌ 客户端需支持 Cluster 协议（phpredis 原生支持）
+
+### 13.6 分片策略选型建议
+
+| 场景 | 推荐方案 | 节点数 | 容量 |
+|------|---------|--------|------|
+| 单实例 + 小流量 | 单机 Memcached / SQLite | 1 | ≤ 10GB |
+| 多实例 + 中等流量 | Memcached + 一致性散列（客户端） | 2~5 | 10~100GB |
+| 多实例 + 高可用 | Redis Cluster（3 主 3 从） | 6+ | 100GB+ |
+| 超大流量 + 专业运维 | Twemproxy + Memcached 集群 | 5+ | 200GB+ |
+
+---
+
+## 十四、持久化缓存的快照与备份策略
+
+### 14.1 各后端的持久化能力
+
+| 后端 | 持久化 | 存储介质 | 数据可备份 | 恢复可行性 |
+|------|--------|---------|-----------|-----------|
+| **NullCache** | 无 | — | — | — |
+| **ArrayCache** | 无 | 内存 | 否 | 否 |
+| **FileCache** | ✅ 全量持久化 | 磁盘文件 | ✅ 可直接复制 | ✅ 拷贝回目录即可 |
+| **SQLiteCache** | ✅ 全量持久化 | 单数据库文件 | ✅ 单文件备份 | ✅ 拷贝回即可 |
+| **MemcachedCache** | ❌ 纯内存 | 内存 | 否（除非 `memcached-tool dump`） | ❌ 重启丢失 |
+| **Redis**（假想） | ✅ RDB / AOF | 磁盘 + 内存 | ✅ 内置备份机制 | ✅ 多种恢复方式 |
+
+### 14.2 FileCache 备份方案
+
+FileCache 的数据是每个 key 对应一个独立文件（MD5 哈希命名），备份策略最简单。
+
+#### 冷备份（停机后拷贝）
+
+```bash
+# 步骤1：停止 RSS-Bridge（如 PHP-FPM、Nginx）
+systemctl stop php-fpm nginx
+
+# 步骤2：完整拷贝缓存目录
+cp -r /var/www/rss-bridge/cache /var/backup/rss-bridge-cache-$(date +%Y%m%d)
+
+# 步骤3：启动 RSS-Bridge
+systemctl start php-fpm nginx
+```
+
+**优点**：数据一致，无拷贝期间的写冲突
+**缺点**：需要停机窗口，不适用于高可用场景
+
+#### 热备份（在线复制）
+
+```bash
+# 使用 rsync 增量备份，不停止服务
+rsync -av --delete \
+    /var/www/rss-bridge/cache/ \
+    /var/backup/rss-bridge-cache/
+
+# 如果担心复制期间的文件写入不一致，可以使用 LVM 快照
+lvcreate --size 10G --snapshot --name cache-snap /dev/vg0/lv-cache
+mount /dev/vg0/cache-snap /mnt/cache-snap
+cp -r /mnt/cache-snap /var/backup/
+umount /mnt/cache-snap
+lvremove /dev/vg0/cache-snap
+```
+
+**关键风险**：FileCache 没有文件锁，热备份期间如果有并发写入，备份数据可能包含部分写入的损坏文件。但由于 FileCache 是 Cache-Aside 模式，即使损坏也只是下次读取失败后重新回源，不会导致功能异常。
+
+#### 恢复
+
+```bash
+# 清空旧缓存（可选）
+rm -rf /var/www/rss-bridge/cache/*.cache
+
+# 还原备份
+cp -r /var/backup/rss-bridge-cache-20250614/* /var/www/rss-bridge/cache/
+
+# 修正权限
+chown -R www-data:www-data /var/www/rss-bridge/cache/
+chmod 755 /var/www/rss-bridge/cache/
+```
+
+### 14.3 SQLiteCache 备份方案
+
+SQLite 是单文件数据库，备份需要特别注意写入期间的一致性。
+
+#### 方式一：`.backup` 命令（推荐）
+
+SQLite 内置了在线备份机制，比直接拷贝文件更安全：
+
+```bash
+# 在线备份（不影响读写，SQLite 自己做一致性保证）
+sqlite3 /var/www/rss-bridge/cache/cache.db ".backup '/var/backup/cache-$(date +%Y%m%d).db'"
+```
+
+内部原理：SQLite 会创建一个快照，逐页复制，即使期间有写入也能保证备份的一致性。
+
+#### 方式二：VACUUM INTO（同时压缩）
+
+```bash
+# 导出一个"干净"的数据库（无碎片、无已删除页）
+sqlite3 /var/www/rss-bridge/cache/cache.db \
+    "VACUUM INTO '/var/backup/cache-clean-$(date +%Y%m%d).db'"
+```
+
+这不仅是备份，还相当于做了一次数据库压缩（VACUUM 回收已删除记录的空间）。
+
+#### 方式三：直接拷贝（仅冷备份可用）
+
+```bash
+# 仅在 RSS-Bridge 停止时使用
+systemctl stop php-fpm
+cp /var/www/rss-bridge/cache/cache.db /var/backup/
+systemctl start php-fpm
+```
+
+**严禁在运行时直接拷贝**：如果拷贝期间 SQLite 正在写入 WAL（Write-Ahead Log），拷贝出来的文件可能损坏。
+
+#### 定期 VACUUM 维护
+
+SQLiteCache 的 `clear()` 和 `prune()` 只删除记录但不回收磁盘空间。长期运行后数据库文件会膨胀。建议定期执行：
+
+```bash
+# 每周执行一次，回收空闲空间（可在业务低峰期）
+sqlite3 /var/www/rss-bridge/cache/cache.db "VACUUM;"
+```
+
+#### 恢复
+
+```bash
+# 替换数据库文件
+systemctl stop php-fpm
+cp /var/backup/cache-20250614.db /var/www/rss-bridge/cache/cache.db
+chown www-data:www-data /var/www/rss-bridge/cache/cache.db
+systemctl start php-fpm
+```
+
+### 14.4 Memcached 快照（有限支持）
+
+Memcached 本质是纯内存缓存，**不提供可靠的持久化机制**。但有有限的导出方式：
+
+```bash
+# 使用 libmemcached 自带的 memcached-tool 导出（非事务性，仅供参考）
+memcached-tool cache-host:11211 dump > cache-dump-$(date +%Y%m%d).txt
+
+# 导入
+memcached-tool cache-host:11211 load < cache-dump-20250614.txt
+```
+
+**重要限制**：
+- `dump` 命令只能导出**当前未过期**的条目，但**不会保留 TTL**（导入后所有条目变为永久或设置相同 TTL）
+- 导出过程不是原子的，期间有写入会导致导出数据不一致
+- 生产环境不依赖 Memcached 作为持久化数据源
+
+### 14.5 Redis 快照与备份（假想后端）
+
+如果添加 RedisCache 后端，Redis 提供两级持久化：
+
+#### RDB 快照（默认）
+
+```bash
+# 触发一次 BGSAVE（后台异步快照）
+redis-cli BGSAVE
+
+# 配置自动快照（redis.conf）
+save 900 1    # 900 秒内有 1 次写操作 → 快照
+save 300 10   # 300 秒内有 10 次写操作 → 快照
+save 60 10000 # 60 秒内有 10000 次写操作 → 快照
+```
+
+生成的 `dump.rdb` 文件存储在 Redis 工作目录，直接拷贝即可备份。
+
+#### AOF 日志（Append-Only File）
+
+```
+# redis.conf
+appendonly yes
+appendfsync everysec   # 每秒 fsync，性能与可靠性的平衡
+```
+
+AOF 记录每一条写入命令，类似数据库的 redo log。恢复时重新执行所有命令即可还原数据。
+
+#### 恢复优先级
+
+Redis 启动时优先检查 AOF 文件（因为数据更完整），只有 AOF 不存在时才加载 RDB。
+
+### 14.6 备份策略模板
+
+| 场景 | 备份频率 | 保留策略 | 验证方式 |
+|------|---------|---------|---------|
+| **个人部署**（FileCache） | 每周 1 次 | 保留最近 2 份 | 抽检 key 是否存在 |
+| **中型部署**（SQLiteCache） | 每日 1 次，BGSAVE 在线备份 | 保留最近 7 日 + 每周 1 份保留 1 月 | 每周恢复到测试库验证完整性 |
+| **大型部署**（Redis Cluster） | RDB 每日备份 + AOF 实时追加 | RDB 保留 30 日 + AOF 保留 7 日 | 定期演练故障恢复流程 |
+| **极高可用** | 跨地域复制（主从/集群） + 每日冷备份 | 冷备份保留 90 日 | 每月灾难恢复演练 |
+
+---
+
+## 十五、缓存过期事件订阅与业务回调
+
+### 15.1 当前状态：无事件机制
+
+RSS-Bridge 的 `CacheInterface` 是**纯 CRUD 接口**，没有任何事件通知机制：
+
+```php
+interface CacheInterface
+{
+    public function get(string $key, $default = null);
+    public function set(string $key, $value, ?int $ttl = null): void;
+    public function delete(string $key): void;
+    public function clear(): void;
+    public function prune(): void;
+    // 没有 onExpire / onSet / onDelete 等事件回调
+}
+```
+
+各后端在 `get()` 中检测到过期时，要么直接删除（FileCache、ArrayCache），要么静默忽略（SQLiteCache），**不会向上层代码发出任何通知**。
+
+### 15.2 业务上需要过期回调的场景
+
+虽然 RSS-Bridge 当前没有使用过期回调，但以下场景在业务上是合理的：
+
+| 场景 | 回调时机 | 期望行为 |
+|------|---------|---------|
+| **令牌自动刷新** | API access_token 过期时 | 自动发起请求刷新 token，避免下次请求时临时刷新导致延迟 |
+| **速率限制标记解除** | Bridge 的 `rate_limit` key 过期时 | 记录日志或重置内部限流状态 |
+| **缓存预热触发** | 高频 Bridge 的缓存过期时 | 后台异步重新抓取，实现 stale-while-revalidate |
+| **监控告警** | 大批量缓存过期时 | 触发告警，预防缓存雪崩 |
+| **资源释放** | 大对象缓存过期时 | 触发关联的临时文件/目录清理 |
+
+### 15.3 过期事件的实现层次
+
+缓存过期事件的实现有两个层次：**惰性过期（懒检测）** 和 **主动过期（服务端推送）**。
+
+#### 层次一：惰性过期检测（PHP 端可实现）
+
+惰性过期依赖于 `get()` 调用时才检测到 key 已过期。这是 FileCache / ArrayCache / SQLiteCache 目前采用的方式。
+
+**实现方案**：在缓存实现中注册过期回调，`get()` 检测到过期时触发。
+
+```php
+// 在 CacheInterface 中新增事件注册方法
+interface CacheInterface
+{
+    // ...原有方法...
+    public function onExpire(callable $callback): void;
+}
+
+// 以 FileCache 为例
+class FileCache implements CacheInterface
+{
+    private array $expireCallbacks = [];
+
+    public function onExpire(callable $callback): void
+    {
+        $this->expireCallbacks[] = $callback;
+    }
+
+    public function get(string $key, $default = null)
+    {
+        $cacheFile = $this->createCacheFile($key);
+        // ...读取与反序列化...
+        $expiration = $item['expiration'] ?? time();
+
+        if ($expiration !== 0 && $expiration <= time()) {
+            // 触发过期回调
+            foreach ($this->expireCallbacks as $callback) {
+                try {
+                    $callback($key, $item['value'] ?? null);
+                } catch (\Throwable $e) {
+                    $this->logger->warning('Expire callback failed', ['key' => $key]);
+                }
+            }
+            $this->delete($key);
+            return $default;
+        }
+        return $item['value'];
+    }
+}
+```
+
+**缺点**：
+- 只能检测被 `get()` 访问到的 key。如果某个 key 过期后从未被访问，回调永远不会触发
+- 回调在请求线程内执行，会增加用户请求的响应延迟
+
+#### 层次二：主动过期（服务端推送，仅 Redis/Memcached 支持）
+
+主动过期由缓存服务端在 key 到期时主动通知客户端，不需要等待 `get()` 调用。
+
+**Redis Keyspace Notifications**：
+
+```bash
+# redis.conf 中启用键空间通知（接收过期事件）
+notify-keyspace-events Ex
+```
+
+订阅方式（PHP 端）：
+
+```php
+$redis = new \Redis();
+$redis->connect('redis-host', 6379);
+
+// 订阅 0 号数据库的过期事件
+$redis->subscribe(['__keyevent@0__:expired'], function ($redis, $channel, $message) {
+    $expiredKey = $message;
+
+    // 根据 key 前缀分发业务回调
+    if (str_starts_with($expiredKey, 'server_')) {
+        // 服务端响应缓存过期，可异步预刷新
+        // refresh_source_cache($expiredKey);
+    } elseif (str_starts_with($expiredKey, 'http_')) {
+        // Feed 响应缓存过期
+        // preheat_feed_cache($expiredKey);
+    }
+});
+```
+
+**优点**：
+- 真正的"到期即通知"，不依赖 `get()` 调用
+- 回调可以在独立进程中执行，不阻塞用户请求
+
+**缺点**：
+- 仅 Redis 原生支持（Memcached 不提供）
+- Redis 的过期事件是"尽力而为"——如果 Redis 崩溃，部分事件会丢失
+- 需要额外的常驻进程（或 Swoole/ReactPHP 的事件循环）来维护订阅连接
+
+### 15.4 完整事件模型设计
+
+若需要扩展 `CacheInterface` 支持事件，建议采用以下模型：
+
+```php
+interface CacheInterface
+{
+    // 原有 CRUD 方法...
+
+    public function on(string $event, callable $callback): void;
+}
+
+// 事件类型定义
+final class CacheEvents
+{
+    public const BEFORE_GET  = 'before_get';   // 读取前
+    public const AFTER_GET   = 'after_get';    // 读取后（含命中/未命中）
+    public const BEFORE_SET  = 'before_set';   // 写入前
+    public const AFTER_SET   = 'after_set';    // 写入后
+    public const BEFORE_DEL  = 'before_delete';// 删除前
+    public const AFTER_DEL   = 'after_delete'; // 删除后
+    public const ON_HIT      = 'hit';          // 缓存命中
+    public const ON_MISS     = 'miss';         // 缓存未命中
+    public const ON_EXPIRE   = 'expire';       // 缓存过期（主动或惰性）
+    public const ON_EVICT    = 'evict';        // 内存不足被淘汰（仅 Redis/Memcached）
+}
+```
+
+**典型用法**：
+
+```php
+// 命中率统计
+$cache->on(CacheEvents::ON_HIT, fn($k) => $stats->increment('hits'));
+$cache->on(CacheEvents::ON_MISS, fn($k) => $stats->increment('misses'));
+
+// 令牌自动刷新
+$cache->on(CacheEvents::ON_EXPIRE, function ($key, $oldValue) {
+    if ($key === 'SpotifyBridge_token') {
+        // 后台队列任务：重新获取 token
+        enqueue_job(new RefreshSpotifyTokenJob());
+    }
+});
+
+// 慢查询日志
+$cache->on(CacheEvents::AFTER_GET, function ($key, $value, $elapsedMs) {
+    if ($elapsedMs > 100) {
+        $logger->warning("Slow cache get: {$key} took {$elapsedMs}ms");
+    }
+});
+```
+
+### 15.5 事件模型的实现成本对比
+
+| 方案 | 可实现性 | 过期事件精度 | 性能影响 | 推荐度 |
+|------|---------|-------------|---------|--------|
+| **惰性检测 + 装饰器** | 高（纯 PHP 实现，不依赖后端） | 低（仅被访问到的 key） | 中（请求线程内执行） | ⭐⭐⭐ |
+| **惰性检测 + 后端扩展** | 高（修改各缓存类） | 低（仅被访问到的 key） | 中（请求线程内执行） | ⭐⭐ |
+| **Redis 键空间通知** | 中（需常驻进程） | 高（服务端推送） | 低（独立进程） | ⭐⭐⭐⭐ |
+| **修改 CacheInterface 接口** | 低（需改所有后端和测试） | 视后端而定 | 视实现而定 | ⭐ |
+
+### 15.6 业务回调的最佳实践
+
+无论采用哪种实现方式，都应遵守以下原则：
+
+1. **回调必须非阻塞**：过期回调不应执行耗时操作（如 HTTP 请求），应将任务投递到消息队列由后台 worker 执行
+2. **回调异常必须隔离**：单个回调出错不能影响缓存操作本身，也不能影响其他回调
+3. **回调必须幂等**：同一条过期事件可能被触发多次（极端情况），回调逻辑必须可重入
+4. **事件不保证可靠性**：不要在过期回调中处理核心业务逻辑（如计费、库存扣减），缓存事件是"尽力而为"的
+5. **避免回调链过长**：不要在回调中又触发缓存操作，防止递归和死循环
+
