@@ -573,3 +573,379 @@ dependencies.php
 4. 在配置文件中设置 `cache.type = "Redis"`
 
 无需修改任何上层代码（Middleware、Action、Bridge），因为它们只依赖 `CacheInterface`。
+
+---
+
+## 十、缓存预热与启动加载策略
+
+### 10.1 当前行为：无预热，懒加载填充
+
+RSS-Bridge **没有缓存预热机制**。应用启动时不会主动加载任何数据到缓存中，所有缓存条目都是由实际请求触发后逐步填充的。
+
+启动时的缓存初始化流程：
+
+```
+请求到达
+   │
+   ▼
+bootstrap.php
+   │  加载 autoload、常量、工具函数
+   │
+   ▼
+Configuration::loadConfiguration()
+   │  解析 config.ini.php
+   │  如果项目根目录存在 DEBUG 文件且内容为空 → 强制 cache.type = "array"
+   │
+   ▼
+dependencies.php
+   │  注册 DI 容器服务
+   │  $container['cache'] = $cacheFactory->create(cache.type)
+   │
+   ▼
+RssBridge::main()
+   │  此时缓存实例已创建，但内部为空
+   │
+   ▼
+CacheMiddleware::invoke()
+   │  cache->get() → 未命中（空缓存）
+   │
+   ▼
+DisplayAction::invoke()
+   │  执行 Bridge 抓取
+   │  cache->set() → 首次写入
+   │
+   ▼
+后续请求
+   │  逐步填充缓存
+```
+
+**关键特征**：
+
+1. **冷启动全空**：无论使用哪个后端，首次启动时缓存都是空的
+2. **按需填充**：每个缓存条目只在第一次被请求时创建
+3. **无批量预热**：没有"启动时预加载所有 Bridge 的 Feed"之类的机制
+
+### 10.2 开发模式的特殊行为
+
+当项目根目录存在 `DEBUG` 文件（内容为空）时，`Configuration` 会自动将 `cache.type` 切换为 `array`（`lib/Configuration.php:38-43`）：
+
+```php
+if (file_exists(__DIR__ . '/../DEBUG')) {
+    $debug = trim(file_get_contents(__DIR__ . '/../DEBUG'));
+    if ($debug === '') {
+        self::setConfig('system', 'env', 'dev');
+        self::setConfig('cache', 'type', 'array');
+    }
+}
+```
+
+这意味着开发模式下每次请求结束后缓存自动销毁，等效于禁用缓存。开发者可以观察到每次请求都走完整抓取路径。
+
+### 10.3 各后端启动特征
+
+| 后端 | 启动时操作 | 冷启动表现 | 预热可能性 |
+|------|-----------|-----------|-----------|
+| **NullCache** | 无 | 所有请求直达后端 | 无意义 |
+| **ArrayCache** | 无 | 进程首次请求全 miss | 不可跨请求预热 |
+| **FileCache** | 无（不扫描目录） | 首次 `get()` 时按需读取文件 | 已有文件即预热 |
+| **SQLiteCache** | 打开/创建数据库文件 | 首次 `get()` 时 SQL 查询 | 已有数据即预热 |
+| **MemcachedCache** | `addServer()`（不立即连接） | 首次 `get()` 时才连接 | 已有数据即预热 |
+
+**FileCache / SQLiteCache 的隐式预热**：由于它们使用磁盘持久化，服务重启后缓存数据不会丢失。重启后的第一次请求如果命中已有缓存文件/记录，就直接返回——这等效于"被动预热"。而 MemcachedCache 重启后数据丢失，必须从冷状态开始。
+
+### 10.4 预热策略建议
+
+如果业务上希望减少冷启动影响，可考虑以下方案：
+
+| 策略 | 实现方式 | 适用场景 |
+|------|---------|---------|
+| **定时预热脚本** | 编写 cron 脚本，定期请求高频 Bridge 的 Feed URL | 专用部署、高可用要求 |
+| **健康检查触发** | 在负载均衡器健康检查中访问核心 Bridge URL，同时完成缓存填充 | 容器化部署（K8s liveness/readiness） |
+| **选择持久化后端** | 使用 FileCache / SQLiteCache 替代 MemcachedCache | 不容忍冷启动空缓存的场景 |
+| **多级缓存** | 在 Bridge 层实现本地 ArrayCache + 远端持久化缓存的两级策略 | 高并发场景 |
+
+> **注意**：预热需要遵守目标网站的速率限制。RSS-Bridge 各 Bridge 的 `CACHE_TIMEOUT` 就是为此设计的——默认 3600 秒（1 小时），预热频率不应超过此间隔。
+
+---
+
+## 十一、缓存后端迁移路径（File → Redis）
+
+### 11.1 迁移的必要性
+
+典型迁移场景：从小规模 FileCache 部署升级到 Redis，以解决：
+- 文件系统 inode 耗尽
+- 并发写入竞态
+- prune 扫描目录的 O(n) 开销
+- 多实例无法共享缓存
+
+### 11.2 数据格式差异分析
+
+迁移的核心难点在于各后端的**数据存储格式不同**：
+
+| 维度 | FileCache | SQLiteCache | MemcachedCache | Redis（假想） |
+|------|-----------|-------------|----------------|--------------|
+| **key 编码** | `md5($key)` | `sha1($key, raw)` | `sha1($key)` | 建议 `sha1($key)` |
+| **value 编码** | PHP serialize | PHP serialize | 原生（Memcached 自动序列化） | 需选择（见下文） |
+| **过期存储** | 内嵌在 value 中 | 单独列 `updated` | 服务端管理 | 服务端管理（TTL） |
+| **元数据** | `key`/`expiration`/`value` | `key`/`updated`/`value` | 仅 value | 仅 value |
+
+**关键问题**：FileCache 的 key 经过了 `md5()` 哈希，而如果 Redis 使用 `sha1()` 哈希，两者无法直接映射。原始 key 在 FileCache 的 value 中有保存（`$item['key']`），可以作为迁移桥接。
+
+### 11.3 迁移方案
+
+#### 方案一：直接切换（推荐，零停机）
+
+由于 RSS-Bridge 的缓存是 **Cache-Aside 模式**，缓存丢失不会导致功能异常，只会导致短暂的全量回源。因此最简单的迁移方式是：
+
+```
+1. 部署 Redis 服务
+2. 实现 RedisCache 类（遵循 CacheInterface）
+3. 在 CacheFactory 中注册 RedisCache
+4. 修改配置 cache.type = "Redis"
+5. 重启应用
+```
+
+**优点**：简单、无风险
+**缺点**：冷启动期间全量回源，可能短暂增加目标网站请求量
+**适用**：缓存可接受短暂空窗的场景
+
+#### 方案二：双写迁移（平滑过渡）
+
+如果需要平滑过渡，避免冷启动冲击：
+
+```
+阶段一：双写
+┌──────────────┐     ┌──────────┐
+│ Application  │────→│ FileCache │  （读）
+│              │     └──────────┘
+│              │────→│ RedisCache │  （写）
+└──────────────┘     └──────────┘
+
+阶段二：验证 Redis 数据完整性后，切换读源到 Redis
+
+阶段三：移除 FileCache
+```
+
+**实现要点**：
+1. 创建 `DualWriteCache` 装饰器，实现 `CacheInterface`
+2. `get()` 优先从 FileCache 读（旧数据），miss 时从 Redis 读
+3. `set()` 同时写入两个后端
+4. 运行一段时间后，Redis 中的数据逐渐覆盖 FileCache
+5. 确认 Redis 数据完整后，切换为纯 Redis
+
+**适用**：对可用性要求极高、不能容忍冷启动空窗的场景
+
+#### 方案三：脚本迁移（历史数据迁移）
+
+如果需要将 FileCache 中的历史数据导入 Redis：
+
+```php
+// migrate_file_to_redis.php（示意代码）
+$fileCache = new FileCache($logger, ['path' => PATH_CACHE]);
+$redisCache = new RedisCache($logger, $redisConfig);
+
+foreach (scandir(PATH_CACHE) as $filename) {
+    if (!str_ends_with($filename, '.cache')) continue;
+
+    $data = file_get_contents(PATH_CACHE . $filename);
+    $item = unserialize($data);
+    if ($item === false) continue;
+
+    $originalKey = $item['key'];           // FileCache 保存了原始 key
+    $expiration  = $item['expiration'];     // 0 = 永久, 否则为 unix timestamp
+    $value       = $item['value'];
+
+    $ttl = 0;
+    if ($expiration > 0) {
+        $ttl = $expiration - time();
+        if ($ttl <= 0) continue;           // 已过期，跳过
+    }
+
+    $redisCache->set($originalKey, $value, $ttl > 0 ? $ttl : null);
+}
+```
+
+**注意**：
+- FileCache 的 value 中保存了原始 key（`$item['key']`），这是迁移的关键
+- SQLiteCache 同样可以用类似方式迁移，从 `storage` 表读取原始 key
+- MemcachedCache 不保存原始 key（无法反查），不适合作为迁移源
+- 迁移脚本应在低流量时段执行
+
+### 11.4 迁移检查清单
+
+| 步骤 | 检查项 |
+|------|--------|
+| 部署前 | Redis 服务可用、PHP redis 扩展已安装、RedisCache 类已实现并通过测试 |
+| 切换前 | 配置文件 `cache.type` 已更新、CacheFactory 已注册 RedisCache 分支 |
+| 切换后 | HealthAction 返回 200、首个 Bridge 请求正常返回、日志无缓存相关异常 |
+| 观察期 | 监控回源请求量是否逐步回落、Redis 内存使用是否稳定、TTL 是否正常过期 |
+| 收尾 | 确认 FileCache 数据不再被引用后，清理旧缓存文件/目录 |
+
+---
+
+## 十二、缓存监控指标与命中率统计
+
+### 12.1 当前状态：无内置监控
+
+RSS-Bridge **没有内置的缓存命中率统计或监控指标**。`CacheInterface` 的 `get()` / `set()` 方法不记录任何计量数据，也不输出命中率、延迟等指标。
+
+目前代码中唯一的可观测性来自日志，但仅覆盖异常场景：
+
+| 组件 | 日志级别 | 触发条件 |
+|------|---------|---------|
+| `FileCache` | `warning` | 反序列化失败、写入失败 |
+| `SQLiteCache` | `error` / `warning` | 反序列化失败、SQL 执行异常 |
+| `MemcachedCache` | `warning` | 写入失败（附带 resultCode/resultMessage/errorCode） |
+| `CacheMiddleware` | 无 | 不记录命中/未命中 |
+
+**结论**：正常流量下，缓存操作完全"静默"，没有任何可观测的指标输出。
+
+### 12.2 关键监控指标定义
+
+若需构建缓存监控体系，以下指标值得关注：
+
+#### 核心指标
+
+| 指标 | 定义 | 计算方式 | 告警建议 |
+|------|------|---------|---------|
+| **命中率** | 缓存命中次数占总查询次数的比例 | `hits / (hits + misses) * 100%` | < 50% 持续 10 分钟 |
+| **绝对命中量** | 单位时间内命中次数 | 计数器 | 突降至 0 可能是缓存清空 |
+| **绝对未命中量** | 单位时间内未命中次数 | 计数器 | 突增可能是缓存失效 |
+| **平均读取延迟** | `get()` 操作的平均耗时 | 计时器 | FileCache > 10ms, SQLiteCache > 5ms |
+| **平均写入延迟** | `set()` 操作的平均耗时 | 计时器 | FileCache > 50ms |
+| **缓存条目总数** | 当前存储的 key 数量 | 各后端特有方式 | 接近容量上限时告警 |
+
+#### 分层指标
+
+| 层级 | 指标 | 采集点 |
+|------|------|--------|
+| **HTTP 响应层** | Feed 命中率 / 304 返回率 | `CacheMiddleware::__invoke()` |
+| **服务端响应层** | 源站请求次数 / 304 协商次数 | `getContents()` |
+| **页面内容层** | DOM 解析次数 / 缓存命中次数 | `getSimpleHTMLDOMCached()` |
+| **Bridge 业务层** | 各 Bridge 缓存命中率 | `BridgeAbstract::loadCacheValue()` |
+
+#### 后端特有指标
+
+| 后端 | 指标 | 采集方式 |
+|------|------|---------|
+| **FileCache** | 缓存目录文件数、磁盘使用量 | `scandir()` + `filesize()` |
+| **SQLiteCache** | 数据库文件大小、记录数 | `SELECT COUNT(*) FROM storage` |
+| **MemcachedCache** | 内存使用率、 eviction 数、当前连接数 | Memcached `stats` 命令 |
+| **Redis** | 内存使用、key 数、hit/miss 统计 | Redis `INFO` 命令 |
+
+### 12.3 监控实现方案
+
+#### 方案一：装饰器模式（推荐）
+
+在不修改 `CacheInterface` 的前提下，用装饰器包装任意缓存后端：
+
+```php
+class InstrumentedCache implements CacheInterface
+{
+    private CacheInterface $inner;
+    private int $hits = 0;
+    private int $misses = 0;
+    private array $readLatencies = [];
+
+    public function get(string $key, $default = null)
+    {
+        $start = microtime(true);
+        $result = $this->inner->get($key, $default);
+        $elapsed = microtime(true) - $start;
+
+        $this->readLatencies[] = $elapsed;
+
+        if ($result !== $default) {
+            $this->hits++;
+        } else {
+            $this->misses++;
+        }
+        return $result;
+    }
+
+    public function getStats(): array
+    {
+        return [
+            'hits'      => $this->hits,
+            'misses'    => $this->misses,
+            'hit_rate'  => $this->hits + $this->misses > 0
+                ? $this->hits / ($this->hits + $this->misses)
+                : 0,
+            'avg_read_latency_ms' => $this->readLatencies
+                ? array_sum($this->readLatencies) / count($this->readLatencies) * 1000
+                : 0,
+        ];
+    }
+
+    // set(), delete(), clear(), prune() 委托给 $this->inner
+}
+```
+
+**接入方式**：在 DI 容器中包装原始缓存实例
+
+```php
+$container['cache'] = function ($c) {
+    $rawCache = $cacheFactory->create(Configuration::getConfig('cache', 'type'));
+    return new InstrumentedCache($rawCache);
+};
+```
+
+**优点**：不侵入现有代码、不改变接口、可随时开启/关闭
+
+#### 方案二：日志埋点
+
+在关键路径添加 debug 级别日志：
+
+```php
+// CacheMiddleware 中
+$cachedResponse = $this->cache->get($cacheKey);
+$this->logger->debug('Cache ' . ($cachedResponse ? 'hit' : 'miss'), [
+    'key' => $cacheKey,
+    'layer' => 'http_response',
+]);
+
+// getContents() 中
+$cachedResponse = $cache->get($cacheKey);
+$this->logger->debug('Cache ' . ($cachedResponse ? 'hit' : 'miss'), [
+    'key' => $cacheKey,
+    'layer' => 'server_response',
+]);
+```
+
+在 `dev` 环境下（`system.env = dev`），DEBUG 级别日志会输出到 `error_log`，可用于本地调试。生产环境可通过 `logging.file_path` + `logging.file_level = DEBUG` 将日志写入文件，再由外部工具（如 ElasticSearch / Grafana Loki）聚合分析。
+
+**优点**：改动最小，利用现有日志基础设施
+**缺点**：日志量大时影响性能，需要外部工具聚合
+
+#### 方案三：Prometheus 指标暴露
+
+添加一个 `/metrics` 端点（新 Action），暴露 Prometheus 格式的指标：
+
+```
+# TYPE rssbridge_cache_hits_total counter
+rssbridge_cache_hits_total{backend="file",layer="http"} 1234
+rssbridge_cache_hits_total{backend="file",layer="server"} 567
+
+# TYPE rssbridge_cache_misses_total counter
+rssbridge_cache_misses_total{backend="file",layer="http"} 89
+rssbridge_cache_misses_total{backend="file",layer="server"} 12
+
+# TYPE rssbridge_cache_latency_seconds summary
+rssbridge_cache_latency_seconds{backend="file",operation="get",quantile="0.5"} 0.0003
+rssbridge_cache_latency_seconds{backend="file",operation="get",quantile="0.99"} 0.0021
+```
+
+**适用**：已有 Prometheus + Grafana 监控体系的生产部署
+
+### 12.4 外部监控（无需改代码）
+
+在不修改 RSS-Bridge 代码的前提下，可通过以下方式监控缓存状态：
+
+| 方法 | 监控对象 | 实现方式 |
+|------|---------|---------|
+| **文件系统监控** | FileCache 文件数/目录大小 | `find cache/ -name '*.cache' \| wc -l` + `du -sh cache/` |
+| **SQLite 数据库监控** | SQLiteCache 记录数/文件大小 | `sqlite3 cache.db "SELECT COUNT(*) FROM storage"` + `ls -lh cache.db` |
+| **Memcached 监控** | MemcachedCache 内存/命中率 | `echo "stats" \| nc memcached 11211` |
+| **Redis 监控** | RedisCache 内存/命中率/eviction | `redis-cli INFO stats` |
+| **HTTP 响应时间监控** | 整体缓存效果 | 对比有缓存/无缓存时的响应时间 |
+| **日志分析** | 缓存异常 | 解析日志中的 `warning`/`error` 级别缓存消息 |
