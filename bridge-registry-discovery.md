@@ -1247,3 +1247,516 @@ DisplayAction catch
 3. **无退避策略**：HTTP 重试是立即重试，没有指数退避
 4. **无降级数据**：失败时不会返回上一次成功的旧 Feed 数据（除非缓存层恰好命中）
 5. **重试仅限网络层**：HTTP 429/503 等应用层限流不会触发重试
+
+---
+
+## 补充 G：并发抓取、协程管理与资源竞争
+
+RSS-Bridge 的并发模型与传统同步 PHP 应用完全一致——**单请求单线程、顺序执行、无协程、无并发抓取**。理解这一点很重要：不存在"多个桥接器在同一个请求中并发抓取"的场景，并发只发生在"多个用户同时发起不同请求"这个 Web 服务器层面。
+
+### G.1 单请求执行模型
+
+每个 HTTP 请求的执行路径是**完全同步**的：
+
+```
+DisplayAction::__invoke()
+    │
+    ├─ BridgeFactory::create()            ← 同步实例化桥接器
+    │
+    ├─ $bridge->collectData()             ← 同步执行桥接器逻辑
+    │     │
+    │     ├─ getContents()  → curl_exec() ← 阻塞式 HTTP 请求
+    │     ├─ getContents()  → curl_exec() ← 阻塞式（如有多个请求则排队执行）
+    │     └─ ...
+    │
+    ├─ FormatFactory::create($format)     ← 同步创建格式化器
+    │
+    └─ $format->render()                  ← 同步渲染输出
+```
+
+**关键点**：
+- 桥接器内部如果发起多个 HTTP 请求（例如分页抓取），它们是**顺序阻塞**执行的，不会并行
+- 一个桥接器请求占用一个 PHP-FPM 工作进程，直到完整响应返回后才释放
+- 没有 Swoole、没有 ReactPHP、没有 curl_multi、没有 pcntl_fork —— 整个代码库完全同步
+
+### G.2 无协程 / 无异步 I/O 的证据
+
+全代码库搜索 `swoole`、`curl_multi`、`pcntl`、`fork`、`async`、`coroutine` 等关键词，仅在三个桥接器的注释或类名中偶尔出现（如 `GithubTrendingBridge`、`COPRBridge`、`HeiseBridge`），核心框架层完全没有并发相关实现。
+
+唯一涉及多请求的底层函数 `getContents()` 也是单请求模型：
+
+```php
+// lib/http.php — CurlHttpClient::request()
+$ch = curl_init();
+// ... 设置各种 curl option ...
+$body = curl_exec($ch);    // 阻塞，直到响应返回或超时
+curl_close($ch);
+```
+
+### G.3 多请求并发（Web 服务器层面）
+
+并发抓取出现在**不同用户请求**之间，由 Web 服务器（Nginx/Apache + PHP-FPM）管理：
+
+| 资源 | 并发控制方式 |
+|------|-------------|
+| PHP 进程数 | `pm.max_children`（PHP-FPM 配置），默认通常 5~50 |
+| 单进程内存限制 | `memory_limit`（php.ini），默认通常 128MB |
+| 单请求执行时长 | `max_execution_time`（php.ini），默认 30 秒 |
+| HTTP 请求超时 | `http.timeout`（RSS-Bridge 配置），默认 5 秒 |
+
+**实际并发上限**约等于 PHP-FPM 的 `max_children` 配置值。
+
+### G.4 资源竞争分析
+
+由于单请求单线程模型，**同一请求内不存在线程安全问题**。资源竞争仅发生在共享资源层面：
+
+#### 缓存竞争（FileCache 为例）
+
+`FileCache::set()` 的写操作**没有加锁**：
+
+```php
+// caches/FileCache.php
+public function set(string $key, $value, int $ttl): void
+{
+    $file = $this->getCacheFile($key);
+    $dir = dirname($file);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+    file_put_contents($file, $value);  // 无 LOCK_EX 标志
+}
+```
+
+这意味着：
+- 两个请求同时写同一个缓存 key 可能出现**写撕裂**（部分写入）
+- `mkdir()` 并发创建同一目录时，一个成功另一个可能返回 false（代码有 `is_dir` 判断但非原子）
+- 但 `CacheMiddleware` 的缓存 key 基于完整请求参数生成，不同桥接器/参数 key 不同，冲突概率很低
+
+#### SQLiteCache 竞争
+
+SQLite 本身有文件级写锁，`SQLiteCache::set()` 依赖 SQLite 的内置锁机制，安全性高于 FileCache，但高并发下写请求会排队阻塞。
+
+#### HTTP 客户端竞争
+
+无连接池，每次 `getContents()` 新建一个 cURL 句柄，请求完成后关闭。不存在连接复用竞争，但也没有 keep-alive 优化。
+
+### G.5 全局状态竞争
+
+**文件**: `lib/RssBridge.php` → 中间件链执行
+
+每个请求独立创建所有对象：
+- `new RssBridge($container)`：每次请求全新实例
+- `new BridgeFactory($cache, $logger)`：每次请求重新扫描目录
+- `CacheMiddleware` / `ExceptionMiddleware`：每次请求全新中间件实例
+- `BridgeFactory::create($name)`：每次请求 `new XxxBridge(...)`
+
+PHP 的 shared-nothing 架构天然避免了请求间的内存状态竞争，唯一竞争点是**外部共享资源**（缓存文件、SQLite 数据库、日志文件、网络连接）。
+
+### G.6 日志写入竞争
+
+Logger 写入默认使用文件（`LoggerFile`）：
+
+```php
+// lib/LoggerFile.php
+file_put_contents($file, $message, FILE_APPEND);  // FILE_APPEND 在多数 POSIX 系统上是原子的
+```
+
+`FILE_APPEND` 模式在 POSIX 系统上对单个 write 调用是原子的（小于 PIPE_BUF，通常 4KB），一般日志行不会出现交叉写入。但大日志消息可能被拆分。
+
+### G.7 资源竞争总结表
+
+| 资源类型 | 是否存在竞争 | 风险等级 | 说明 |
+|---------|------------|---------|------|
+| 内存/对象状态 | 否 | — | PHP shared-nothing 架构，请求间隔离 |
+| FileCache 写入 | 是 | 低 | 无文件锁，可能写撕裂，但缓存失效后自动恢复 |
+| SQLiteCache 写入 | 是（受保护） | 极低 | SQLite 文件级写锁保证一致性，高并发排队 |
+| 日志写入 | 是（弱） | 极低 | FILE_APPEND 原子性，小于 PIPE_BUF 时安全 |
+| HTTP 连接池 | 否 | — | 无连接池，每次新建 cURL |
+| 配置文件读取 | 否 | — | 只读，进程启动时加载一次 |
+
+---
+
+## 补充 H：输出格式协商与转换流程
+
+RSS-Bridge 支持 **6 种输出格式**，由 `FormatFactory` 管理，每种格式对应一个独立实现类，所有格式共享同一中间数据模型（`FeedItem` 数组）。
+
+### H.1 格式发现与注册
+
+**文件**: `lib/FormatFactory.php:7-16`
+
+与桥接器发现机制完全一致：扫描 `formats/` 目录，正则匹配文件名。
+
+```php
+$iterator = new \FilesystemIterator(__DIR__ . '/../formats');
+foreach ($iterator as $file) {
+    if (preg_match('/^([^.]+)Format\.php$/U', $file->getFilename(), $m)) {
+        $this->formatNames[] = $m[1];
+    }
+}
+sort($this->formatNames);
+```
+
+发现后调用 `sort()` 按字母序排列，与桥接器的 "scandir 原始顺序" 略有不同。
+
+### H.2 六种输出格式
+
+| 格式类 | 文件名 | MIME 类型 | 标准/规范 |
+|--------|-------|-----------|-----------|
+| `MrssFormat` | `formats/MrssFormat.php` | `application/rss+xml` | RSS 2.0 + Media RSS 扩展 |
+| `AtomFormat` | `formats/AtomFormat.php` | `application/atom+xml` | RFC 4287 Atom Syndication |
+| `JsonFormat` | `formats/JsonFormat.php` | `application/json` | JSON Feed Version 1 |
+| `HtmlFormat` | `formats/HtmlFormat.php` | `text/html` | 自定义 HTML 页面（内置其他格式链接） |
+| `PlaintextFormat` | `formats/PlaintextFormat.php` | `text/plain` | PHP `print_r()` 调试输出 |
+| `SfeedFormat` | `formats/SfeedFormat.php` | `text/plain` | sfeed TSV 格式（tab 分隔） |
+
+### H.3 格式协商流程
+
+**无 HTTP Accept 协商**。格式选择完全由 `?format=` URL 参数决定，不遵循 `Accept` 头。
+
+#### 参数来源与默认值
+
+**文件**: `actions/DisplayAction.php:22, 33-35`
+
+```php
+$format = $request->get('format');
+if (!$format) {
+    return new Response(render(__DIR__ . '/../templates/error.html.php',
+        ['message' => 'You must specify a format']), 400);
+}
+```
+
+`format` 参数是必需的，无默认值。前端卡片的 "Generate feed" 按钮默认提交 `format=Html`：
+
+```php
+// actions/FrontpageAction.php:235-240
+$form .= html_tag('button', 'Generate feed', [
+    'type'  => 'submit',
+    'name'  => 'format',
+    'value' => 'Html',    // 默认 Html 格式
+    'formtarget' => '_blank',
+]);
+```
+
+#### 参数规范化
+
+**文件**: `lib/FormatFactory.php:36-51`
+
+```php
+protected function sanitizeName(string $name): ?string
+{
+    $name = ucfirst(strtolower($name));          // HTML → Html, html → Html
+    if (preg_match('/(.+)(?:\.php)/', $name, $m)) { $name = $m[1]; } // 去 .php
+    if (preg_match('/(.+)(?:Format)/i', $name, $m)) { $name = $m[1]; } // 去 Format 后缀
+    if (in_array($name, $this->formatNames)) {
+        return $name;
+    }
+    return null;
+}
+```
+
+| 用户输入 | 规范化结果 |
+|---------|-----------|
+| `Html` | `Html` |
+| `html` | `Html` |
+| `HTML` | `Html` |
+| `AtomFormat` | `Atom` |
+| `Json.php` | `Json` |
+| `InvalidFormat` | `null`（抛 InvalidArgumentException） |
+
+### H.4 格式转换核心数据模型
+
+所有格式共享同一中间模型，由 `FormatAbstract` 定义：
+
+```php
+// lib/FormatAbstract.php
+abstract class FormatAbstract
+{
+    protected array $feed = [];    // Feed 元数据：name, uri, icon, donationUri
+    protected array $items = [];   // FeedItem 对象数组
+    protected int $lastModified;   // 最后修改时间戳
+
+    abstract public function render(): string;   // 各格式实现此方法完成转换
+}
+```
+
+`FeedItem` 是统一条目数据结构，包含 `title/uri/content/timestamp/author/enclosures/categories/uid/thumbnail` 等字段。
+
+### H.5 转换执行流程
+
+**文件**: `actions/DisplayAction.php:126-137`
+
+```php
+$formatFactory = new FormatFactory();
+$format = $formatFactory->create($format);   // 1. 创建格式化器实例
+
+$format->setItems($items);                   // 2. 注入条目数据（FeedItem[]）
+$format->setFeed($bridge->getFeed());        // 3. 注入 Feed 元数据
+$format->setLastModified($now);              // 4. 注入修改时间
+
+$headers = [
+    'last-modified' => gmdate('D, d M Y H:i:s ', $now) . 'GMT',
+    'content-type'  => $format->getMimeType() . '; charset=UTF-8',  // 5. 设置正确 Content-Type
+];
+$body = $format->render();                   // 6. 各格式的 render() 完成转换
+return new Response($body, 200, $headers);
+```
+
+### H.6 各格式转换细节
+
+#### MrssFormat（RSS 2.0 + Media RSS）
+
+**文件**: `formats/MrssFormat.php`
+
+使用 PHP `DomDocument` 构建 XML：
+- Root `<rss version="2.0">` 含 `xmlns:atom` 和 `xmlns:media` 命名空间
+- Feed 元数据 → `<channel>` 下的 `<title>/<link>/<description>/<image>/<atom:link>` 等
+- 条目 → `<item>` 下的 `<title>/<link>/<guid>/<pubDate>/<description>/<category>` 等
+- 附件 → `<media:content url="..." type="..."/>`（Media RSS 命名空间）
+- 支持 iTunes podcast 扩展（`xmlns:itunes`）
+
+#### AtomFormat（RFC 4287）
+
+**文件**: `formats/AtomFormat.php`
+
+同样基于 `DomDocument`：
+- Root `<feed xmlns="http://www.w3.org/2005/Atom">`
+- Feed 元数据 → `<title>/<icon>/<logo>/<link rel="alternate">/<link rel="self">/<id>/<updated>/<author>`
+- 条目 → `<entry>` 下的 `<title type="html">/<published>/<updated>/<id>/<link>/<author>/<content type="html">`
+- `<id>` 三级降级策略：item UID → URI → `sha1(title+content)`
+- 附件 → `<link rel="enclosure" type="..." href="..."/>`
+- 缩略图 → `<media:thumbnail url="..."/>`
+
+#### JsonFormat（JSON Feed 1.0）
+
+**文件**: `formats/JsonFormat.php`
+
+映射到 JSON Feed 规范字段：
+- `version` → 固定 `https://jsonfeed.org/version/1`
+- `title/home_page_url/feed_url/icon/favicon` → Feed 元数据
+- `items[].id/title/author/date_modified/url/content_html|content_text/attachments/tags` → 条目
+- 非标准字段 → `items[]._rssbridge.{...}`（vendor extension）
+- 编码：`JSON_PRETTY_PRINT | JSON_INVALID_UTF8_IGNORE`
+
+#### HtmlFormat（自定义 HTML 页面）
+
+**文件**: `formats/HtmlFormat.php`
+
+这是最特殊的格式，不输出 Feed，而是输出一个**人类可读的 HTML 页面**，并且在页面中自动生成其他 5 种格式的订阅链接：
+
+```php
+// 遍历所有非 Html 格式，生成链接
+$formatNames = $formatFactory->getFormatNames();
+foreach ($formatNames as $formatName) {
+    if ($formatName === 'Html') { continue; }
+    $formatUrl = '?' . str_ireplace('format=Html', 'format=' . $formatName, $queryString);
+    $formats[] = [
+        'url'  => $formatUrl,
+        'name' => $formatName,
+        'type' => $formatObject->getMimeType(),
+    ];
+}
+```
+
+用户首次点击 "Generate feed" 打开 Html 页面，再从该页面选择真正想要的订阅格式。
+
+#### PlaintextFormat（调试用）
+
+直接 `print_r($feed + ['items' => $items])`，输出 PHP 数组结构，用于开发调试。
+
+#### SfeedFormat（sfeed TSV）
+
+输出 tab 分隔的纯文本，每行一个条目，适配 [sfeed](https://codemadness.org/sfeed.html) 极简 RSS 阅读器。
+
+### H.7 格式处理链路总览
+
+```
+Bridge::collectData()
+    │ 产出：FeedItem[]（数组）
+    ▼
+$bridge->getItems() → FormatAbstract::setItems()
+    │ 统一为 FeedItem 对象数组
+    ▼
+FormatAbstract::setFeed() + setLastModified()
+    │
+    ▼
+$format->render()（多态分发）
+    ├─ MrssFormat     → DomDocument 构建 RSS 2.0 XML
+    ├─ AtomFormat     → DomDocument 构建 Atom XML
+    ├─ JsonFormat     → 数组映射 + json_encode()
+    ├─ HtmlFormat     → 渲染 HTML 模板 + 其他格式链接
+    ├─ PlaintextFormat → print_r()
+    └─ SfeedFormat    → sprintf() 拼接 TSV 行
+    │
+    ▼
+Response($body, 200, ['content-type' => $format->getMimeType()])
+```
+
+---
+
+## 补充 I：管理员维护界面与桥接器健康状态展示
+
+RSS-Bridge 的"维护界面"体系非常精简，没有传统 CMS 那种完整的后台管理面板。现有功能分散在 4 个 Action 中，全部是只读或简单模式切换。
+
+### I.1 健康检查端点（HealthAction）
+
+**文件**: `actions/HealthAction.php`
+
+```
+GET ?action=health
+```
+
+极简健康检查，返回固定的 `200 OK` JSON：
+
+```json
+{
+    "code": 200,
+    "message": "all is good"
+}
+```
+
+这个端点不做任何实际检查（不验证数据库、不验证缓存、不探测桥接器），只是确认 PHP 进程在运行。适合用于 Kubernetes/负载均衡器的 liveness/readiness probe。
+
+### I.2 桥接器连通性探测（ConnectivityAction）
+
+**文件**: `actions/ConnectivityAction.php`
+
+这是最接近"桥接器健康面板"的功能，**仅在 `env=dev` 时可用**。
+
+#### 两种调用方式
+
+| URL | 行为 |
+|-----|------|
+| `?action=connectivity` | 返回 HTML 页面，前端 JS 逐个 AJAX 探测所有桥接器 |
+| `?action=connectivity&bridge=Xxx` | 对单个桥接器发起 cURL 探测，返回 JSON 结果 |
+
+#### 单个桥接器探测逻辑
+
+```php
+// actions/ConnectivityAction.php:40-66
+private function reportBridgeConnectivity($bridgeClassName)
+{
+    $bridge = $this->bridgeFactory->create($bridgeClassName);
+    $curl_opts = [
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_FOLLOWLOCATION => true,
+    ];
+    $result = [
+        'bridge'     => $bridgeClassName,
+        'successful' => false,
+        'http_code'  => null,
+    ];
+    try {
+        $response = getContents($bridge::URI, [], $curl_opts, true);
+        $result['http_code'] = $response->getCode();
+        if (in_array($result['http_code'], [200])) {   // 仅 200 算成功
+            $result['successful'] = true;
+        }
+    } catch (\Exception $e) {
+        // 失败不抛异常，successful 保持 false
+    }
+    return new Response(Json::encode($result), 200, ['content-type' => 'text/json']);
+}
+```
+
+**探测策略**：
+- 目标：桥接器的 `URI` 常量（即目标网站首页）
+- 超时：5 秒连接超时
+- 成功判定：HTTP 200（不接受 201/301/302 等）
+- 权限：仅探测已启用（whitelisted）的桥接器
+
+#### 前端批量探测页面
+
+**文件**: `templates/connectivity.html.php` + `static/connectivity.js`
+
+页面结构：
+- 顶部进度条 Bootstrap `progress-bar`
+- 状态消息条（显示当前探测到第几个）
+- 搜索框（前端过滤已探测桥接器）
+
+JS 逻辑：从 ListAction 获取所有桥接器列表，**逐个串行**发起 `?action=connectivity&bridge=Xxx` AJAX 请求，成功显示绿色、失败显示红色。
+
+**注意**：是串行而非并行请求，避免对目标站点造成压力。
+
+### I.3 维护模式（MaintenanceMiddleware）
+
+**文件**: `middlewares/MaintenanceMiddleware.php`
+
+```ini
+[system]
+enable_maintenance_mode = false
+```
+
+设为 `true` 后，所有请求（除 `?action=health` 外——它在中间件之前返回）都返回 503 错误页：
+
+```html
+503 Service Unavailable
+RSS-Bridge is down for maintenance.
+```
+
+这是一个**全局开关**，不是针对单个桥接器的。切换方式：编辑 `config.ini.php`。无 UI 界面操作。
+
+### I.4 首页警告条（FrontpageAction 的 messages）
+
+**文件**: `actions/FrontpageAction.php:22-27`
+
+首页会在顶部展示两类警告（如果存在）：
+
+```php
+// 1. 配置声明但文件不存在的桥接器
+foreach ($this->bridgeFactory->getMissingEnabledBridges() as $missingEnabledBridge) {
+    $messages[] = [
+        'body'  => sprintf('Warning : Bridge "%s" not found', $missingEnabledBridge),
+        'level' => 'warning'
+    ];
+}
+
+// 2. 其他系统消息（目前仅 missing bridges）
+```
+
+最终通过模板变量渲染在首页顶部。
+
+### I.5 错误统计与报告阈值
+
+**文件**: `actions/DisplayAction.php:107-112`
+
+DisplayAction 会对每个桥接器的错误做计数（存储在缓存中，TTL 5 天）：
+
+```php
+$cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+$report = $this->cache->get($cacheKey);
+if ($report) {
+    $report = Json::decode($report);
+    $report['count']++;
+} else {
+    $report = ['error' => $code, 'time' => time(), 'count' => 1];
+}
+$this->cache->set($cacheKey, Json::encode($report), 86400 * 5);
+```
+
+但**没有管理界面查看这些统计数据**，只能直接检查缓存后端（文件/SQLite/Memcached）。
+
+### I.6 维护功能矩阵
+
+| 功能 | 实现方式 | 是否有 UI | 权限控制 |
+|------|---------|----------|---------|
+| 服务健康检查 | `?action=health` | 无（纯 JSON） | 公开 |
+| 桥接器连通性探测 | `?action=connectivity` | 有（开发环境） | 仅限 `env=dev` |
+| 全局维护模式 | 配置文件 `enable_maintenance_mode` | 无（改配置） | 管理员 |
+| 缺失桥接器警告 | 首页顶部 messages | 有 | 所有访客可见 |
+| 桥接器启禁配置 | 配置文件 `enabled_bridges` | 无 | 管理员 |
+| 错误次数统计 | 缓存自动记录 | 无 | — |
+| 桥接器参数配置 | 配置文件 `[BridgeName]` 段 | 无 | 管理员 |
+| 捐赠链接展示 | 首页卡片维护者旁 | 有 | 需 `admin.donations = true` |
+
+### I.7 与"完整管理后台"的差距
+
+当前缺失的典型管理功能：
+1. **无桥接器启禁的 Web UI**：必须改配置文件
+2. **无桥接器健康状态仪表盘**：ConnectivityAction 仅限开发环境，无历史趋势
+3. **无错误日志查看器**：需直接访问服务器日志文件
+4. **无缓存管理界面**：无法在 Web 上查看/清理缓存
+5. **无配置编辑器**：所有配置必须通过 `config.ini.php` 文件
+6. **无访问统计/请求日志**：仅有 Nginx/Apache 级别的访问日志
+7. **无用户/权限系统**：除可选的 `authentication.token` 全局 API Token 外无认证
+
+这与 RSS-Bridge 的定位一致——它是一个**轻量级的 Feed 生成中间件**，而非一个需要运维后台的完整服务。管理员通过传统服务器管理方式（SSH、日志、配置文件）即可完成维护。
