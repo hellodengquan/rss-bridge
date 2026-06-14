@@ -1544,3 +1544,647 @@ $cache->on(CacheEvents::AFTER_GET, function ($key, $value, $elapsedMs) {
 4. **事件不保证可靠性**：不要在过期回调中处理核心业务逻辑（如计费、库存扣减），缓存事件是"尽力而为"的
 5. **避免回调链过长**：不要在回调中又触发缓存操作，防止递归和死循环
 
+---
+
+## 十六、缓存与底层存储的一致性选择
+
+### 16.1 RSS-Bridge 的一致性模型：Cache-Aside（旁路缓存）
+
+RSS-Bridge 严格采用 **Cache-Aside（旁路缓存）模式**，这是所有缓存与"底层存储"（即被 Bridge 抓取的第三方网站 API/网页）之间交互的唯一模式。
+
+Cache-Aside 的核心逻辑：
+
+```
+          读流程                          写流程（Bridge 抓取成功）
+             │                                │
+             ▼                                ▼
+    查询缓存                          直接回源抓取（目标网站）
+             │                                │
+       ┌─────┴─────┐                    解析数据
+       │           │                          │
+     命中        未命中                      写入缓存
+       │           │                          │
+       ▼           ▼                          ▼
+   返回缓存     回源抓取                  返回数据
+               / 目标网站 │
+                    │
+                    ▼
+               写入缓存
+                    │
+                    ▼
+               返回数据
+```
+
+这与其他模式的关键区别：
+
+| 模式 | 谁负责同步缓存和存储 | RSS-Bridge 是否适用 |
+|------|-------------------|-------------------|
+| **Cache-Aside** | 应用代码手动管理读写 | ✅ **当前使用** |
+| **Write-Through** | 写时同时写缓存和存储 | ❌ 无"存储"可写（目标站不可写入） |
+| **Write-Behind（Write-Back）** | 先写缓存，异步刷入存储 | ❌ 无"存储"可写 |
+| **Read-Through** | 缓存层自动回源填充 | ❌ RSS-Bridge 的缓存是被动的 |
+| **Refresh-Ahead** | 缓存过期前自动后台刷新 | ❌ 未实现 |
+
+### 16.2 为什么 RSS-Bridge 只能用 Cache-Aside
+
+RSS-Bridge 是一个**只读的聚合服务**——它从第三方网站抓取数据并转换为 Feed，**不向目标网站写入任何数据**。因此不存在"写回存储"的概念，Write-Through 和 Write-Behind 模式天然不适用。
+
+```
+RSS-Bridge 架构中的数据流方向：
+
+┌──────────────┐    读（HTTP GET）    ┌──────────────────┐
+│  RSS-Bridge  │ ───────────────────→ │  目标网站/API    │
+│   (缓存层)    │ ←─────────────────── │  (唯一数据源)    │
+└──────────────┘    返回 HTML/JSON    └──────────────────┘
+         │
+         ▼
+    （单向）写回自身缓存
+```
+
+### 16.3 一致性语义：最终一致 + 弱一致
+
+由于 Cache-Aside 模式加上 TTL 过期策略，RSS-Bridge 的缓存与目标网站之间天然是**弱一致性**（或最终一致性）：
+
+```
+T0: 目标站发布了新文章（RSS-Bridge 不知道）
+T1: 用户请求 → RSS-Bridge 缓存命中 → 返回旧数据（不一致窗口）
+T2: 缓存过期（CACHE_TIMEOUT 到了）
+T3: 用户请求 → 回源抓取 → 获得新数据 → 更新缓存 → 返回新数据
+T3+: 所有请求返回新数据（最终一致）
+```
+
+**不一致窗口长度** = `CACHE_TIMEOUT`（各 Bridge 自定义，默认 3600 秒 = 1 小时）
+
+这意味着用户看到的 Feed 数据最多可能滞后 1 小时。对 RSS 阅读场景来说，这是完全可以接受的折衷。
+
+### 16.4 主动失效机制的缺失
+
+Cache-Aside 模式通常配合**主动失效**（当底层存储变化时主动删除缓存）来减少不一致窗口。但 RSS-Bridge 不具备这个能力：
+
+| 主动失效触发方式 | RSS-Bridge 是否可用 | 原因 |
+|----------------|-------------------|------|
+| **写操作后删缓存** | ❌ | 不向目标站写数据 |
+| **目标站 Webhook 通知** | ❌ | 绝大多数目标站不提供数据变更通知 |
+| **数据库 binlog 订阅** | ❌ | 无权访问目标站数据库 |
+| **定时轮询检测变更** | ⚠️ 理论可行 | 当前未实现，且等同于缩短 TTL |
+
+**结论**：RSS-Bridge 只能依赖 **TTL 被动过期** 来实现数据更新，没有主动失效手段。
+
+### 16.5 getContents() 的特殊一致性：条件请求 + 304 协商
+
+虽然整体是 Cache-Aside + TTL，但 `getContents()` 引入了一层额外的一致性保障：**HTTP 条件请求（If-Modified-Since / If-None-Match）**。
+
+```
+普通 Cache-Aside（CacheMiddleware 层）：
+  get() 命中未过期 → 直接返回，不联系目标站
+  get() 未命中/过期 → 回源抓取 → 写缓存 → 返回
+
+getContents 的增强 Cache-Aside：
+  get() 命中（不检查过期！）→ 提取 Last-Modified/ETag
+                     → 条件请求目标站
+                          ├─ 304 → 用缓存内容（一致性比 TTL 更高）
+                          └─ 200 → 更新缓存（获得最新数据）
+  get() 未命中 → 普通请求 → 写缓存 → 返回
+```
+
+**getContents 的一致性优于普通 Cache-Aside**：
+- 即使缓存已过 TTL，只要目标站内容没变（304），就复用缓存且不浪费带宽
+- 即使缓存还在 TTL 内，只要目标站内容变了，也能在条件请求时发现（前提是 TTL 已过，否则根本不发请求）
+- 但本质还是 TTL 驱动，TTL 内的数据是"盲信任"的
+
+### 16.6 一致性选择的业务权衡
+
+| 一致性级别 | 实现方式 | 数据延迟 | 目标站压力 | RSS-Bridge 现状 |
+|-----------|---------|---------|-----------|----------------|
+| **强一致** | 每次请求都回源 | 0 | 极高 | 仅 DEBUG 模式（ArrayCache）接近 |
+| **读己之写** | 写后立即删缓存 | ~0 | 高 | ❌ 无法实现（无写操作） |
+| **最终一致（短 TTL）** | TTL = 60~300 秒 | 1~5 分钟 | 较高 | 部分实时性强的 Bridge 设置 |
+| **最终一致（长 TTL）** | TTL = 3600~86400 秒 | 1~24 小时 | 低 | ✅ **默认策略** |
+| **条件请求增强** | TTL + ETag/Last-Modified | TTL + 协商延迟 | 中等 | ✅ getContents 层已实现 |
+
+**设计建议**：
+- 对更新频率低的 Bridge（如博客周刊），可设置长 TTL（86400 秒 = 1 天）
+- 对更新频率高的 Bridge（如新闻、社交媒体），设置短 TTL（300~900 秒）并依赖 304 协商节省带宽
+- 不要把 TTL 设为 0（禁用缓存），这会把 RSS-Bridge 变成纯代理，失去了最核心的价值
+
+---
+
+## 十七、缓存击穿与热点 Key 的本地二级缓存策略
+
+### 17.1 三种缓存异常场景辨析
+
+| 术语 | 定义 | 触发条件 | 风险等级 |
+|------|------|---------|---------|
+| **缓存穿透**（Penetration） | 查询不存在的数据，缓存和存储都没有，每次都打到存储 | 恶意请求不存在的 Bridge / URL | 中 |
+| **缓存击穿**（Breakdown） | 单个热点 Key 过期瞬间，大量并发请求同时回源 | 热门 Bridge 的 Feed 缓存过期 | **高** |
+| **缓存雪崩**（Avalanche） | 大量 Key 同时过期，或缓存服务宕机，全量请求打到存储 | 缓存重启 / TTL 全部设为同一值 | **极高** |
+
+RSS-Bridge 在高流量部署下最容易遇到的是**缓存击穿**：某个热门 Bridge（如 YoutubeBridge、TwitterBridge）的 Feed 缓存一旦过期，瞬间可能有成百上千个并发请求同时回源抓取，极可能触发目标网站的速率限制（429 Too Many Requests）。
+
+### 17.2 当前状态：无任何击穿防护
+
+RSS-Bridge **没有内置任何防缓存击穿机制**。`CacheMiddleware` 的逻辑简单直接：
+
+```php
+// CacheMiddleware::__invoke()（简化示意）
+$cacheKey = $this->makeCacheKey($request);
+$cachedResponse = $this->cache->get($cacheKey);
+
+if ($cachedResponse !== null) {
+    return $cachedResponse;  // 命中，直接返回
+}
+
+// 未命中 —— 直接执行抓取（无锁、无单飞、无排队）
+$response = $next($request);
+
+// 写缓存
+$this->cache->set($cacheKey, $response, $this->computeTtl($response));
+return $response;
+```
+
+当热点 Key 过期时，N 个并发请求会同时执行到 `$next($request)`，产生 N 次回源抓取。
+
+### 17.3 防击穿策略一：互斥锁（Mutex Lock）
+
+最经典的防击穿手段：未命中时先尝试获取锁，只有拿到锁的请求去回源，其他请求等待或返回降级数据。
+
+```php
+class LockingCacheMiddleware
+{
+    public function __invoke(Request $request, callable $next): Response
+    {
+        $cacheKey = $this->makeCacheKey($request);
+        $cached = $this->cache->get($cacheKey);
+
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        // 尝试获取锁（用缓存自身实现分布式锁）
+        $lockKey = 'lock:' . $cacheKey;
+        $lockAcquired = $this->cache->set($lockKey, '1', 30, true); // NX + 30s TTL
+
+        if ($lockAcquired) {
+            // 拿到锁 → 回源抓取
+            try {
+                $response = $next($request);
+                $this->cache->set($cacheKey, $response, $this->computeTtl($response));
+                return $response;
+            } finally {
+                $this->cache->delete($lockKey);
+            }
+        }
+
+        // 没拿到锁 → 等待后重试（自旋，或直接返回默认值）
+        usleep(50000); // 50ms
+        return $this->cache->get($cacheKey) ?? $this->fallbackResponse();
+    }
+}
+```
+
+**适用场景**：回源成本高（目标站速率限制严格）但热点 Key 数量不多的情况。
+
+**注意事项**：
+- 锁必须有 TTL，防止持锁进程崩溃导致死锁
+- `set($key, $value, $ttl, true)` 中的 `true` 表示 NX（Only set if not exists），需要各缓存后端支持——目前 RSS-Bridge 的 `CacheInterface::set()` 没有 `$nx` 参数，需要扩展接口
+- Redis/Memcached 原生支持 NX，FileCache/SQLiteCache 需要模拟（先 get 再 set 有竞态，需用文件锁/SQLite 事务保证原子性）
+
+### 17.4 防击穿策略二：Singleflight（单飞模式）
+
+Singleflight（Go 语言标准库模式）是比互斥锁更高效的方式：**同一个 Key 的并发回源请求只执行一次，其他请求共享结果**。
+
+```php
+class SingleflightCache
+{
+    private array $inflight = []; // key => Deferred
+
+    public function getOrFetch(string $key, callable $fetcher, int $ttl)
+    {
+        $cached = $this->cache->get($key);
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        // 已有同 key 的回源正在进行？
+        if (isset($this->inflight[$key])) {
+            // 等待另一个请求的结果（共享）
+            return $this->inflight[$key]->await();
+        }
+
+        // 第一个请求 → 执行回源
+        $deferred = new Deferred();
+        $this->inflight[$key] = $deferred;
+
+        try {
+            $result = $fetcher();
+            $this->cache->set($key, $result, $ttl);
+            $deferred->resolve($result);
+            return $result;
+        } catch (\Throwable $e) {
+            $deferred->reject($e);
+            throw $e;
+        } finally {
+            unset($this->inflight[$key]);
+        }
+    }
+}
+```
+
+**与互斥锁的区别**：
+- 互斥锁：其他请求**阻塞等待**，锁释放后再去读缓存（可能需要再次查询）
+- Singleflight：其他请求**挂起等待**同一份回源结果，完成后所有等待者同时拿到数据，少一次缓存查询
+
+**RSS-Bridge 限制**：PHP-FPM 是**多进程模型**，每个请求是独立进程。`$inflight` 数组存在 PHP 内存中，**无法跨进程共享**。因此：
+- 单 PHP-FPM 进程内 Singleflight 有效（同一进程处理的并发请求会合并）
+- 多进程部署下 Singleflight 无效（需要配合 APCu 或分布式锁实现跨进程版本）
+
+### 17.5 防击穿策略三：本地二级缓存（L1 + L2）
+
+在远端缓存（Redis/Memcached）之上，增加一层进程内缓存（ArrayCache / APCu）作为 L1，形成两级缓存架构：
+
+```
+          请求
+            │
+            ▼
+   ┌─────────────────┐
+   │  L1: 本地缓存    │  (进程内 ArrayCache / APCu，TTL 较短: 10~30s)
+   └───────┬─────────┘
+        命中└────→ 直接返回（极快，无网络开销）
+           未命中
+            │
+            ▼
+   ┌─────────────────┐
+   │  L2: 远端缓存    │  (Redis / Memcached，TTL 较长: 300~3600s)
+   └───────┬─────────┘
+        命中└────→ 写回 L1 → 返回
+           未命中
+            │
+            ▼
+      回源抓取（目标网站）
+            │
+            ▼
+      同时写 L2 + L1 → 返回
+```
+
+**优势**：
+- L1 命中率即使只有 20%，也能大幅减少 L2 的网络请求量
+- 热点 Key 在 L1 TTL 内完全不会打到 L2，更不会回源
+- L2 故障时，L1 可作为降级缓存（部分数据可用）
+- L2 击穿瞬间，L1 仍然提供服务（只要 L1 TTL > 击穿窗口）
+
+**L1 缓存的选择**：
+
+| 方案 | 跨进程共享 | 性能 | PHP 要求 | 适用场景 |
+|------|-----------|------|---------|---------|
+| **ArrayCache** | ❌（仅当前进程） | ⭐⭐⭐⭐⭐ | 无需扩展 | 单进程 / CLI 模式 |
+| **APCu** | ✅（同 PHP-FPM 进程池内） | ⭐⭐⭐⭐ | 需要 `apcu` 扩展 | 多进程生产部署 |
+
+**RSS-Bridge 中的集成方式**：
+
+```php
+// 创建 L1 + L2 组合缓存
+class TwoLevelCache implements CacheInterface
+{
+    public function __construct(
+        private CacheInterface $l1,  // APCuCache / ArrayCache
+        private CacheInterface $l2,  // RedisCache / MemcachedCache
+        private int $l1Ttl = 30,     // L1 的 TTL，显著短于 L2
+    ) {}
+
+    public function get(string $key, $default = null)
+    {
+        // L1 查找
+        $value = $this->l1->get($key, $this->sentinel);
+        if ($value !== $this->sentinel) {
+            return $value;
+        }
+
+        // L1 miss → L2 查找
+        $value = $this->l2->get($key, $this->sentinel);
+        if ($value !== $this->sentinel) {
+            // L2 hit → 回填 L1
+            $this->l1->set($key, $value, $this->l1Ttl);
+            return $value;
+        }
+
+        return $default;
+    }
+
+    public function set(string $key, $value, ?int $ttl = null): void
+    {
+        // 双写：同时写 L2 和 L1
+        $this->l2->set($key, $value, $ttl);
+        $this->l1->set($key, $value, $this->l1Ttl);
+    }
+
+    public function delete(string $key): void
+    {
+        // 先删 L2，再删 L1（防止短暂不一致时 L1 返回旧值）
+        $this->l2->delete($key);
+        $this->l1->delete($key);
+    }
+}
+```
+
+**L1/L2 TTL 比例建议**：L1 TTL 设为 L2 TTL 的 5%~10%。例如 L2=3600s（1h），则 L1=180~360s。这个比例是命中率和一致性的折衷。
+
+### 17.6 防击穿策略四：提前续期（Stale-While-Revalidate）
+
+缓存即将过期但还未过期时，由第一个请求触发**后台异步刷新**，其他请求继续返回旧数据：
+
+```
+           TTL = 3600s
+  ├────────────────────────────┤
+                                过期点
+  ├────────────────────┬───────┤
+       正常期         续期窗口
+       直接返回        第一个请求触发后台刷新
+                        其他请求继续返回旧缓存
+```
+
+```php
+// 在缓存写入时额外记录一个"续期触发时间"（TTL 的 80% 处）
+$item = [
+    'value'       => $data,
+    'expireAt'    => time() + $ttl,
+    'refreshAt'   => time() + (int)($ttl * 0.8), // 80% TTL 时开始续期
+];
+
+// 读取时检查是否进入续期窗口
+public function getWithStaleWhileRevalidate(string $key, $default = null)
+{
+    $item = $this->rawGet($key);
+    if ($item === null) {
+        return $default;
+    }
+
+    if (time() >= $item['refreshAt'] && time() < $item['expireAt']) {
+        // 进入续期窗口但还没过期 → 异步刷新，同时返回旧值
+        $this->triggerAsyncRefresh($key); // 投递到消息队列
+    }
+
+    if (time() >= $item['expireAt']) {
+        return $default; // 已过期，走正常回源
+    }
+
+    return $item['value'];
+}
+```
+
+**RSS-Bridge 限制**：PHP-FPM 无原生异步任务机制，需要配合消息队列（RabbitMQ/Redis Queue）或 cron 定时任务实现。
+
+### 17.7 防雪崩补充：TTL 随机抖动
+
+除了防击穿，还需要防雪崩。最简单有效的手段是给 TTL 加**随机抖动**（jitter）：
+
+```php
+// 原始：所有请求同一 TTL = 3600，大量 Key 会在同一时间过期
+$ttl = 3600;
+
+// 改进：在 ±10% 范围内随机化，打散过期时间
+$ttl = 3600 + random_int(-360, 360);  // 3240 ~ 3960 秒
+```
+
+RSS-Bridge 的 `CacheMiddleware` 对错误响应已经做了抖动（`random_int(300, 900)` 秒），但成功响应还没有。建议成功响应也加抖动。
+
+### 17.8 策略组合建议
+
+| 场景 | 推荐组合 |
+|------|---------|
+| **个人部署**（低流量） | 无需额外防护，当前 Cache-Aside 足够 |
+| **中型部署**（中等流量） | L1（APCu）+ L2（Redis）二级缓存 + TTL 抖动 |
+| **大型部署**（高流量） | L1/L2 二级缓存 + 分布式互斥锁防击穿 + 后台续期 + TTL 抖动 |
+| **极高流量** | 以上全部 + CDN 边缘缓存（Nginx proxy_cache）在 RSS-Bridge 之前再加一层 |
+
+---
+
+## 十八、缓存多语言客户端 SDK 的兼容性
+
+### 18.1 兼容性问题的来源
+
+RSS-Bridge 当前是**纯 PHP 单体应用**，所有缓存读写都由 PHP 代码完成。但在以下场景中，会出现**多语言/多系统共享缓存**的需求：
+
+1. **多服务微服务化**：RSS-Bridge 拆分为 PHP（Feed 生成）+ Go/Python（抓取 Worker）+ Node.js（Webhook 服务），多个服务共享同一个 Redis/Memcached
+2. **运维工具链**：用 Python/Shell 写的缓存分析、预热、迁移脚本需要读写 RSS-Bridge 的缓存
+3. **监控系统**：Prometheus/Grafana 的 Exporter（通常 Go 编写）需要读取缓存指标
+4. **CDN/边缘节点**：Varnish/Nginx 的 Lua 脚本需要直接查询 RSS-Bridge 的缓存
+
+在这些场景下，**缓存的编码协议必须跨语言一致**——否则 PHP 写入的数据 Go 读不懂，反之亦然。
+
+### 18.2 当前编码协议：PHP 专属，不可跨语言
+
+RSS-Bridge 的 FileCache 和 SQLiteCache 使用 **PHP `serialize()` / `unserialize()`** 作为值的编码格式：
+
+| 后端 | Key 编码 | Value 编码 | TTL 存储方式 |
+|------|---------|-----------|-------------|
+| **FileCache** | `md5($key)`（文件名） | PHP `serialize(['key', 'expiration', 'value'])` | 内嵌在序列化数据中 |
+| **SQLiteCache** | `sha1($key, raw)`（BLOB 主键） | PHP `serialize($value)` | 单独列 `updated`（整数） |
+| **MemcachedCache** | `sha1($key)` | Memcached 扩展自动处理（默认 igbinary 或 PHP serialize） | 传给 Memcached 服务端 |
+| **ArrayCache** | 原始 `$key` | 原始 PHP 变量 | 进程内存变量 |
+
+**PHP `serialize()` 的跨语言问题**：
+
+```php
+// PHP 写入
+$value = ['title' => 'Hello', 'items' => [1, 2, 3]];
+file_put_contents('cache.bin', serialize($value));
+// 存储内容: a:2:{s:5:"title";s:5:"Hello";s:5:"items";a:3:{i:0;i:1;i:1;i:2;i:2;i:3;}}
+```
+
+这种格式是 PHP 独有的，其他语言没有标准解析器：
+- Python：需要第三方库 `phpserialize`（功能有限，不支持对象）
+- Go：无成熟库，只能手动解析
+- Node.js：`php-serialize` npm 包（同样不支持对象）
+- Java/JVM：几乎不可用
+
+更严重的是，如果缓存 value 包含 PHP 对象（如 `Response` 对象），`serialize()` 会写入类名和属性——其他语言完全无法还原为对应的对象结构。
+
+### 18.3 存储格式标准化方案
+
+#### 方案一：JSON 编码（推荐，跨语言最友好）
+
+将 value 的编码格式统一为 JSON，所有语言都能原生解析：
+
+```php
+// 写入
+$payload = [
+    'v'   => 1,                    // 格式版本号，方便未来升级
+    'ts'  => time(),               // 写入时间戳
+    'ttl' => $ttl,                 // TTL（秒）
+    'd'   => $this->normalize($value), // 标准化后的数据（纯数组/标量）
+];
+$serialized = json_encode($payload, JSON_UNESCAPED_UNICODE);
+
+// 读取
+$payload = json_decode($serialized, true);
+if ($payload && $payload['v'] === 1) {
+    return $payload['d'];
+}
+```
+
+**JSON 编码的注意事项**：
+1. **资源丢失**：PHP 对象的方法、私有属性、类信息都会丢失——必须在写入前将对象序列化为纯数组
+2. **类型模糊**：JSON 不区分 `int`/`float` 大数字、不区分关联数组和对象（PHP `json_decode` 的 `assoc=true` 可全部转为数组）
+3. **不支持二进制**：二进制数据需 base64 编码（RSS-Bridge 的缓存主要是文本，影响不大）
+4. **循环引用**：含循环引用的 PHP 对象无法 JSON 编码
+
+**Response 对象的标准化**：
+
+`CacheMiddleware` 层缓存的是 `Response` 对象，需要定义跨语言的 JSON 结构：
+
+```json
+{
+  "v": 1,
+  "ts": 1718323200,
+  "ttl": 3600,
+  "d": {
+    "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>...",
+    "statusCode": 200,
+    "headers": {
+      "Content-Type": ["application/rss+xml; charset=utf-8"],
+      "Last-Modified": ["Sat, 14 Jun 2025 00:00:00 GMT"]
+    }
+  }
+}
+```
+
+#### 方案二：MessagePack / CBOR（紧凑二进制 JSON）
+
+如果缓存体积大、JSON 的字符串开销不可接受，可用 MessagePack（紧凑二进制格式）替代：
+
+```
+JSON:  {"title":"Hello","items":[1,2,3]}  →  32 字节
+MsgPack: 等价二进制                         →  19 字节（约省 40%）
+```
+
+各语言的 MsgPack 库支持情况：
+- PHP：`msgpack` 扩展（PECL）
+- Python：`msgpack`（pip）
+- Go：`github.com/vmihailenco/msgpack/v5`
+- Node.js：`@msgpack/msgpack`（npm）
+
+**优势**：比 JSON 体积小 30%~50%，解析速度更快
+**劣势**：二进制格式，不可人类可读，调试不如 JSON 方便
+
+#### 方案三：Protocol Buffers（强类型，高性能）
+
+如果对性能和类型安全有极高要求，可用 Protobuf 定义缓存 schema：
+
+```protobuf
+syntax = "proto3";
+
+package rssbridge.cache;
+
+message CacheEntry {
+  int32 version     = 1;
+  int64 timestamp   = 2;
+  int32 ttl_seconds = 3;
+  bytes data        = 4;  // 根据 key 前缀选择不同的子 message
+}
+
+message HttpResponse {
+  int32 status_code     = 1;
+  string body           = 2;
+  map<string, HeaderValues> headers = 3;
+}
+
+message HeaderValues {
+  repeated string values = 1;
+}
+```
+
+**适用场景**：已有 Protobuf 技术栈、极高流量、对序列化开销敏感的场景
+
+### 18.4 Key 格式标准化
+
+除了 value，key 的格式也需要跨语言一致：
+
+| 组件 | 当前实现 | 标准化建议 |
+|------|---------|-----------|
+| **Key 前缀** | PHP 字符串拼接（`http_`、`server_`、`pages_`、`{Bridge}_`） | ✅ 已天然跨语言，所有语言字符串拼接一致 |
+| **Key 哈希** | FileCache: `md5($key)`, SQLiteCache: `sha1($key)`, Memcached: `sha1($key)` | **统一使用 SHA-1 hex**（所有语言都有标准库） |
+| **TTL 语义** | FileCache: timestamp（过期绝对时间）, SQLiteCache: updated timestamp, Memcached: 秒数（相对 TTL） | **统一使用相对秒数 TTL**（Memcached/Redis 原生语义，写入时由客户端计算绝对时间） |
+
+**标准化后的 Key 协议**：
+
+```
+原始 key (PHP): "http_" . json_encode([path, queryParams])
+       ↓
+跨语言通用:      prefix + ":" + raw_key (可选 URL 编码转义特殊字符)
+       ↓
+存储层:          sha1_hex(通用 key)  →  "a9993e364706816aba3e25717850c26c9cd0d89d"
+```
+
+各语言的 SHA-1 实现对照：
+
+| 语言 | SHA-1 代码 |
+|------|-----------|
+| **PHP** | `sha1($key)` |
+| **Python** | `hashlib.sha1(key.encode()).hexdigest()` |
+| **Go** | `fmt.Sprintf("%x", sha1.Sum([]byte(key)))` |
+| **Node.js** | `crypto.createHash('sha1').update(key).digest('hex')` |
+| **Java** | `DigestUtils.sha1Hex(key)` (Apache Commons) |
+
+### 18.5 跨语言缓存操作兼容性矩阵
+
+假设 RSS-Bridge 改用 `JSON + SHA-1 key + 秒级 TTL` 的标准化协议，各语言操作缓存的兼容性：
+
+| 操作 | PHP | Python | Go | Node.js | 说明 |
+|------|-----|--------|----|---------|------|
+| **计算存储 key** | ✅ | ✅ | ✅ | ✅ | SHA-1 hex 标准 |
+| **读取 value** | ✅ | ✅ | ✅ | ✅ | JSON 标准解析 |
+| **写入 value** | ✅ | ✅ | ✅ | ✅ | JSON 标准编码 |
+| **解析 TTL** | ✅ | ✅ | ✅ | ✅ | 秒级整数 |
+| **反序列化为 Response 对象** | ✅ | ⚠️ | ⚠️ | ⚠️ | 需各语言自行实现 Response 类 + 映射逻辑 |
+| **读取 Bridge 业务数据**（数组） | ✅ | ✅ | ✅ | ✅ | JSON 直接可用 |
+| **条件请求元数据**（ETag/Last-Modified） | ✅ | ✅ | ✅ | ✅ | 缓存 headers 字段中 |
+
+### 18.6 渐进式迁移策略
+
+由于修改编码协议涉及**数据不兼容**，不能一步到位，需要渐进式迁移：
+
+```
+阶段 1：双写
+┌──────────┐
+│  PHP     │──→ JSON 格式（新版）  ←── Python/Go 工具读写（使用新版）
+│ RSS-Bridge│──→ serialize 格式（旧版）  ←── 兼容旧数据
+└──────────┘
+读取时先尝试 JSON 解析，失败则 fallback 到 unserialize
+
+阶段 2：切换读
+PHP 代码只读取 JSON 格式，不再读取 serialize 格式
+旧数据通过 prune/TTL 过期自动清理
+
+阶段 3：清理
+移除 serialize 相关代码，文档中注明 JSON + SHA-1 为正式缓存协议
+```
+
+### 18.7 标准化后的缓存协议文档示例
+
+如果完成了标准化，建议将以下内容固化为接口规范，方便其他语言 SDK 参考实现：
+
+```
+RSS-Bridge Cache Protocol v1.0
+
+1. Key 格式:
+   - 业务 key: "{prefix}:{payload}"
+     prefix ∈ {http, error_reporting, server, pages, lock}
+     或 "{BridgeShortName}:{payload}"
+   - 存储 key: sha1_hex(业务 key)，40 字符小写十六进制
+
+2. Value 格式（JSON）:
+   {
+     "v":   1,                // 协议版本，当前为 1
+     "ts":  1718323200,       // unix 写入时间戳
+     "ttl": 3600,             // TTL（秒），0 表示永久
+     "d":   <任意 JSON 值>    // 实际业务数据
+   }
+
+3. 操作语义:
+   - get(key): 返回 d 字段，若 ts+ttl < now 视为过期
+   - set(key, value, ttl): 按上述 JSON 格式写入
+   - delete(key): 物理删除
+   - clear(): 删除所有 key
+   - prune(): 删除 ts+ttl < now 的所有 key（TTL 由服务端管理的后端无需实现）
+```
+
