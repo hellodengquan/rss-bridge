@@ -1280,7 +1280,316 @@ RSS-Bridge 没有单一 "trial mode" 开关，而是由**生产端 URL 试跑**�
 
 ---
 
-## 十五、关键文件索引
+## 十五、Contrib 自定义桥：Docker 挂载注册 + 文件系统扫描发现
+
+RSS-Bridge 没有独立的 `contrib/` 插件目录扫描机制（`contrib/` 目录仅含 `.gitkeep` 为空），自定义桥的注册与发现通过**两条路径**实现。
+
+### 15.1 路径一：直接文件放置（所有部署方式通用）
+
+与内置 Bridge 完全相同：将 `XxxBridge.php` 放入 `bridges/` 目录即可。三个地方会自动发现：
+
+1. **BridgeFactory 构造函数**（`lib/BridgeFactory.php:19-23`）：
+   ```php
+   foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+       if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+           $this->bridgeClassNames[] = $m[1];
+       }
+   }
+   ```
+   正则只匹配 `*Bridge.php`，非 Bridge 命名的文件会被忽略。
+
+2. **SPL 自动加载器**（`lib/bootstrap.php:29-44`）：
+   ```php
+   spl_autoload_register(function ($className) {
+       $folders = [
+           __DIR__ . '/../bridges/',  // ← 已注册
+           __DIR__ . '/../actions/',
+           ...
+       ];
+       foreach ($folders as $folder) {
+           $file = $folder . $className . '.php';
+           if (is_file($file)) require $file;
+       }
+   });
+   ```
+
+3. **enabled_bridges 白名单**（`config.default.ini.php:11-12`）：
+   ```ini
+   [system]
+   enabled_bridges[] = "*"    ; 或逐一列出 enabled_bridges[] = "XxxBridge"
+   ```
+   `*` 表示全部启用，新增 Bridge 无需改配置。如果是白名单模式，需要在 `config.ini.php` 中追加。
+
+### 15.2 路径二：Docker /config 目录挂载（容器部署专属）
+
+`docker-entrypoint.sh:8-32` 在容器启动时执行一次性注册：
+
+```bash
+find /config/ -type f -name '*' -print0 2> /dev/null |
+while IFS= read -r -d '' file; do
+    file_name="$(basename "$file")"
+    case "$file_name" in
+    *Bridge.php)    yes | cp "$file" /app/bridges/ ;
+                    chown www-data:www-data "/app/bridges/$file_name";
+                    printf "Custom Bridge %s added.\n" $file_name;;
+    *Format.php)    yes | cp "$file" /app/formats/ ;
+                    chown www-data:www-data "/app/formats/$file_name";
+                    printf "Custom Format %s added.\n" $file_name;;
+    config.ini.php) yes | cp "$file" /app/ ;
+                    ...
+    whitelist.txt)  yes | cp "$file" /app/ ;
+                    ...
+    DEBUG)          yes | cp "$file" /app/ ;
+                    ...
+    esac
+done
+```
+
+**关键约束**：
+- 文件名不能含空格（含空格直接跳过）
+- 只匹配 `*Bridge.php` 后缀
+- 用 `yes | cp` 强制覆盖同名文件（允许自定义桥覆盖内置桥）
+- `chown www-data` 确保 PHP 进程可读
+- **仅在容器启动时执行一次**，运行期修改 `/config/` 不会自动同步，需重启容器
+
+### 15.3 命名冲突与优先级
+
+- 文件名匹配：`scandir` 按字典序，同名文件后出现的不会加入 `bridgeClassNames` 数组（但 Docker 拷贝会覆盖文件内容，实际以后拷贝的为准）
+- 大小写不敏感匹配：`createBridgeClassName()` 用 `strtolower` 做 array_search，所以 `?bridge=githubrelease` 和 `?bridge=GithubRelease` 都能命中 `GithubReleaseBridge`
+- 自动加载优先级：`spl_autoload_register` 按 `$folders` 数组顺序查找，`bridges/` 在最前，所以 `bridges/XxxBridge.php` 优先级高于其他目录同名文件（但其他目录不会放 Bridge）
+
+---
+
+## 十六、Bridge Factory 热加载：每次请求 scandir，无持久化缓存
+
+### 16.1 无缓存的扫描机制
+
+`BridgeFactory` 和 `FormatFactory`、`CacheFactory` 一样，**没有使用 CacheInterface 缓存扫描结果**，每次实例化都会重新 `scandir` 目录：
+
+| 组件 | 构造函数扫描 | 扫描路径 | 缓存方式 |
+|---|---|---|---|
+| `BridgeFactory` | `scandir(__DIR__ . '/../bridges/')` | 硬编码相对路径 | 无 |
+| `FormatFactory` | `scandir(__DIR__ . '/../formats/')` | 硬编码相对路径 | 无 |
+| `CacheFactory` | `scandir(PATH_LIB_CACHES)` | 常量定义路径 | 无 |
+
+每次扫描的开销：3 个目录 × 数百文件的 `scandir` + 正则匹配，在现代 SSD 上单请求增加 1~3ms。
+
+### 16.2 与 DI 容器的生命周期衔接
+
+`lib/dependencies.php:24-28` 在 Container 中注册为 lazy 工厂：
+
+```php
+$container['bridgeFactory'] = function ($c) {
+    return new BridgeFactory($c['cache'], $c['logger']);
+};
+```
+
+`Container::offsetGet()`（`lib/Container.php:21-24`）做单例缓存：
+
+```php
+if (!isset($this->resolved[$offset])) {
+    $this->resolved[$offset] = $this->values[$offset]($this);
+}
+return $this->resolved[$offset];
+```
+
+**生命周期模型**：
+```
+HTTP 请求到达
+    │
+    ▼
+index.php → 创建新 Container（每次请求全新实例）
+    │
+    ▼
+RssBridge::run() → DisplayAction 构造参数需要 BridgeFactory
+    │
+    ▼
+Container::offsetGet('bridgeFactory')
+    → resolved['bridgeFactory'] 为空 → 调用工厂函数
+    → new BridgeFactory → scandir bridges/ → 存 resolved 缓存
+    │
+    ▼
+DisplayAction 执行 → 多次调用 bridgeFactory 方法
+    → 全部复用同一个实例，不再 scandir
+    │
+    ▼
+请求结束 → PHP 进程销毁 → Container 和 resolved 缓存全部销毁
+```
+
+### 16.3 "热加载"的真实含义
+
+因为**每次请求都重新扫描**，所以：
+- ✅ 新增 Bridge 文件后，**下一个请求自动发现**，无需重启服务器/清空缓存
+- ✅ 删除 Bridge 文件后，下一个请求自动失效
+- ⚠️ 同一请求过程中新增/删除文件**不会被感知**（因为实例已缓存）
+- ⚠️ 没有 `reload()` / `refresh()` API 手动触发重扫描
+- ⚠️ 没有基于文件 mtime 的增量扫描（每次全量扫描）
+
+这与传统的"热加载"（进程内监听文件变化自动重载）不同——RSS-Bridge 靠** PHP shared-nothing 架构天然实现热加载**，每个请求是独立进程，不存在进程内缓存需要失效的问题。
+
+### 16.4 enabled_bridges 白名单的静态性
+
+`enabled_bridges` 配置在 `Configuration` 构造时（`lib/Configuration.php:27-35`）从 `config.ini.php` 读取，**不会随 BridgeFactory 扫描刷新**。因此：
+- 白名单模式下列出的不存在的 Bridge 会在每次请求时被 `logger->info()` 记录一次（`lib/BridgeFactory.php:38-40`）
+- 新增 Bridge 后如果用白名单模式，必须修改 `config.ini.php` 才会生效（Configuration 每次请求也重新读取，所以修改配置后下个请求生效，无需重启）
+
+---
+
+## 十七、Cron 调度：无内置调度器，依赖外部拉模式
+
+**RSS-Bridge 代码中没有任何 cron 调度器、定时任务或后台进程**。整个系统基于**拉模式（Pull Model）**设计：
+
+```
+RSS 阅读器 ──定期 HTTP GET──▶ RSS-Bridge ──HTTP GET──▶ 源网站
+             (间隔由阅读器配置)           (按需即时抓取)
+```
+
+### 17.1 代码中"cron"的真实含义
+
+Grep 到的 6 个含 "cron" 的文件，全部是** Bridge 解析数据源中的 cron 字段**，不是系统调度：
+
+| 文件 | cron 用途 |
+|---|---|
+| `bridges/CachetBridge.php` | 解析 Cachet 状态页数据中的 `cron` 字段（数据源本身的元数据） |
+| `bridges/BAEBridge.php` | 同上 |
+| `bridges/NHKWorldJapanShowBridge.php` | 同上 |
+| `bridges/KilledbyMicrosoftBridge.php` | 同上 |
+| `static/connectivity.js` | 前端连通性测试的调度描述文案 |
+| `lib/parsedown/Parsedown.php` | Markdown 解析器的无关代码 |
+
+### 17.2 调度触发的四种外部方式
+
+实际部署中，cron 调度完全由外部系统实现：
+
+**方式一：RSS 阅读器轮询（最常见）**
+- 阅读器按用户配置的间隔（通常 15~60 分钟）定期请求 Feed URL
+- RSS-Bridge 按需执行 Bridge::collectData() → 抓取源站 → 渲染格式
+- 服务端缓存（`http_` 命名空间）降低源站压力
+
+**方式二：Linux crontab + curl**
+```bash
+*/15 * * * * curl -s "https://rss-bridge.example.com/?action=display&bridge=Xxx&format=Atom" > /dev/null
+```
+- 主动预热缓存，让第一个真实用户请求命中缓存
+- 适合热门 Bridge
+
+**方式三：Docker HEALTHCHECK 间接触发**
+`Dockerfile` 定义：
+```dockerfile
+HEALTHCHECK --interval=5m --timeout=10s --retries=3 \
+    CMD curl -f http://localhost/ || exit 1
+```
+每 5 分钟访问首页，触发一次 PHP 进程，但不执行具体 Bridge。
+
+**方式四：第三方调度服务（IFTTT / Zapier / n8n）**
+- Webhook 定时触发 RSS-Bridge 的 DisplayAction
+- 结果推送到通知渠道
+
+### 17.3 间接的"调度效果"：缓存 TTL
+
+虽然没有调度器，但 `http_` 缓存的 TTL 机制产生了类似调度的效果：
+```
+T0: 首次请求 → 抓取源站 → 渲染 → 缓存（TTL=3600s）→ 返回 200
+T0+1800s: 第二次请求 → 缓存命中 → 返回缓存 → 不抓取源站
+T0+3601s: 第三次请求 → 缓存过期 → 重新抓取源站 → 刷新缓存 → 返回新 200
+```
+这意味着**每小时最多抓取一次源站**（默认 `CACHE_TIMEOUT = 3600`），等效于 1 小时的最低调度间隔。如果阅读器轮询间隔短于 TTL，实际抓取频率由 TTL 决定。
+
+### 17.4 设计取舍
+
+不内置 cron 的原因：
+1. PHP shared-nothing 模型不适合常驻后台进程
+2. 拉模式与 Feed 生态天然契合（阅读器负责调度）
+3. 降低部署复杂度（无需额外守护进程）
+4. 源站频率限制由缓存 TTL 间接保证
+
+---
+
+## 十八、多 Bridge 并发 Fetch：无并发调度，单请求单 Bridge 串行
+
+**RSS-Bridge 没有多 Bridge 并发抓取机制，也没有跨请求的全局限流。**
+
+### 18.1 单请求的执行模型
+
+每个 HTTP 请求对应 **一个 Bridge**，串行执行：
+
+```
+Request ?action=display&bridge=GithubRelease&u=rss-bridge
+    │
+    ▼
+DisplayAction::execute()
+    ├─ 1. BridgeFactory->create('GithubReleaseBridge')
+    ├─ 2. $bridge->setInput($request->toArray())      # 参数校验
+    ├─ 3. $bridge->collectData()                      # ⬅ 抓取发生在这里
+    │     └─ getContents('https://github.com/rss-bridge/releases')  # 单次 HTTP GET
+    │     └─ 解析 HTML → 组装 FeedItem[]
+    ├─ 4. FormatFactory->create('Atom')
+    └─ 5. $format->setItems($items)->render()
+```
+
+即使 Bridge 内部多次调用 `getContents()`，也是**串行发起**，没有 `curl_multi`、没有 `Guzzle Promise`、没有异步队列。
+
+### 18.2 "多 Bridge"场景的实际处理
+
+只有两个 Action 会遍历多个 Bridge，但**均不并发、也不抓取**：
+
+**DetectAction**（`actions/DetectAction.php:25-38`）：
+```php
+foreach ($this->bridgeFactory->getBridgeClassNames() as $bridgeClassName) {
+    if (!$this->bridgeFactory->isEnabled($bridgeClassName)) continue;
+    $bridge = $this->bridgeFactory->create($bridgeClassName);
+    $params = $bridge->detectParameters($url);  # ⬅ 默认实现不发 HTTP 请求
+    if ($params !== null) {
+        $format = $request->get('format');
+        $uri = '?action=display&bridge=' . $bridgeClassName .
+               '&format=' . $format . '&' . http_build_query($params);
+        return new Response('', 301, ['Location' => $uri]);
+    }
+}
+```
+`detectParameters()` 默认实现（`lib/BridgeAbstract.php:308-323`）仅做 URL 字符串匹配，不发起 HTTP 请求。少数重载此方法的 Bridge 会发请求，但也是串行逐个。
+
+**FindfeedAction**（`actions/FindfeedAction.php:31-46`）：
+同上，但是收集所有命中结果返回 JSON 数组，不做 301 跳转。
+
+### 18.3 限流的真实边界
+
+保护措施完全在**单请求单次抓取**层面，没有全局维度：
+
+| 限流维度 | 实现方式 | 作用范围 |
+|---|---|---|
+| 单请求超时 | `CURLOPT_TIMEOUT = 5s`（默认） | 单次 curl 请求 |
+| 单请求大小 | `CURLOPT_MAXFILESIZE + CURLOPT_PROGRESSFUNCTION` 20MB（默认） | 单次响应 |
+| 重试次数 | `retries = 1`（默认） | 单次 curl 错误 |
+| 源站频率 | 缓存 TTL（默认 3600s） + 源站返回 429 透传 | 同 Bridge 同参数 |
+| 按域名限流 | ❌ 无 | - |
+| 总并发数 | ❌ 无（依赖 php-fpm pm.max_children） | - |
+| 全局 QPS | ❌ 无 | - |
+
+### 18.4 PHP-FPM 层面的隐式并发控制
+
+真实的并发上限由 PHP-FPM 配置决定（`config/php-fpm.conf`）：
+```ini
+pm = dynamic
+pm.max_children = 5        ; 最大同时处理 5 个请求
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+```
+这意味着 RSS-Bridge 实例**最多同时处理 5 个 Bridge 请求**，超出的请求排队。这是隐式的、非业务逻辑层面的并发限制。
+
+### 18.5 没有分布式锁与重复请求抑制
+
+同一 Bridge 同一参数在缓存过期瞬间，可能收到多个并发请求导致"惊群效应"——同时多次抓取源站。代码中没有：
+- `LockInterface` 或类似分布式锁
+- `fetch_in_progress` 标记让后续请求等待第一个完成
+- 基于 Bridge + 参数的请求去重
+
+这是一个已知的设计简化，在缓存命中率高的场景下影响较小。
+
+---
+
+## 十九、关键文件索引
 
 | 文件 | 职责 |
 |---|---|
@@ -1306,6 +1615,7 @@ RSS-Bridge 没有单一 "trial mode" 开关，而是由**生产端 URL 试跑**�
 | `lib/http.php` | `CurlHttpClient`（重试、超时、大小限流、条件请求）、`HttpException` / `CloudFlareException` / `RateLimitException`、Request（fromCli/fromGlobals）、Response |
 | `lib/contents.php` | `getContents()`（服务端缓存 + 条件请求 + 状态码分支）、`getSimpleHTMLDOMCached()` |
 | `lib/bootstrap.php` | PATH_* 常量、自动加载器、helper 全局函数加载 |
+| `lib/Container.php` | DI 容器实现（ArrayAccess + lazy 单例缓存 `$resolved`） |
 | `middlewares/CacheMiddleware.php` | 服务端缓存读取、304 Not Modified 协商、错误响应写入缓存、1% 概率触发 prune |
 | `middlewares/ExceptionMiddleware.php` | 全局异常兜底，统一返回 500 HTML |
 | `middlewares/SecurityMiddleware.php` | 查询参数类型校验（仅允许字符串） |
@@ -1324,11 +1634,12 @@ RSS-Bridge 没有单一 "trial mode" 开关，而是由**生产端 URL 试跑**�
 | `tests/ParameterValidatorTest.php` | ParameterValidator 的单测 |
 | `static/rss-bridge.js` | 前端：Bridge 搜索、Feed Finder AJAX 搜索、exampleValue 一键填充 |
 | `index.php` | 全局异常/错误/关闭 三层 handler 兜底、CLI vs HTTP 入口分流 |
+| `docker-entrypoint.sh` | Docker 容器启动脚本：从 /config 挂载目录复制自定义 Bridge/Format/配置 |
 | `config.default.ini.php` | 默认配置（http 超时/重试/大小、cache 类型、error 输出模式、env、enabled_bridges 等） |
 
 ---
 
-## 十六、设计特点总结
+## 二十、设计特点总结
 
 1. **显式格式，零内容协商**：不依赖 HTTP Accept Header，用查询参数显式指定，简单可预测、便于缓存。
 2. **基于文件系统的格式/缓存/Bridge 注册**：新增任一类只需在对应目录下添加 `*Format.php` / `*Cache.php` / `*Bridge.php`，Factory 扫描自动发现。
@@ -1346,3 +1657,7 @@ RSS-Bridge 没有单一 "trial mode" 开关，而是由**生产端 URL 试跑**�
 14. **CLI 与 HTTP 同一入口**：不调用 `php_sapi_name()`，以 `$argv` 变量是否存在为 CLI 判断依据，argv 平铺为 key=value 后经 `parse_str` 进同一 Request 管道，action 路由和响应与 HTTP 完全一致。
 15. **DEBUG 文件触发环境切换**：根目录下空 `DEBUG` 文件同时触发 `system.env=dev` + `cache.type=array` + PHP 错误转 ErrorException 三重效果，避免开发模式下缓存脏数据和隐藏的 PHP Warning。
 16. **Trial/Test 三条通路并行**：生产路径即试跑路径（前端表单→DisplayAction）+ URL 参数自动探测（DetectAction/FindfeedAction + detectParameters）+ PHPUnit 静态扫描（BridgeImplementationTest 遍历所有 Bridge），三层覆盖从开发者手动试跑到 CI 自动合规检查。
+17. **Contrib 自定义桥双路径注册**：直接放 `bridges/` 目录（所有部署通用，每次请求 scandir 自动发现） + Docker `/config` 挂载（容器启动时复制到 `/app/bridges/`），无需修改注册表。
+18. **Factory 热加载靠 shared-nothing 天然实现**：Bridge/Format/Cache Factory 每次实例化 scandir 无持久化缓存，Container 单例仅在单请求内有效，新增文件下一个请求自动发现，无需重启或清理缓存。
+19. **拉模式架构，无内置 Cron**：依赖 RSS 阅读器/外部 crontab 定时触发，缓存 TTL 间接限制源站抓取频率（默认最低 1 小时 1 次），契合 Feed 生态且降低部署复杂度。
+20. **无并发调度，PHP-FPM 隐式限并发**：单请求单 Bridge 串行执行，Detect/Findfeed 遍历 Bridge 也为串行且默认不发 HTTP；无连接池、无分布式锁、无惊群效应抑制，并发上限由 php-fpm `pm.max_children = 5` 隐式控制。
