@@ -647,34 +647,396 @@ $cacheKey = 'http_' . json_encode($request->toArray());
 
 ---
 
-## 七、关键文件索引
+## 七、Disk Cache 落盘：五种 Cache 后端与 TTL 过期机制
+
+### 7.1 CacheFactory 与后端选择
+
+缓存后端由 `lib/CacheFactory.php` 通过扫描 `caches/` 目录自动发现，配置项 `[cache] type` 决定使用哪一种（默认 `file`）：
+
+| 类 | 配置名 | 存储介质 | TTL 精确性 | 适用场景 |
+|---|---|---|---|---|
+| `FileCache` | `file` | 本地文件系统（每 key 一个文件） | 读时比对（惰性过期） | 默认，单机部署 |
+| `SQLiteCache` | `sqlite` | SQLite3 单文件数据库 | 读时比对（惰性过期），支持索引 | 中规模，减少文件数 |
+| `MemcachedCache` | `memcached` | Memcached 服务端 | 服务端主动过期 | 分布式 / 多机部署 |
+| `ArrayCache` | `array` | PHP 进程内存数组 | 读时比对 | DEBUG 模式 / 单次请求 |
+| `NullCache` | `null` | 空实现，永不存储 | N/A | 禁用缓存 |
+
+DEBUG 模式（存在 `DEBUG` 文件且为空）自动强制使用 `ArrayCache`（`lib/Configuration.php:38-43`）。
+
+### 7.2 FileCache 落盘细节
+
+**key → 路径映射**（`caches/FileCache.php:115-118`）：
+```php
+private function createCacheFile(string $key): string
+{
+    return $this->config['path'] . hash('md5', $key) . '.cache';
+}
+```
+原始 key（可能含特殊字符、超长）先做 MD5，保证文件名合法且等长。路径默认 `./cache/`，可通过 `[FileCache] path` 覆盖。
+
+**文件内容结构**（`caches/FileCache.php:54-60`）：
+```php
+$item = [
+    'key'        => $key,           // 原始 key（便于调试，冗余存储）
+    'expiration' => time() + $ttl,  // 过期时间戳；0 表示永不过期
+    'value'      => $value,         // 任意可序列化 PHP 值（Response 对象、HTML 字符串等）
+];
+file_put_contents($cacheFile, serialize($item));
+```
+使用 PHP 原生 `serialize()`，因此可以缓存 Response 对象等复合结构。`ttl === 0` 时直接跳过不写（避免写一个永不过期的 0 TTL 条目）；`ttl === null` 时 `expiration = 0` 表示永久缓存。
+
+**读取与惰性过期**（`caches/FileCache.php:27-46`）：
+```php
+$data = file_get_contents($cacheFile);
+$item = unserialize($data);
+$expiration = $item['expiration'] ?? time();
+if ($expiration === 0 || $expiration > time()) {
+    return $item['value'];
+}
+$this->delete($key);  // 过期即删（读时触发）
+return $default;
+```
+反序列化失败（文件损坏）也会删除该文件。`prune()` 遍历整个目录删除所有过期文件，由 CacheMiddleware 以 1% 概率随机触发（`middlewares/CacheMiddleware.php:57-60`）。
+
+### 7.3 SQLiteCache 落盘差异
+
+SQLiteCache 用 `sha1(key, true)`（二进制 20 字节）作为 BLOB 主键，value 同样用 `serialize()` 序列化为 BLOB：
+
+```sql
+CREATE TABLE storage ('key' BLOB PRIMARY KEY, 'value' BLOB, 'updated' INTEGER)
+CREATE INDEX idx_storage_updated ON storage (updated)
+```
+
+列名 `updated` 实际存的是过期时间戳（代码注释坦言命名错误）。过期用单条 SQL 批量删除：
+```sql
+DELETE FROM storage WHERE updated > 0 AND updated <= :now
+```
+比 FileCache 逐个文件扫描高效得多。开启 WAL 模式和 `synchronous = NORMAL`，在性能与安全间取平衡。
+
+### 7.4 三种 key 命名空间
+
+整个系统用 cache key 前缀区分三大缓存域，互不干扰：
+
+| 前缀 | 生产方 | 典型 key | 典型 TTL |
+|---|---|---|---|
+| `http_` | CacheMiddleware + DisplayAction | `http_` + `json_encode($_GET)` | Bridge CACHE_TIMEOUT（默认 3600s）或错误响应 5~15min |
+| `server_` | `getContents()` | `server_{url}_{md5(postBody)}` | 固定 864000s（10 天），受 no-cache/no-store 头抑制 |
+| `pages_` | `getSimpleHTMLDOMCached()` | `pages_{url}` | 调用方指定，默认 86400s（1 天） |
+| `error_reporting_` | DisplayAction | `error_reporting_{bridgeName}_{code}` | 固定 432000s（5 天），用于错误频率计数 |
+
+---
+
+## 八、URL 重写与 Sanitization：三级处理链路
+
+URL 处理分为三个层次，各司其职：
+
+### 8.1 第一层：Url 类 — 严格验证与规范化
+
+`lib/Url.php` 是一个"故意做得非常严格"的 URL 解析器，只接受绝对的 http/https URL：
+
+**正则校验**（`lib/Url.php:46-58`）：
+```php
+$pattern = '#^https?://'   // scheme
+    . '([a-z0-9-]+\.?)+'   // 一个或多个域名段
+    . '(\.[a-z]{1,24})?'   // 可选全局 TLD
+    . '(:\d+)?'            // 可选端口
+    . '($|/|\?)#i';        // 结束或 / 或 ?
+```
+额外限制：总长不超过 1500 字符。scheme 非 http/https 直接抛 `UrlException`。
+
+**规范化输出**（`lib/Url.php:129-150`）：
+- 端口 80 自动省略（`http://x:80/` → `http://x/`）
+- path 不以 `/` 开头或含 `//` 前缀均抛异常
+- 不处理 fragment（注释 `// todo: add fragment`）
+
+注意：Url 类目前在代码中使用较少，主要用于 Bridge 内部严格校验；大多数路径仍使用宽松的 `parse_url()` + `urljoin()`。
+
+### 8.2 第二层：urljoin() — 相对 URL 转绝对
+
+`lib/php-urljoin/src/urljoin.php` 是 Python `urllib.parse.urljoin()` 的 PHP 移植，被 50+ Bridge 广泛调用。
+
+**核心合并规则**：
+```
+输入: base = "https://example.com/a/b/page.html"
+      rel  = "../images/photo.png?size=lg#thumb"
+      │
+      ▼
+1. parse_url 拆分为 $pbase 和 $prel
+2. 若 rel 含合法 scheme 且与 base 相同（或在白名单内），保留 rel scheme
+3. 合并：array_merge($pbase, $prel)  →  rel 字段覆盖 base 同名字段
+4. 相对 path 处理：
+   - rel path 非 "/" 开头 → 取 base path 目录 + "/" + rel path
+   - 消除 "./" 前缀
+5. 路径规范化：按 "/" 拆分，逐段消解 ".." 和 "."
+6. 重组：scheme://[user:pass@]host[:port][/path][?query][#fragment]
+```
+
+相对 scheme 的白名单（`$uses_relative`）包括 http/https/ftp/ws/wss 等 20 种，意味着 `javascript:` 等危险 scheme 不会被当作 relative 合并——但如果 rel 本身就是完整的 `javascript:` URL，第 42-48 行会直接返回原 rel（安全隐患，依赖调用方过滤）。
+
+### 8.3 第三层：defaultLinkTo() — HTML 内容中的链接批量补全
+
+`lib/html.php:247-286` 遍历 HTML DOM 中的 `<img src>` 和 `<a href>`，逐一用 `urljoin()` 把相对链接补全为绝对链接：
+
+```php
+foreach ($findByTag('img') as $image) {
+    $image->setAttribute('src', urljoin($url, $image->getAttribute('src')));
+}
+foreach ($findByTag('a') as $anchor) {
+    $anchor->setAttribute('href', urljoin($url, $anchor->getAttribute('href')));
+}
+```
+
+只处理 img 和 a，不处理 `<iframe src>`、`<video src>`、`<source srcset>`、`<link href>` 等。`parseSrcset()`（`lib/html.php:306-329`）单独解析 `srcset` 属性，但不自动重写 URL——需要 Bridge 自行调用。
+
+### 8.4 FeedItem 层的隐式 Sanitization
+
+`lib/FeedItem.php:92-112` 在 `setURI()` 里做了一道隐式过滤：
+```php
+if (!preg_match('#^https?://#i', $uri)) {
+    return;  // 非 http/https 直接丢弃，不存入
+}
+```
+因此 enclosure 和其他字段中的 URL **不会**经过这个过滤——只有 `uri` 字段受保护。enclosure 由 `setEnclosures()` 用 `FILTER_VALIDATE_URL` 校验。
+
+---
+
+## 九、Fetch 层：重试机制、文件大小限流与条件请求
+
+RSS-Bridge 没有实现并发请求调度或全局限流器，HTTP 抓取完全由 `getContents()` + `CurlHttpClient` 串行执行。保护措施体现在三个方面。
+
+### 9.1 请求重试与超时
+
+`CurlHttpClient::request()`（`lib/http.php:65-197`）的重试逻辑：
+
+```php
+$defaultConfig = [
+    'timeout'   => 5,       // [http] timeout，默认 5s
+    'retries'   => 2,       // [http] retries，默认 1（注意：$defaultConfig 写 2，被配置覆盖为 1）
+    'max_redirections' => 5,
+];
+// ...
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) break;
+    if ($tries <= $config['retries']) continue;
+    throw new HttpException(...);
+}
+```
+重试只针对 cURL 层错误（网络不通、DNS 失败、超时），HTTP 4xx/5xx 状态码**不会触发重试**——`curl_exec` 视为成功，后续由 `getContents()` 的 switch 处理。
+
+### 9.2 文件大小限流
+
+由 `[http] max_filesize`（默认 20MB，见 `config.default.ini.php:58`）控制，两种方式双重保险：
+
+```php
+// lib/http.php:119-131
+if ($config['max_filesize']) {
+    // 方式一：依赖服务器返回 Content-Length（可能被伪造或缺失）
+    curl_setopt($ch, CURLOPT_MAXFILESIZE, $config['max_filesize']);
+    // 方式二：回调函数实时监控下载字节数（即使无 Content-Length 也生效）
+    curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+    curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($ch, $downloadSize, $downloaded, ...) {
+        if ($downloaded > $config['max_filesize']) return -1;  // 非零返回中止传输
+        return 0;
+    });
+}
+```
+单位换算在 `getContents()` 侧完成：配置值（MB）× 2²⁰ = 实际字节数。
+
+### 9.3 条件请求与 304 复用
+
+`getContents()`（`lib/contents.php:73-90`）在命中服务端缓存时，自动带上条件请求头让源服务器做 304 判断：
+
+```php
+$cachedResponse = $cache->get($cacheKey);
+if ($cachedResponse) {
+    $lastModified = $cachedResponse->getHeader('last-modified');
+    if ($lastModified) {
+        // 兼容服务器可能发送 Unix 时间戳（非 RFC 7231 格式）
+        $lastModified = new \DateTimeImmutable((is_numeric($lastModified) ? '@' : '') . $lastModified);
+        $config['if_not_modified_since'] = $lastModified->getTimestamp();
+    }
+    $etag = $cachedResponse->getHeader('etag');
+    if ($etag) {
+        $httpHeadersNormalized['if-none-match'] = $etag;
+    }
+}
+```
+
+收到 304 后用缓存 body 填充响应（`lib/contents.php:126-129`）：
+```php
+case 304:
+    $response = $response->withBody($cachedResponse->getBody());
+    break;
+```
+
+只有 200/201/202 会写入缓存（TTL 10 天），且受响应头 `Cache-Control: no-cache / no-store` 抑制。301/302/303 的缓存被注释为 `// todo: cache`，目前重定向响应不落盘。
+
+### 9.4 "并发"与"限流"的真实情况
+
+- **无并发**：PHP-FPM/mod_php 模型下每次请求单进程串行执行，Bridge 中多次 `getContents()` 按顺序发起。没有 curl_multi、没有异步任务、没有连接池。
+- **无全局限流**：没有请求级令牌桶、没有按域名速率限制、没有并发数控制。防护手段仅为：单请求超时（默认 5s）、重试次数（默认 1 次）、响应大小上限（默认 20MB）、以及源站 429 被捕获后抛 `RateLimitException` 返回给客户端。
+- **代理可选**：配置 `[proxy] url` 后所有请求走 HTTP 代理，支持按 Bridge 维度让用户通过 `_noproxy` 参数关闭。
+
+---
+
+## 十、Error 分类降级：异常类型分支与三段式输出策略
+
+### 10.1 异常类继承体系
+
+```
+\Throwable
+ ├─ \Exception
+ │   ├─ HttpException              lib/http.php:13 — HTTP 状态码异常（含 Response）
+ │   │   └─ CloudFlareException    lib/http.php:38 — 识别 CF 拦截页
+ │   ├─ RateLimitException         lib/http.php:6 — 源站限流
+ │   ├─ ClientException            lib/utils.php:250 — Bridge 判定的客户端参数错误
+ │   ├─ UrlException               lib/url.php:5 — URL 校验失败
+ │   └─ 其他 Bridge 抛出的 \Exception — 通用服务端错误
+ └─ \Error (PHP 运行时错误，由异常处理器兜底)
+```
+
+### 10.2 DisplayAction 内的分类分支
+
+`actions/DisplayAction.php:91-124` 按异常类型分四档处理：
+
+```php
+try {
+    $bridge->collectData();
+} catch (\Throwable $e) {
+    if ($e instanceof ClientException) {
+        // 第 1 档：客户端参数错误 —— 仅 debug 日志，不计数，不暴露给用户
+        $this->logger->debug(...);
+    } elseif ($e instanceof RateLimitException) {
+        // 第 2 档：被源站限流 —— 直接返回 429 + 异常 HTML 页
+        $this->logger->debug(...);
+        return new Response(render(exception.html.php), 429);
+    } elseif ($e instanceof HttpException) {
+        if (in_array($e->getCode(), [429, 503])) {
+            // 第 3 档：HTTP 429/503 —— 直接返回对应状态码 + 异常 HTML 页
+            return new Response(render(exception.html.php), $e->getCode());
+        }
+        // 其他 HTTP 错误（404/500 等）：静默，走下面的错误计数逻辑
+    } else {
+        // 第 4 档：未知异常 —— error 日志 + 错误计数
+        $this->logger->error(...);
+    }
+    // ========== 统一错误计数与输出 ==========
+    $errorOutput = Configuration::getConfig('error', 'output');  // feed | http | none
+    $reportLimit = Configuration::getConfig('error', 'report_limit');  // 默认 1
+    $errorCount = 1;
+    if ($reportLimit > 1) {
+        $errorCount = $this->logBridgeError($bridge->getName(), $e->getCode());
+    }
+    if ($errorCount >= $reportLimit) {
+        if ($errorOutput === 'feed') {
+            // 输出为 Feed 条目（格式兼容！）
+            $items = [$this->createFeedItemFromException($e, $bridge)];
+        } elseif ($errorOutput === 'http') {
+            // 输出为 HTTP 500 错误页
+            return new Response(render(exception.html.php), 500);
+        } elseif ($errorOutput === 'none') {
+            // 静默：返回空 Feed
+        }
+    }
+}
+```
+
+### 10.3 错误频率计数（report_limit 机制）
+
+`logBridgeError()`（`actions/DisplayAction.php:172-191`）用独立缓存域 `error_reporting_` 做滑动窗口计数：
+
+```php
+$cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+$report = $this->cache->get($cacheKey);
+if ($report) {
+    $report = Json::decode($report);
+    $report['time'] = time();
+    $report['count']++;
+} else {
+    $report = ['error' => $code, 'time' => time(), 'count' => 1];
+}
+$ttl = 86400 * 5;  // 5 天
+$this->cache->set($cacheKey, Json::encode($report), $ttl);
+```
+TTL 5 天，每次错误刷新过期时间。`report_limit` 默认为 1，意味着首次错误即暴露；设为 N 则需同一 Bridge 在 5 天内同一错误码累计 N 次才对外暴露——用于过滤偶发抖动。
+
+### 10.4 中间件兜底：ExceptionMiddleware
+
+`middlewares/ExceptionMiddleware.php:14-23` 是整个洋葱的最后一道防线，捕获所有未被 DisplayAction 处理的异常：
+
+```php
+try {
+    return $next($request);
+} catch (\Throwable $e) {
+    $this->logger->error('Exception in ExceptionMiddleware', ['e' => $e]);
+    return new Response(render(exception.html.php), 500);
+}
+```
+所有漏网之鱼（包括 DisplayAction 外的 Action、中间件自身异常）统一返回 500 HTML 错误页。此外 `index.php:20-59` 还注册了全局 `set_exception_handler` + `set_error_handler` + `register_shutdown_function` 三层兜底，确保 Fatal Error 也不会暴露 PHP 原生堆栈。
+
+### 10.5 三种错误输出模式对比
+
+| `[error] output` | 正常渲染 | 错误时行为 | Feed 解析器感知 |
+|---|---|---|---|
+| `feed`（默认） | 正常条目 | 生成一条"错误条目"混入 Feed，title 含错误码 | 能继续解析，用户在阅读器里看到错误信息 |
+| `http` | 正常条目 | 返回 HTTP 500 + HTML 异常页 | Feed 解析失败，阅读器标红 |
+| `none` | 正常条目 | 返回空 Feed（0 条目） | 解析成功但无内容，可能被误判为"无更新" |
+
+结合 `report_limit` 的节流效果：例如 `output=feed` + `report_limit=3`，同一 Bridge 同一错误码前两次完全静默（像没发生一样返回空 Feed？不——代码逻辑是 `errorCount < reportLimit` 时三个分支都不触发，$items 保持空数组，实际等价于 `output=none`），第三次起才以 Feed 条目形式对外暴露。
+
+---
+
+## 十一、关键文件索引
 
 | 文件 | 职责 |
 |---|---|
-| `actions/DisplayAction.php` | 格式协商入口、编排数据流向、编码清洗、200 响应写入服务端缓存 |
+| `actions/DisplayAction.php` | 格式协商入口、编排数据流向、编码清洗、200 响应写入服务端缓存、异常分类降级、错误频率计数 |
 | `lib/FormatFactory.php` | 格式自动发现、名称规范化、类实例化 |
 | `lib/FormatAbstract.php` | 格式抽象基类，定义 `setItems/setFeed/setLastModified/getMimeType`，完成 array→FeedItem 转换 |
-| `lib/FeedItem.php` | 中间数据模型，字段规范化与校验 |
-| `lib/utils.php` | `parse_mime_type()` 基于扩展名推断 MIME，含锚点提示机制 |
+| `lib/FeedItem.php` | 中间数据模型，字段规范化与校验、URI/enclosure sanitization |
+| `lib/utils.php` | `parse_mime_type()` 基于扩展名推断 MIME、`ClientException` |
 | `lib/RssBridge.php` | 中间件栈注册与洋葱模型编排 |
-| `middlewares/CacheMiddleware.php` | 服务端缓存读取、304 Not Modified 协商、错误响应写入缓存 |
+| `lib/Configuration.php` | 三层配置加载（默认→自定义→环境变量）与校验 |
+| `lib/CacheFactory.php` | 缓存后端自动发现、实例化与配置校验 |
 | `lib/CacheInterface.php` | 缓存后端抽象接口 |
+| `lib/url.php` | 严格 URL 解析器与 `UrlException` |
+| `lib/php-urljoin/src/urljoin.php` | 相对 URL 转绝对（Python urljoin 移植） |
+| `lib/html.php` | `defaultLinkTo()` 批量重写 HTML 中 img/a 链接、`parseSrcset()` |
+| `lib/http.php` | `CurlHttpClient`（重试、超时、大小限流、条件请求）、`HttpException` / `CloudFlareException` / `RateLimitException` |
+| `lib/contents.php` | `getContents()`（服务端缓存 + 条件请求 + 状态码分支）、`getSimpleHTMLDOMCached()` |
+| `middlewares/CacheMiddleware.php` | 服务端缓存读取、304 Not Modified 协商、错误响应写入缓存、1% 概率触发 prune |
+| `middlewares/ExceptionMiddleware.php` | 全局异常兜底，统一返回 500 HTML |
+| `middlewares/SecurityMiddleware.php` | 查询参数类型校验（仅允许字符串） |
+| `caches/FileCache.php` | 磁盘文件缓存（md5 文件名 + serialize） |
+| `caches/SQLiteCache.php` | SQLite 单文件缓存（sha1 BLOB 主键 + WAL 模式） |
+| `caches/MemcachedCache.php` | Memcached 分布式缓存 |
+| `caches/ArrayCache.php` | 进程内内存缓存（DEBUG 模式默认） |
+| `caches/NullCache.php` | 空实现（禁用缓存） |
 | `formats/AtomFormat.php` | Atom 1.0 渲染（RFC 4287） |
 | `formats/MrssFormat.php` | RSS 2.0 + Media RSS 渲染 |
 | `formats/JsonFormat.php` | JSON Feed 1.0 渲染 |
 | `formats/HtmlFormat.php` | HTML 预览页（含其他格式的跳转链接） |
 | `formats/PlaintextFormat.php` | PHP print_r 调试输出 |
 | `formats/SfeedFormat.php` | sfeed TSV 格式输出 |
+| `index.php` | 全局异常/错误/关闭 三层 handler 兜底 |
+| `config.default.ini.php` | 默认配置（http 超时/重试/大小、cache 类型、error 输出模式等） |
 
 ---
 
-## 八、设计特点总结
+## 十二、设计特点总结
 
 1. **显式格式，零内容协商**：不依赖 HTTP Accept Header，用查询参数显式指定，简单可预测、便于缓存。
-2. **基于文件系统的格式注册**：新增格式只需在 `formats/` 下添加 `*Format.php`，无需修改任何注册表。
-3. **FeedItem 作为防腐层**：Bridge 的原始数组与各格式渲染逻辑解耦，字段规范化在中间层统一完成。
+2. **基于文件系统的格式/缓存注册**：新增格式或缓存后端只需在对应目录下添加 `*Format.php` / `*Cache.php`，无需修改注册表。
+3. **FeedItem 作为防腐层**：Bridge 的原始数组与各格式渲染逻辑解耦，字段规范化与 URL sanitization 在中间层统一完成。
 4. **格式间策略独立但约定一致**：UID 三级降级、MIME 类型声明、UTF-8 清洗等在各格式独立实现，逻辑基本一致但存在微妙差异（如 Json 的 UID 降级位置后置、Atom 对 itunes/alternate 的互斥处理）。
 5. **错误输出保持格式承诺**：即使桥接失败，也按请求格式返回合法 Feed 文档，而不是 HTTP 错误页，保护 RSS 阅读器的解析链路。
 6. **MIME 推断的锚点覆盖**：通过 `#.ext` 伪扩展名机制，允许 Bridge 强制指定 enclosure 的 MIME 类型，优先级高于真实文件扩展名。
-7. **两级缓存双写**：服务端缓存分两处写入——DisplayAction 管 200 正常响应（Bridge TTL），CacheMiddleware 管错误响应（带随机抖动的短 TTL），避免错误风暴。
-8. **无 ETag 的简化协商**：仅实现 Last-Modified / If-Modified-Since，未实现 ETag / If-None-Match，且 Last-Modified 值取请求执行时间而非数据真实变更时间。
+7. **两级缓存双写 + 命名空间隔离**：服务端缓存分两处写入——DisplayAction 管 200 正常响应（Bridge TTL），CacheMiddleware 管错误响应（带随机抖动的短 TTL），用 `http_` / `server_` / `pages_` / `error_reporting_` 前缀隔离四个缓存域。
+8. **无 ETag 的简化协商**：对外响应仅实现 Last-Modified / If-Modified-Since，未实现 ETag；但对源站发起 getContents 请求时同时携带 If-Modified-Since 和 If-None-Match。
+9. **URL 三级处理链**：严格 `Url` 类验证 → `urljoin()` 相对转绝对 → `defaultLinkTo()` HTML 批量补全，三层各司其职但覆盖范围不同（仍有 iframe/srcset 等盲区）。
+10. **串行 Fetch + 被动限流**：无并发、无全局限流，依赖单请求超时（5s）、大小上限（20MB）、重试次数（1 次）和源站 429 透传；重试仅针对 curl 层错误，HTTP 4xx/5xx 不重试。
+11. **异常四档分类 + report_limit 节流**：ClientException（静默）、RateLimitException/Http429/503（立即透传）、其他 HttpException（计数后降级）、未知 Exception（error 日志 + 计数），结合 `error_reporting_` 缓存域的 5 天滑动窗口阈值过滤偶发抖动。
+12. **多层兜底防御**：DisplayAction try/catch → ExceptionMiddleware → index.php 全局 exception/error/shutdown handler 三层兜底，确保任何异常都不会暴露 PHP 原生堆栈。
