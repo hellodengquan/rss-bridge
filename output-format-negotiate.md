@@ -989,24 +989,323 @@ try {
 
 ---
 
-## 十一、关键文件索引
+## 十一、Bridge 参数校验：PARAMETERS 常量 Schema + ParameterValidator 双环
+
+### 11.1 无 YAML，基于 PHP 类常量的 Schema 定义
+
+RSS-Bridge **没有 YAML 配置文件**定义 Bridge 参数，而是通过每个 Bridge 类的 `const PARAMETERS = []` 类常量声明参数模型，本质上是一个**以 Context 为第一层 key 的嵌套关联数组 Schema**：
+
+```php
+const PARAMETERS = [
+    // context 名（前端按 context 渲染多组表单）
+    'By user ID' => [
+        'user_id' => [
+            'name'      => 'User ID',          // 前端 label
+            'type'      => 'text',             // text | number | list | checkbox
+            'title'     => 'Enter numeric ID', // 前端 tooltip/占位符
+            'required'  => true,               // 必填/选填
+            'pattern'   => '\d+',              // 仅 text 类型：正则约束
+            'exampleValue' => '1234567',       // 前端示例值按钮
+            'defaultValue' => '',              // 默认值
+        ],
+        'limit' => self::LIMIT,                // 复用 BridgeAbstract 的 LIMIT 常量（number 类型）
+    ],
+    'global' => [
+        // global context：跨所有 context 共享的参数
+        'formatting' => [
+            'name'  => 'Rich text',
+            'type'  => 'checkbox',
+        ],
+    ],
+];
+```
+
+**四种类型的属性约定**（由 `lib/ParameterValidator.php:24-41` 和 `tests/BridgeImplementationTest.php:69-128` 双重约束）：
+
+| type | 必需属性 | 可选属性 | 校验方式 |
+|---|---|---|---|
+| `text`（默认） | `name` | `required`, `pattern`, `defaultValue`, `exampleValue`, `title` | `filter_var` 或 `FILTER_VALIDATE_REGEXP` 匹配 `^pattern$` |
+| `number` | `name` | `required`, `defaultValue`, `exampleValue`, `title` | `FILTER_VALIDATE_INT` |
+| `checkbox` | `name` | `title` | `FILTER_VALIDATE_BOOLEAN + FILTER_NULL_ON_FAILURE`；**不允许声明 `required`** |
+| `list` | `name`, `values` (非空数组) | `title`, `defaultValue`, `exampleValue` | 必须在 `values` 顶层或子数组中存在；**不允许声明 `required`** |
+
+`tests/BridgeImplementationTest.php:58-158` 对所有 Bridge 做强制静态检查：所有参数名非空、type 在四种内、list 必须有 values、checkbox/list 不得声明 required 等。
+
+### 11.2 校验流程：BridgeAbstract::setInput() → ParameterValidator
+
+调用链在 `actions/DisplayAction.php:79` 触发：
+
+```php
+$bridge->setInput($request->toArray());
+```
+
+`lib/BridgeAbstract.php:138-179` 的完整流程：
+
+```
+输入 $_GET（去掉 action/bridge/format/_cache_timeout/_noproxy/_ 等保留键）
+      │
+      ▼
+PARAMETERS 是否为空？
+ ├─ 是：还有输入 → throw ClientException("Unexpected parameters")
+ └─ 否：继续
+      │
+      ▼
+ParameterValidator::validateInput($input 引用传递, $parameters)
+  → 双重循环：每个 input 名在所有 context 中查找是否注册
+  → 未注册 → error: "Parameter is not registered!"
+  → 已注册 → switch(type) 做类型过滤，失败则置 null
+  → required 但被过滤为 null → error: "Parameter is invalid!"
+  → 有错误 → throw ClientException("Invalid parameters value(s): ...")
+      │
+      ▼
+ParameterValidator::getQueriedContext($input, $parameters)
+  → 推理用户使用的是哪个 context：
+     - 用户 input 的多余键（不在 context 也不在 global 中）→ 跳过
+     - 任一必填参数缺失 → 标记为 false
+     - 任一非 checkbox/list 参数有值 → 标记为 true
+     - 0 个匹配 → 返回第一个 context（无参数默认）或 null
+     - 1 个匹配 → 返回该 context 名
+     - ≥2 个匹配 → 返回 false（"Mixed context parameters" → \Exception）
+      │
+      ▼
+setInputWithContext() → 赋值 + 补默认值 + global 合并到选中 context
+```
+
+**关键细节：input 是引用传递**（`validateInput(array &$input, ...)`），校验过程同步完成了类型转换（如字符串 "123" → int 123，"true" → bool true）。Checkbox 默认值为 false，List 默认值为 values 数组的第一项（或 defaultValue）。
+
+### 11.3 配置层校验：CONFIGURATION 常量 + loadConfiguration()
+
+`const CONFIGURATION = []` 是管理员在 `config.ini.php` 中配置的密钥/凭证级参数（与用户通过 URL 传入的 PARAMETERS 不同层级）：
+
+```php
+const CONFIGURATION = [
+    'api_key' => [
+        'required'      => true,
+    ],
+    'cache_ttl' => [
+        'defaultValue'  => 3600,
+    ],
+];
+```
+
+`lib/BridgeAbstract.php:119-136` 的 `loadConfiguration()` 在 Bridge 实例化后立即调用，按 section = BridgeShortName 从 `Configuration::getConfig()` 读取，缺省时：
+- `required=true` → 抛 `\Exception`（启动时即失败）
+- 有 `defaultValue` → 采用默认值
+- 既不 required 也无 defaultValue → 不写入 `$this->configuration`
+
+---
+
+## 十二、CLI 模式入口：argv 平铺为 query + Request::fromCli
+
+### 12.1 入口代码：index.php 第 63-69 行
+
+```php
+$argv = $argv ?? null;
+if ($argv) {
+    parse_str(implode('&', array_slice($argv, 1)), $cliArgs);
+    $request = Request::fromCli($cliArgs);
+} else {
+    $request = Request::fromGlobals();
+}
+```
+
+**SAPI 判定方式**：不调用 `php_sapi_name()`，而是通过 PHP 运行时是否自动注入 `$argv` 变量判断——当且仅当 CLI 模式且 `php.ini` 的 `register_argc_php` = On 时 `$argv` 才存在（这是一个经典简写，但依赖 php.ini 配置）。
+
+### 12.2 参数语法：`key=value` 空格分隔
+
+与 HTTP GET 的查询字符串语法一一对应：
+
+```bash
+# Web URL
+# ?action=display&bridge=DansTonChat&format=Json
+
+# CLI 等价
+php index.php action=display bridge=DansTonChat format=Json
+```
+
+实现细节：`array_slice($argv, 1)` 跳过脚本名 `index.php`，`implode('&', ...)` 拼接为查询字符串，再用 `parse_str()` 解析为关联数组。
+
+- 支持 `&` 在单个参数内部（`parse_str` 会二次拆，但 CLI 下的 `&` 需转义或单引号包裹，否则被 shell 解释为后台运行）
+- 无显式布尔类型：`checkbox=true` 仍是字符串，由 ParameterValidator 转换
+- 无文件上传（`$_FILES` 为空），但 RSS-Bridge 本身不依赖此
+- 所有支持的 action（list/display/detect/findfeed 等）完全一致
+
+### 12.3 Request::fromCli 与 fromGlobals 的差异
+
+`lib/http.php:210-224` 定义两种工厂方法：
+
+| 行为 | `fromGlobals()`（HTTP） | `fromCli()`（CLI） |
+|---|---|---|
+| `$this->get` | `$_GET` | `$cliArgs`（parse_str 结果） |
+| `$this->server` | `$_SERVER` | **未初始化**（始终 null） |
+| `toArray()` | 返回 `$_GET` | 返回 `$cliArgs` |
+
+**重要影响**：
+- CLI 下 `$request->server('HTTP_IF_MODIFIED_SINCE')`、`$request->server('HTTP_HOST')` 等永远返回 null → **CacheMiddleware 的 304 协商在 CLI 下失效**，始终返回完整 body。
+- `get_current_url()` 等依赖 `$_SERVER` 的辅助函数在 CLI 下可能返回空值或异常。
+- SecurityMiddleware、BasicAuthMiddleware、TokenAuthenticationMiddleware 等依赖 `$this->server` 的中间件走默认分支，行为基本安全但无鉴权。
+
+### 12.4 CLI 响应输出
+
+`Response::send()`（`lib/http.php:294-314`）不区分 SAPI：HTTP 模式下设置 header + echo body，CLI 模式下直接 echo body 到 stdout，`header()` 调用被 PHP 静默忽略。因此 JSON/Atom/RSS/Plaintext 输出直接显示在终端，HTML 输出会看到完整的 HTML 源码。
+
+---
+
+## 十三、Debug 开关与日志分级：DEBUG 文件 + 环境 + handler 链
+
+### 13.1 DEBUG 文件触发三重切换
+
+`lib/Configuration.php:38-43` 在配置加载阶段检查项目根目录下是否存在 `DEBUG` 文件：
+
+```php
+if (file_exists(__DIR__ . '/../DEBUG')) {
+    $debug = trim(file_get_contents(__DIR__ . '/../DEBUG'));
+    if ($debug === '') {
+        self::setConfig('system', 'env', 'dev');
+        self::setConfig('cache', 'type', 'array');
+    }
+}
+```
+
+**注意**：只当 `DEBUG` 文件**内容为空**时触发（有内容的 DEBUG 文件不做任何事）。
+
+触发的三重效果：
+
+| 效果 | 值 | 说明 |
+|---|---|---|
+| `system.env` | `dev` | 替换默认的 `prod` |
+| `cache.type` | `array` | 替换默认的 `file`，每次请求后缓存随进程销毁 |
+| PHP 错误转异常 | 见 `index.php:32-35` | `env=dev` 时 `set_error_handler` 把所有非屏蔽错误升级为 `ErrorException`，严格暴露隐患 |
+
+### 13.2 日志分级与 handler 装配
+
+`lib/dependencies.php:48-64` 创建 `SimpleLogger`，根据 `system.env` 装配不同 handler：
+
+```
+                SimpleLogger(name='rssbridge')
+                 │
+                 ├─ env=dev → ErrorLogHandler(level=DEBUG)
+                 │              → syslog(error_log PHP 默认目的地)
+                 │
+                 ├─ env=prod → ErrorLogHandler(level=INFO)
+                 │              → syslog(同上)
+                 │
+                 └─ [logging].file_path && [logging].file_level 同时配置
+                                → StreamHandler(level=file_level, stream=file_path)
+                                      → 追加写入文件 (FILE_APPEND)
+```
+
+四级日志常量（`lib/logger.php:7-10`）：
+
+| level | 数值 | 触发场景 |
+|---|---|---|
+| `DEBUG` | 10 | ClientException 捕获、RateLimitException 捕获、调试追踪 |
+| `INFO` | 20 | 启用的 Bridge 未找到、服务启动信息 |
+| `WARNING` | 30 | 缓存反序列化失败、磁盘写失败、PHP 非致命错误（prod 模式下）、SQLite 执行失败 |
+| `ERROR` | 40 | 未知异常（非 Client/RateLimit/指定 HttpException 类型）、PHP Fatal（shutdown）、未捕获异常 |
+
+### 13.3 日志过滤与异常脱敏
+
+`SimpleLogger::log()`（`lib/logger.php:69-100`）做了两级过滤：
+
+**第一级：完全丢弃特定异常类型与消息**
+```php
+if ($e instanceof RateLimitException) return;  // 限流太吵，完全不记
+foreach ($ignoredMessages as $ignored) {
+    if (str_starts_with($e->getMessage(), $ignored)) return;
+}
+// 被忽略的消息前缀：'Format name invalid', 'Unknown format given', 'Unable to find'
+```
+
+**第二级：handler 阈值过滤**  
+每个 handler 按 `$record['level'] < $this->level` 做数值比较，小则丢弃。因此 `StreamHandler(WARNING)` 只收 WARNING + ERROR，丢弃 DEBUG/INFO。
+
+异常字段写入前经过 `sanitize_root()`（`lib/utils.php:xxx`）处理，去除项目根目录绝对路径，避免信息泄漏。
+
+### 13.4 dev vs prod 的行为差异汇总
+
+| 维度 | dev（DEBUG 文件空） | prod（默认） |
+|---|---|---|
+| 缓存后端 | ArrayCache（内存，请求间不持久） | FileCache（磁盘，持久） |
+| PHP 错误升级 | 所有非屏蔽错误 → `ErrorException` 抛出 | WARNING 级别写入日志，继续执行 |
+| ErrorLogHandler 阈值 | DEBUG（全量） | INFO（仅 INFO/WARNING/ERROR） |
+| 日志量 | 大，含 ClientException 等调试信息 | 小，仅业务级别以上 |
+
+---
+
+## 十四、Trial / Test 模式：三类运行通路与自动化衔接
+
+RSS-Bridge 没有单一 "trial mode" 开关，而是由**生产端 URL 试跑**、**参数自动探测**、**单元测试 BridgeImplementationTest** 三套机制组合实现。
+
+### 14.1 路径一：前端 Generate feed（直接试跑）
+
+`actions/FrontpageAction.php` 渲染每个 Bridge 的参数表单，提交后走标准 `action=display&format=Html` 通路——**即生产路径本身就是 trial 路径**，没有独立模式。前端通过 `static/rss-bridge.js:41-46` 提供 "Use example value" 按钮填充 `exampleValue`，便于开发者试跑。
+
+### 14.2 路径二：DetectAction / FindfeedAction（URL 自动参数探测）
+
+这是面向最终用户的"我给你一个网页地址，你帮我匹配 Bridge 并生成参数"的自动化 trial 流程。
+
+**DetectAction**：遍历所有启用的 Bridge，调用 `detectParameters($url)`，首个命中即 301 跳转：
+```
+输入: ?action=detect&url=https://example.com/...&format=Atom
+       │
+       ▼
+  for 每个 enabled Bridge:
+     $params = $bridge->detectParameters($url)
+     $params !== null → 301 redirect 到
+       ?action=display&bridge=Xxx&format=Atom&{http_build_query($params)}
+  全部失败 → "No bridge found" 错误页
+```
+
+**FindfeedAction**：前端 feed finder 搜索框的后端，返回 JSON 数组（所有命中的 Bridge 及其参数元数据）供前端多选展示，不做重定向。
+
+`detectParameters()` 默认实现（`lib/BridgeAbstract.php:308-323`）仅针对**无参数 Bridge**（`PARAMETERS` 为空）做 URL 主域名匹配；有参数的 Bridge 需自行重载此方法，从 URL 中提取子路径/查询参数并重建为 `PARAMETERS` 对应的键值对数组，可选包含 `'context' => 'By user ID'` 指定 context 名。
+
+`tests/BridgeImplementationTest.php:154-157` 对 `const TEST_DETECT_PARAMETERS = ['url1' => ['expected_param1' => 'v1'], ...]` 做断言，验证 `detectParameters($url)` 输出与预期一致。
+
+### 14.3 路径三：PHPUnit 自动化测试（BridgeImplementationTest）
+
+`tests/BridgeImplementationTest.php` 是 CI 级别的 trial/test，每次提交运行，覆盖：
+
+| 测试方法 | 校验内容 | 示例 |
+|---|---|---|
+| `testClassName` | 命名规范（大写开头、无空格、以 Bridge 结尾） | - |
+| `testClassType` | 必须继承 `BridgeAbstract` | - |
+| `testConstants` | NAME/URI/DESCRIPTION/MAINTAINER 非空字符串、PARAMETERS 为数组、CACHE_TIMEOUT ≥ 0 且为 int | - |
+| `testParameters` | PARAMETERS schema 有效性：type 四种内、list 必须有 values、checkbox/list 不得声明 required、pattern/exampleValue/defaultValue 格式合法、TEST_DETECT_PARAMETERS 映射正确 | 见 §11.1 表 |
+| `testMethodValues` | getDescription/getMaintainer/getName/getURI/getIcon 返回非空字符串 | - |
+| `testUri` | URI 常量和 `getURI()` 返回值必须通过 `FILTER_VALIDATE_URL` | - |
+
+使用 NullCache + NullLogger 构造 Bridge（隔离 I/O），保证纯静态校验可离线运行。`dataBridgesProvider()` 用 `glob(bridges/*Bridge.php)` 遍历项目内所有 Bridge 类做参数化测试。
+
+---
+
+## 十五、关键文件索引
 
 | 文件 | 职责 |
 |---|---|
 | `actions/DisplayAction.php` | 格式协商入口、编排数据流向、编码清洗、200 响应写入服务端缓存、异常分类降级、错误频率计数 |
+| `actions/DetectAction.php` | URL → Bridge 参数自动探测（单命中 301 跳转） |
+| `actions/FindfeedAction.php` | URL → Bridge 参数自动探测（多命中 JSON 数组返回） |
+| `lib/BridgeFactory.php` | Bridge 名称规范化、白名单过滤、自动发现 |
+| `lib/BridgeAbstract.php` | 所有 Bridge 基类，定义 PARAMETERS/CONFIGURATION/TEST_DETECT_PARAMETERS 常量、setInput 参数校验流程、detectParameters 默认实现 |
+| `lib/ParameterValidator.php` | PARAMETERS schema 校验引擎（validateInput 引用传值过滤 + getQueriedContext 上下文推断） |
 | `lib/FormatFactory.php` | 格式自动发现、名称规范化、类实例化 |
 | `lib/FormatAbstract.php` | 格式抽象基类，定义 `setItems/setFeed/setLastModified/getMimeType`，完成 array→FeedItem 转换 |
 | `lib/FeedItem.php` | 中间数据模型，字段规范化与校验、URI/enclosure sanitization |
 | `lib/utils.php` | `parse_mime_type()` 基于扩展名推断 MIME、`ClientException` |
-| `lib/RssBridge.php` | 中间件栈注册与洋葱模型编排 |
-| `lib/Configuration.php` | 三层配置加载（默认→自定义→环境变量）与校验 |
+| `lib/RssBridge.php` | Action 路由解析（dash→camelCase）、中间件栈注册与洋葱模型编排 |
+| `lib/Configuration.php` | 三层配置加载（默认→自定义→环境变量 RSSBRIDGE_*）与校验、DEBUG 文件三重切换 |
+| `lib/logger.php` | Logger 接口 + 四级常量、SimpleLogger（过滤 + 分发）、ErrorLogHandler、StreamHandler、NullLogger |
+| `lib/dependencies.php` | DI 容器：logger/cache/bridge_factory/http_client 的 lazy 装配 |
 | `lib/CacheFactory.php` | 缓存后端自动发现、实例化与配置校验 |
 | `lib/CacheInterface.php` | 缓存后端抽象接口 |
 | `lib/url.php` | 严格 URL 解析器与 `UrlException` |
 | `lib/php-urljoin/src/urljoin.php` | 相对 URL 转绝对（Python urljoin 移植） |
 | `lib/html.php` | `defaultLinkTo()` 批量重写 HTML 中 img/a 链接、`parseSrcset()` |
-| `lib/http.php` | `CurlHttpClient`（重试、超时、大小限流、条件请求）、`HttpException` / `CloudFlareException` / `RateLimitException` |
+| `lib/http.php` | `CurlHttpClient`（重试、超时、大小限流、条件请求）、`HttpException` / `CloudFlareException` / `RateLimitException`、Request（fromCli/fromGlobals）、Response |
 | `lib/contents.php` | `getContents()`（服务端缓存 + 条件请求 + 状态码分支）、`getSimpleHTMLDOMCached()` |
+| `lib/bootstrap.php` | PATH_* 常量、自动加载器、helper 全局函数加载 |
 | `middlewares/CacheMiddleware.php` | 服务端缓存读取、304 Not Modified 协商、错误响应写入缓存、1% 概率触发 prune |
 | `middlewares/ExceptionMiddleware.php` | 全局异常兜底，统一返回 500 HTML |
 | `middlewares/SecurityMiddleware.php` | 查询参数类型校验（仅允许字符串） |
@@ -1021,22 +1320,29 @@ try {
 | `formats/HtmlFormat.php` | HTML 预览页（含其他格式的跳转链接） |
 | `formats/PlaintextFormat.php` | PHP print_r 调试输出 |
 | `formats/SfeedFormat.php` | sfeed TSV 格式输出 |
-| `index.php` | 全局异常/错误/关闭 三层 handler 兜底 |
-| `config.default.ini.php` | 默认配置（http 超时/重试/大小、cache 类型、error 输出模式等） |
+| `tests/BridgeImplementationTest.php` | CI 级别 trial：所有 Bridge 的命名、常量、PARAMETERS schema、TEST_DETECT_PARAMETERS 断言 |
+| `tests/ParameterValidatorTest.php` | ParameterValidator 的单测 |
+| `static/rss-bridge.js` | 前端：Bridge 搜索、Feed Finder AJAX 搜索、exampleValue 一键填充 |
+| `index.php` | 全局异常/错误/关闭 三层 handler 兜底、CLI vs HTTP 入口分流 |
+| `config.default.ini.php` | 默认配置（http 超时/重试/大小、cache 类型、error 输出模式、env、enabled_bridges 等） |
 
 ---
 
-## 十二、设计特点总结
+## 十六、设计特点总结
 
 1. **显式格式，零内容协商**：不依赖 HTTP Accept Header，用查询参数显式指定，简单可预测、便于缓存。
-2. **基于文件系统的格式/缓存注册**：新增格式或缓存后端只需在对应目录下添加 `*Format.php` / `*Cache.php`，无需修改注册表。
+2. **基于文件系统的格式/缓存/Bridge 注册**：新增任一类只需在对应目录下添加 `*Format.php` / `*Cache.php` / `*Bridge.php`，Factory 扫描自动发现。
 3. **FeedItem 作为防腐层**：Bridge 的原始数组与各格式渲染逻辑解耦，字段规范化与 URL sanitization 在中间层统一完成。
 4. **格式间策略独立但约定一致**：UID 三级降级、MIME 类型声明、UTF-8 清洗等在各格式独立实现，逻辑基本一致但存在微妙差异（如 Json 的 UID 降级位置后置、Atom 对 itunes/alternate 的互斥处理）。
 5. **错误输出保持格式承诺**：即使桥接失败，也按请求格式返回合法 Feed 文档，而不是 HTTP 错误页，保护 RSS 阅读器的解析链路。
 6. **MIME 推断的锚点覆盖**：通过 `#.ext` 伪扩展名机制，允许 Bridge 强制指定 enclosure 的 MIME 类型，优先级高于真实文件扩展名。
-7. **两级缓存双写 + 命名空间隔离**：服务端缓存分两处写入——DisplayAction 管 200 正常响应（Bridge TTL），CacheMiddleware 管错误响应（带随机抖动的短 TTL），用 `http_` / `server_` / `pages_` / `error_reporting_` 前缀隔离四个缓存域。
+7. **两级缓存双写 + 四命名空间隔离**：服务端缓存分两处写入——DisplayAction 管 200 正常响应（Bridge TTL），CacheMiddleware 管错误响应（带随机抖动的短 TTL），用 `http_` / `server_` / `pages_` / `error_reporting_` 前缀隔离。
 8. **无 ETag 的简化协商**：对外响应仅实现 Last-Modified / If-Modified-Since，未实现 ETag；但对源站发起 getContents 请求时同时携带 If-Modified-Since 和 If-None-Match。
 9. **URL 三级处理链**：严格 `Url` 类验证 → `urljoin()` 相对转绝对 → `defaultLinkTo()` HTML 批量补全，三层各司其职但覆盖范围不同（仍有 iframe/srcset 等盲区）。
 10. **串行 Fetch + 被动限流**：无并发、无全局限流，依赖单请求超时（5s）、大小上限（20MB）、重试次数（1 次）和源站 429 透传；重试仅针对 curl 层错误，HTTP 4xx/5xx 不重试。
 11. **异常四档分类 + report_limit 节流**：ClientException（静默）、RateLimitException/Http429/503（立即透传）、其他 HttpException（计数后降级）、未知 Exception（error 日志 + 计数），结合 `error_reporting_` 缓存域的 5 天滑动窗口阈值过滤偶发抖动。
 12. **多层兜底防御**：DisplayAction try/catch → ExceptionMiddleware → index.php 全局 exception/error/shutdown handler 三层兜底，确保任何异常都不会暴露 PHP 原生堆栈。
+13. **PARAMETERS 类常量 Schema + 双环校验**：无 YAML，用 PHP `const PARAMETERS = [...]` 定义参数模型，ParameterValidator 在运行时做类型/值校验，BridgeImplementationTest 在 CI 时做 schema 格式校验，引用传值同步完成类型转换。
+14. **CLI 与 HTTP 同一入口**：不调用 `php_sapi_name()`，以 `$argv` 变量是否存在为 CLI 判断依据，argv 平铺为 key=value 后经 `parse_str` 进同一 Request 管道，action 路由和响应与 HTTP 完全一致。
+15. **DEBUG 文件触发环境切换**：根目录下空 `DEBUG` 文件同时触发 `system.env=dev` + `cache.type=array` + PHP 错误转 ErrorException 三重效果，避免开发模式下缓存脏数据和隐藏的 PHP Warning。
+16. **Trial/Test 三条通路并行**：生产路径即试跑路径（前端表单→DisplayAction）+ URL 参数自动探测（DetectAction/FindfeedAction + detectParameters）+ PHPUnit 静态扫描（BridgeImplementationTest 遍历所有 Bridge），三层覆盖从开发者手动试跑到 CI 自动合规检查。
