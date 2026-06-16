@@ -1578,3 +1578,484 @@ private function logBridgeError($bridgeName, $code)
    当前使用 JSON 而非 `serialize()` 是正确选择（`DisplayAction.php:175` 的 todo 评论也提到没必要 json encode）。但从反序列化安全角度，JSON 比 `serialize()` 安全得多，建议保持。
 
 4. **SQLite 下的 BLOB 成本**：虽然 error_reporting 的 JSON 很小，但 SQLite 的 `INSERT OR REPLACE` 是「先删后插」操作，如果频繁更新同一错误的 count，会产生大量 WAL 页碎片。高并发下建议用 Redis/INCR 指令替代，避免全量读改写。
+
+---
+
+## 十、深度细节（终章）：工程化落地的深度剖析
+
+### 10.1 unserialize 运行时检测机制
+
+在加固 `unserialize()` 之前，需要先搞清楚「缓存里到底存了什么类型的对象」，否则盲目加 `allowed_classes` 白名单可能导致正常业务崩溃。
+
+**运行时检测的三种方案**：
+
+**方案 A：`allowed_classes => true` + 日志审计（最安全的渐进式）**
+```php
+// 第一步：先开启审计，不改行为
+$value = unserialize($blob, ['allowed_classes' => true]);
+if (is_object($value)) {
+    $this->logger->debug('unserialize object detected', [
+        'class'   => get_class($value),
+        'cache_key' => $this->createCacheKey($key),  // 注意：只记哈希，不记原始 key 避免泄露敏感信息
+    ]);
+}
+```
+- 等价于裸 `unserialize()` 的行为，**不破坏任何功能**
+- 运行一周后分析日志，收集所有出现过的类名
+- 然后把这些类名加入白名单，切换到 `allowed_classes => [...]` 模式
+- 风险：在此期间仍然受反序列化攻击威胁，只能作为过渡
+
+**方案 B：包装器类 + 类型断言**
+```php
+// 对每个 unserialize 调用点，加上期望类型检查
+function safe_unserialize(string $data, array $allowed, $default = null) {
+    $value = unserialize($data, ['allowed_classes' => $allowed]);
+    if ($value === false) {
+        // 反序列化失败（格式错/类不在白名单）
+        return $default;
+    }
+    return $value;
+}
+```
+- `unserialize` 返回 `false` 可能是因为：数据损坏、类不在白名单、版本不兼容
+- 全部归因为「缓存失效」，返回 default 降级，下次重新生成
+- 对业务无影响，只是缓存命中率暂时下降
+
+**方案 C：`__PHP_Incomplete_Class` 检测**
+```php
+// 当 allowed_classes=false 但数据里有对象时
+// unserialize 会返回 __PHP_Incomplete_Class 对象
+$value = unserialize($blob, ['allowed_classes' => false]);
+if ($value instanceof __PHP_Incomplete_Class) {
+    $this->logger->warning('Incomplete class in cache', [
+        'class' => $value->__PHP_Incomplete_Class_Name,
+    ]);
+    return $default;
+}
+```
+- 这是 PHP 提供的「软失败」机制：类不在白名单时不报错，返回标记对象
+- 可用于检测旧缓存里有哪些类，同时不会触发任何 `__wakeup()` 魔术方法
+- **最安全的检测方案**，因为对象不会被真正实例化
+
+**rss-bridge 的实际检测路径**：
+- 三个缓存实现（SQLite/File/Memcached）各有 2-3 处 unserialize 调用
+- 如果要加运行时检测，需要修改 7-8 个调用点
+- 推荐顺序：先方案 C 检测有哪些类 → 再方案 A 确认风险 → 最后方案 B 加白名单
+
+### 10.2 error_reporting_ 4 种拆分的切换灰度
+
+从「单键大对象」切换到 4 种拆分方案（元数据+详情、滚动时间窗、JSON 序列化、Redis INCR），需要灰度发布策略，避免一次性切换导致数据丢失或缓存雪崩。
+
+**4 种方案的切换难度矩阵**：
+
+| 方案 | 旧数据兼容 | 切换复杂度 | 回滚难度 | 推荐灰度周期 |
+|------|-----------|-----------|---------|-------------|
+| 元数据+详情分键 | 可兼容（读旧键做迁移） | 低 | 低 | 1 天 |
+| 滚动时间窗 | 不可兼容（键名变了） | 中 | 中 | 3-7 天 |
+| JSON 替代 serialize | 可兼容（双写+渐进切换） | 中 | 中 | 3 天 |
+| Redis INCR 原子计数 | 不可兼容（存储引擎变了） | 高 | 高 | 7-14 天 |
+
+**灰度切换的通用模式（双写过渡法）**：
+
+```
+灰度阶段 1（双写旧键）：
+  写入：同时写旧键和新键
+  读取：优先读旧键，旧键没有就读新键
+  持续时间：1 个 TTL 周期（5 天）
+  目的：确保新键有完整的数据积累
+
+灰度阶段 2（切读新键）：
+  写入：仍然双写
+  读取：优先读新键，新键没有就读旧键
+  持续时间：3-7 天
+  目的：验证新键的读写链路稳定
+
+灰度阶段 3（停止写旧键）：
+  写入：只写新键
+  读取：只读新键，旧键等自然过期
+  持续时间：观察 1 天后彻底删除旧键
+  目的：清理冗余数据
+
+回滚机制：
+  任何阶段发现问题 → 立即切回「只读旧键」
+  因为阶段 1 和 2 都在双写，回滚零损失
+```
+
+**滚动时间窗的特殊灰度策略**：
+- 不能双写，因为时间窗的键名每天都在变（`_20260617` / `_20260618`）
+- 切换当天开始写新格式，旧格式随 TTL 自然过期
+- 聚合时做兼容：「有时间窗数据就聚合时间窗，没有就 fallback 到旧键」
+- 5 天后旧键全部过期，彻底移除兼容代码
+
+### 10.3 3 项防护缺失的补救代价
+
+9.7 节提到的 3 项防护缺失（无白名单、无 HMAC、文件权限宽松），各自的修复成本和业务影响不同。
+
+**代价量化矩阵**：
+
+| 防护项 | 代码改动量 | 业务影响 | 测试成本 | 总代价 | 投入产出比 |
+|--------|-----------|---------|---------|--------|-----------|
+| `allowed_classes` 白名单 | 中（7-8 个调用点 + 1 个配置项） | 低（缓存 miss 率短暂上升） | 高（需收集所有类名验证） | 中 | 极高（安全收益大） |
+| HMAC 完整性校验 | 中（set/get 各加一段逻辑 + 密钥配置） | 极低（CPU 开销 <1%） | 低（只需测 set/get 正常链路） | 低 | 高 |
+| FileCache 文件权限 0600 | 极小（加一行 chmod） | 无（仅权限收紧） | 极低 | 极低 | 高 |
+
+**详细拆解**：
+
+**P0：allowed_classes 白名单**
+- 改动点：SQLiteCache (2处) + FileCache (2处) + MemcachedCache (1处) = 5 处 unserialize
+- 风险点：如果白名单漏了某个类，该类对象的缓存会全部失效，表现为「缓存命中率突降 + 上游请求量突增」
+- 补救成本：发现漏类 → 加回白名单 → 等缓存自然重建；最坏情况影响几分钟到几小时的缓存命中率
+- 总成本：约 2-3 人天开发 + 1 周观察期
+
+**P1：HMAC-SHA256 校验**
+- 改动点：set 时拼接 HMAC + get 时验证 HMAC
+- 兼容性问题：旧缓存没有 HMAC，直接验证会全部失败 → 需要「无 HMAC 时降级兼容」
+- 双写过渡策略：
+  - 阶段 1：写入时同时写「纯数据」和「带 HMAC 数据」两个版本（或同值加前缀标记）
+  - 阶段 2：读取时优先验证 HMAC 版本，失败则读纯数据版本
+  - 阶段 3：纯数据版本随 TTL 过期后，只保留 HMAC 版本
+- 性能开销：`hash_hmac('sha256', ...)` 单次约 1-2μs，对缓存读写可忽略
+- 总成本：约 1-2 人天开发 + 3 天观察期
+
+**P3：文件权限 0600**
+- 改动点：`FileCache.php:60` 的 `file_put_contents()` 后加一行 `chmod()`
+- 风险：umask 场景、共享主机场景下可能 chmod 失败 → 需要 try/catch 降级
+- 注意：已存在的旧文件权限不会自动改变 → 需要 prune 时遍历 chmod
+- 总成本：约 0.5 人天开发，几乎零风险
+
+### 10.4 3 种风险场景的兼容回退
+
+实施加固时必须考虑「改出问题了怎么快速回退」，三种风险场景各有不同的回退策略。
+
+**场景 1：allowed_classes 白名单漏类**
+```
+现象：某类缓存突然全部 miss，上游 API 请求量暴涨
+定位：error_log 中出现 "Failed to unserialize" 警告（SQLiteCache.php:69）
+即时回退：
+  方案 A（最快）：配置开关临时切回 allowed_classes => true
+    - 改配置文件，等 OPcache 刷新
+    - 恢复时间：1-2 分钟（取决于 revalidate_freq）
+  方案 B（代码回退）：git revert 加固 commit，重新部署
+    - 恢复时间：取决于部署流水线，通常 5-15 分钟
+善后：
+  - 从日志中收集缺失的类名
+  - 加入白名单
+  - 重新上线
+```
+
+**场景 2：HMAC 密钥泄露或配置错误**
+```
+现象：所有缓存验证失败，命中率跌至 0
+定位：日志中大量 "Cache integrity check failed" 错误
+即时回退：
+  - 配置项 `cache.hmac_enable = false` 临时关闭校验
+  - 退化为无 HMAC 模式，立即恢复
+  - 同时旧数据全部可读，无任何丢失
+风险：
+  - 关闭 HMAC 期间重新暴露在篡改风险中
+  - 如果是密钥配置错误，修正后重新开启即可
+  - 如果是密钥泄露，需要：轮换密钥 → 旧数据全部失效（或双密钥过渡）
+```
+
+**场景 3：文件权限收紧导致其他进程无法读**
+```
+现象：另一个 PHP-FPM 池或 CLI 脚本读缓存失败，报 permission denied
+定位：ls -l 缓存文件显示 0600，所有者是 www-data
+即时回退：
+  - 配置开关切回宽松权限（0644）
+  - 脚本批量 chmod 现有文件为 0644
+    find /path/to/cache -name "*.cache" -exec chmod 644 {} \;
+  - 几分钟内恢复
+根本解决：
+  - 确保所有读写进程属于同一用户组
+  - 使用 0660 权限而非 0600
+  - 或者切换到 SQLite/Memcached 等共享存储
+```
+
+**通用回退设计原则**：
+1. 每个加固项都要有独立的配置开关，支持一键关闭
+2. 回退路径的代码必须经过测试，不能只设计前进路径
+3. 灰度期间保留旧代码路径至少一个 TTL 周期
+4. 关键指标（缓存命中率、上游请求量、错误率）必须有监控告警
+
+### 10.5 P0 至 P3 加固的自动化扫描
+
+加固不能只靠人工审查，需要自动化扫描工具持续检测，防止新代码又引入漏洞。
+
+**静态检测的 4 个层面**：
+
+**1. grep / ripgrep 级别的快扫（CI 级，<10 秒）**
+```bash
+# 检测裸 unserialize 调用（无 allowed_classes 参数）
+rg 'unserialize\s*\(\s*\$' --type php \
+  | grep -v 'allowed_classes' \
+  | grep -v __PHP_Incomplete_Class
+
+# 检测 serialize 调用（标记潜在风险点）
+rg 'serialize\s*\(' --type php
+
+# 检测直接使用 getInput('limit') 无兜底
+rg 'getInput\(('|"")limit('|")\)' --type php \
+  | grep -v '\?\?' \
+  | grep -v '\?:' \
+  | grep -v 'min\|max\|array_slice'
+```
+- 可集成到 CI 流水线，发现新增裸调用立即打回
+- 优点：快、零依赖
+- 缺点：误报率高（某些场景故意不用白名单）
+
+**2. PHP-CS-Fixer / PHP_CodeSniffer 自定义规则**
+```php
+// 自定义 Sniff 伪代码
+class UnserializeSecuritySniff implements Sniff
+{
+    public function register() { return [T_STRING]; }
+    public function process(File $phpcsFile, $stackPtr) {
+        $token = $phpcsFile->getTokensAsString($stackPtr, 1);
+        if ($token !== 'unserialize') return;
+        // 检查后面是否有第二个参数包含 allowed_classes
+        $next = $phpcsFile->findNext(T_OPEN_PARENTHESIS, $stackPtr);
+        // ... 解析参数 ...
+        if (!$hasAllowedClasses) {
+            $phpcsFile->addError('Unsafe unserialize call', $stackPtr, 'Unsafe');
+        }
+    }
+}
+```
+- 优点：准确，可集成到 IDE
+- 缺点：编写规则成本高
+
+**3. PHPStan / Psalm 静态分析**
+```neon
+# phpstan.neon
+rules:
+    - RssBridge\Rules\UnserializeRule
+```
+- 可做数据流分析：追踪「从缓存读出 → unserialize → 传给业务逻辑」的完整链路
+- 检测未验证的反序列化数据流入敏感函数
+- 优点：最精准
+- 缺点：配置复杂，运行慢
+
+**4. 运行时 AOP 注入检测**
+```php
+// 利用 uopz 扩展或预加载机制，在运行时 hook unserialize
+uopz_set_return('unserialize', function ($data, $options = []) {
+    if (!isset($options['allowed_classes']) || $options['allowed_classes'] === true) {
+        trigger_error('Unsafe unserialize call detected!', E_USER_WARNING);
+    }
+    return uopz_get_exit_status() ? false : unserialize($data, $options);
+}, true);
+```
+- 覆盖所有调用点，包括第三方库
+- 只能在测试/预发布环境开，生产环境有性能影响
+
+**rss-bridge 现状**：当前项目用 PHPUnit 做单元测试，未见 PHPStan/Psalm/CS 等静态分析工具。如果要加自动化扫描，推荐从 grep 级别的 CI 检查开始，成本最低。
+
+### 10.6 分键拆分的 key 数膨胀
+
+把 error_reporting 从单键拆成多键（元数据+详情、滚动时间窗）后，缓存 key 的数量会膨胀。需要量化评估对存储的影响。
+
+**4 种拆分方案的 key 数对比**：
+
+假设有 B = 400 个 Bridge，每个平均 E = 10 种错误类型，保留 W = 5 天数据。
+
+| 方案 | Key 数量 | 单键大小 | 总存储估算 | 膨胀倍数 |
+|------|---------|---------|-----------|---------|
+| 原始单键 | B × E = 4,000 | ~100B | ~400KB | 1× |
+| 元数据+详情 | 2 × B × E = 8,000 | meta: ~80B / trace: ~2KB | ~8MB | 20× |
+| 滚动时间窗（日） | B × E × W = 20,000 | ~80B | ~1.6MB | 4× |
+| 滚动时间窗（时） | B × E × W × 24 = 480,000 | ~50B | ~24MB | 60× |
+| 元数据+滚动窗 | 2 × B × E × W = 40,000 | 见上 | ~16MB | 40× |
+
+**Key 数膨胀的影响**：
+
+**对 SQLiteCache 的影响**：
+- 更多行 → 索引更大 → 查询稍慢（但 BLOB 小了，单次 IO 更快）
+- 2 万行 vs 4 千行，查询性能差异可忽略
+- 存储空间：主要开销在 BLOB 数据，行数本身占比极低
+
+**对 FileCache 的影响**：
+- 每个 key 一个文件 → 4000 个文件 vs 20000 个文件
+- 文件系统 inode 消耗增加（每个文件一个 inode）
+- 目录遍历（`scandir` / `prune()`）变慢：O(n) 扫描 2 万文件 vs 4 千文件，慢 5 倍
+- `prune()` 每天执行的话，2 万文件遍历约需几十毫秒到几百毫秒
+
+**对 Memcached 的影响**：
+- Key 数越多 → 内存占用越多
+- 但 Memcached 是 LRU 淘汰，冷数据自然被踢
+- 对命中率的影响：小 key 多了可能降低单 key 驱逐成本，但总体影响小
+
+**控制膨胀的手段**：
+
+1. **滑动窗口清理**：每天凌晨清理超过 N 天的时间窗 key
+   ```
+   error_reporting_{Bridge}_{Code}_{YYYYMMDD}
+   → 每天只保留最近 5 天的 key
+   → 稳定在 B × E × 5 = 20,000，不会无限增长
+   ```
+
+2. **采样聚合**：低优先级错误不按天细分，按周聚合
+   - 高频错误：按天粒度（准确统计）
+   - 低频错误：按周粒度（减少 key 数）
+
+3. **TTL 自动过期**：靠 TTL 自然过期清理，无需主动删
+   - 滚动窗的 key 设置 TTL = 窗口大小 + 1 天
+   - 过期后自动消失，无需手动清理
+
+**结论**：按天滚动窗口 + 元数据拆分，key 数从 4 千膨胀到 2-4 万，总存储从 400KB 涨到几 MB，完全在可接受范围内。如果是按小时窗口才需要警惕膨胀。
+
+### 10.7 滚动时间窗丢窗口处理
+
+使用滚动时间窗（按天/按小时分片）时，有几个边界场景会导致「窗口数据丢失」或「统计不准」。
+
+**丢窗口的 4 种典型场景**：
+
+**场景 1：跨天边界误差**
+```
+时间线（按天窗口）：
+  2026-06-17 23:59:55 → 错误发生 → 计入 06-17 窗口
+  2026-06-18 00:00:03 → 又一个错误 → 计入 06-18 窗口
+  两次只差 8 秒，但分到了两个窗口
+
+聚合「最近 5 天」时：
+  如果当前时间是 06-18 00:00:10
+  只算 06-14 到 06-18 → 06-17 窗口的 23:59:55 那一次被算在内 ✓
+  但如果聚合逻辑是「只看完整的天」，06-18 当天会被排除 → 少计最近的错误
+```
+**处理**：聚合时包含「当天（不完整窗口）」，统计时注明「截至当前时间」。
+
+**场景 2：空窗口没有值**
+```
+某 Bridge 某天没有任何错误 → 当天窗口的 key 不存在
+聚合计算 5 天平均值时：
+  方案 A：只算有数据的天数 → 平均值偏高（分母变小）
+  方案 B：没 key 的天算 0 → 平均值偏低
+```
+**处理**：
+- 计数器场景：空窗口当作 0（错误次数为 0 是合理语义）
+- 聚合时遍历日期范围，逐个查 key，不存在则补 0
+- 代码示例：
+  ```php
+  $total = 0;
+  for ($i = 0; $i < 5; $i++) {
+      $date = date('Ymd', strtotime("-$i days"));
+      $key = "error_reporting_{$bridge}_{$code}_{$date}";
+      $total += (int)$this->cache->get($key);  // 不存在返回 0
+  }
+  ```
+
+**场景 3：窗口切换时的并发写入**
+```
+23:59:59.9 → 进程 A 读取 06-17 窗口 → count=100
+00:00:00.1 → 进程 A 写回 → 应该写到 06-17 还是 06-18？
+```
+**处理**：读和写必须使用同一时间戳。读取窗口 key 时记下日期，写回时还用这个日期，而不是重新取 `date('Ymd')`。
+```php
+// 错误做法
+$count = $cache->get("key_" . date('Ymd'));  // 读时是 23:59:59 → 06-17
+$count++;
+$cache->set("key_" . date('Ymd'), $count);    // 写时是 00:00:01 → 写到 06-18 了！
+
+// 正确做法
+$window = date('Ymd');
+$key = "key_" . $window;
+$count = (int)$cache->get($key);
+$count++;
+$cache->set($key, $count, $ttl);  // 用同一个 $window
+```
+
+**场景 4：长 TTL 窗口数据残留**
+```
+设置 TTL = 5 天
+06-17 的窗口 → TTL 到 06-22 结束
+06-22 当天聚合「最近 5 天」(06-18 ~ 06-22)
+  → 06-17 的数据还在缓存里，但不被计入 ✓（正确）
+06-23 聚合
+  → 06-18 窗口的 TTL 是到 06-23 的某个精确秒数
+  → 如果聚合时间早于过期时间，06-18 还在，计入（应该是 06-19~06-23）
+  → 多算了一天？
+```
+**处理**：TTL 设为窗口大小 + 1 天的缓冲，聚合时按日期范围过滤，不依赖 TTL 自动清理。TTL 只负责兜底清理，业务逻辑自己判断窗口是否在范围内。
+
+### 10.8 Redis INCR 幂等键设计
+
+如果用 Redis 替代 SQLite 做错误计数，`INCR` 指令是天然的原子操作，能解决 lost update 问题。但需要注意幂等性设计。
+
+**Redis INCR 的原子性优势**：
+```
+// 对比：当前 SQLite 实现（非原子）
+$report = $cache->get($key);    // 读
+$report['count']++;             // 改
+$cache->set($key, $report);     // 写 → 竞态窗口
+
+// Redis INCR（原子）
+$count = $redis->incr($key);    // 单条指令，服务器端原子执行
+// 不会有竞态，永远不会少算
+```
+
+**幂等性问题**：
+- `INCR` 不是幂等的：同一次错误如果重试了，会多算一次
+- rss-bridge 的错误报告是「每次异常触发一次计数」，天然就是「来一次加一次」的语义，不需要幂等
+- 但如果上游有重试机制（比如客户端超时重发请求），同一个错误可能被计数多次
+
+**幂等键设计方案**：
+如果需要「同一错误只算一次」（比如按小时幂等）：
+
+```
+方案 A：错误指纹 + SETNX
+  key = "error_reporting_{bridge}_{code}_{hour}_{fingerprint}"
+  fingerprint = md5($e->getMessage() . $e->getFile() . $e->getLine())
+  
+  if ($redis->setnx($key, 1)) {
+      // 首次出现，计数+1
+      $redis->incr("error_reporting_{bridge}_{code}_{hour}_count");
+      $redis->expire($key, 3600);  // 1 小时后过期
+  }
+  // 否则什么也不做
+```
+- 同一小时内完全相同的错误只计数一次
+- 消耗：每个错误指纹一个 key + 一个计数器 key
+- 适合：去重计数场景
+
+**方案 B：滑动窗口 + ZSET（更精细）**
+```
+key = "error_reporting_{bridge}_{code}_sliding"
+ZADD key score=timestamp member=requestId
+
+// 清理窗口外的数据
+ZREMRANGEBYSCORE key 0 (当前时间 - 窗口大小)
+
+// 统计窗口内数量
+ZCARD key
+```
+- 精确到秒级的滑动窗口计数
+- 消耗：每个错误事件一个 ZSET member（约几十字节）
+- 适合：需要精确速率限制的场景
+
+**rss-bridge 场景选择**：
+- 当前需求是「5 天内错误数超过 N 次就上报」，精度要求不高
+- 用「按天 INCR + 聚合 5 天」足够
+- 键数：B × E × 5 = 2 万，和 SQLite 方案差不多
+- 复杂度：很低，`INCR` 一条指令搞定，比 SQLite 的读-改-写简单得多
+
+**INCR 的注意事项**：
+1. **INCR 溢出**：Redis 的 INCR 是 64 位有符号整数，最大 9.2×10¹⁸，error count 永远达不到
+2. **初始值**：key 不存在时 INCR 会自动创建并从 0 开始 +1，结果为 1，符合预期
+3. **TTL 配合**：`INCR` 不自动设 TTL，需要首次时单独 `EXPIRE`
+   ```php
+   $count = $redis->incr($key);
+   if ($count === 1) {
+       $redis->expire($key, $ttl);  // 只在第一次设置过期时间
+   }
+   ```
+   但这不是原子的！要用 `SET key 1 EX ttl NX` 替代：
+   ```php
+   if ($redis->set($key, 1, ['ex' => $ttl, 'nx'])) {
+       $count = 1;
+   } else {
+       $count = $redis->incr($key);
+   }
+   ```
+4. **Memcached 也有 INCR**：不一定要换 Redis，Memcached 的 `increment()` 也是原子的
+   - 注意 Memcached 的 `increment` 在 key 不存在时**不会自动创建**，返回 false
+   - 需要先 `add($key, 0)` 初始化，再 `increment`
