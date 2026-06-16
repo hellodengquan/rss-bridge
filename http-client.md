@@ -1802,3 +1802,627 @@ $httpVersion = curl_getinfo($ch, CURLINFO_HTTP_VERSION);
 ```
 
 > **提示**：如果目标站点的反爬系统同时检测 TLS 指纹和 ALPN 行为，确保 curl-impersonate 版本与目标浏览器匹配至关重要。过时的 impersonate 版本（如 chrome110）在新版 CloudFlare 下可能已被识别。
+
+---
+
+## 15. 架构边界与退路分析
+
+### 15.1 multi-handle 异步连接池退路
+
+#### 现状：完全同步模型
+
+RSS-Bridge 的 `CurlHttpClient` **完全没有异步/并发支持**，所有请求都是同步阻塞的。每个 `request()` 调用执行完整的生命周期：
+
+```
+请求 A: curl_init() → DNS → TCP → TLS → 请求 → 响应 → curl_close()
+请求 B: curl_init() → DNS → TCP → TLS → 请求 → 响应 → curl_close()
+请求 C: curl_init() → DNS → TCP → TLS → 请求 → 响应 → curl_close()
+```
+
+由于每次都新建句柄，没有连接复用，也没有并发。
+
+#### 可扩展的 multi-handle 异步方案
+
+cURL 提供 `curl_multi_*` 系列函数用于并发请求和连接复用。虽然 RSS-Bridge 目前未使用，但可以作为退路方案：
+
+```php
+// 概念示例（未实现）
+class MultiCurlHttpClient implements HttpClient
+{
+    private $multiHandle;
+    private $connectionPool = [];
+
+    public function requestMulti(array $urls, array $config = []): array
+    {
+        $mh = curl_multi_init();
+        $handles = [];
+
+        foreach ($urls as $url) {
+            $ch = curl_init($url);
+            // ... 设置选项 ...
+            curl_multi_add_handle($mh, $ch);
+            $handles[] = $ch;
+        }
+
+        // 事件循环，并发等待所有请求完成
+        do {
+            curl_multi_exec($mh, $active);
+            curl_multi_select($mh);
+        } while ($active);
+
+        // 收集响应
+        $responses = [];
+        foreach ($handles as $ch) {
+            $responses[] = curl_multi_getcontent($ch);
+            curl_multi_remove_handle($mh, $ch);
+            // 连接可复用，不立即 close
+        }
+
+        curl_multi_close($mh);
+        return $responses;
+    }
+}
+```
+
+#### multi-handle 带来的优势
+
+| 特性 | 当前 CurlHttpClient | MultiCurlHttpClient |
+|------|---------------------|----------------------|
+| 并发能力 | ❌ 串行，一个请求完成后才开始下一个 | ✅ 并发，N 个请求同时进行 |
+| 连接复用 | ❌ 每次新建句柄 | ✅ 同 multi 句柄内可复用连接 |
+| 性能（N 个请求） | O(N × 单个请求时间) | O(最长单个请求时间) |
+| 反爬风险 | 连续请求时间戳间隔可被检测 | 请求同时到达，更接近真实浏览器 |
+| 内存占用 | 低（单个句柄） | 高（N 个句柄 + 响应缓冲区） |
+
+#### 对现有代码的影响
+
+如果引入 multi-handle，需要考虑：
+
+1. **`getContents()` 接口兼容**：当前返回单个字符串/Response，并发版本需要返回数组
+2. **重试机制重构**：当前重试在单句柄循环内，并发版本需要按句柄单独重试
+3. **缓存机制调整**：`getSimpleHTMLDOMCached()` 每次只缓存一个 URL，需要批处理
+4. **超时计算**：`CURLOPT_TIMEOUT` 是每个句柄的独立超时，不是总超时
+5. **错误处理**：单个请求失败不应导致整个并发组失败
+
+> **注意**：PHP 环境下，同步模型对 RSS-Bridge 是合理的——每个 Bridge 请求通常只需要 1-5 个 HTTP 请求，并发带来的收益不明显，反而增加复杂度。multi-handle 只有在批量抓取（如一次性获取 10+ 篇文章）时才有明显优势。
+
+---
+
+### 15.2 Bridge 禁用 socks5h 时认证泄漏隔离
+
+#### NOPROXY 机制的全局副作用
+
+`DisplayAction.php:41-48` 中的 NOPROXY 机制存在全局副作用风险：
+
+```php
+if (
+    Configuration::getConfig('proxy', 'url')
+    && Configuration::getConfig('proxy', 'by_bridge')
+    && $noproxy
+) {
+    define('NOPROXY', true);  // ← 全局常量，一旦定义不可撤销
+}
+```
+
+由于 PHP 常量的全局特性，**同一进程内的后续请求也会跳过代理**。在 PHP-FPM 模式下，worker 进程是复用的，这意味着：
+
+```
+请求 A (带 _noproxy=1):
+  → define('NOPROXY', true)
+  → getContents() 不使用代理 ✓
+
+请求 B (不带 _noproxy，同 worker 进程):
+  → defined('NOPROXY') 已经为 true
+  → getContents() 也不使用代理 ✗ 非预期行为
+```
+
+#### 认证泄漏的场景分析
+
+当存在全局代理认证，而用户请求中使用 `_noproxy=1` 时：
+
+| 场景 | 代理配置 | 认证泄漏风险 | 说明 |
+|------|---------|-------------|------|
+| 1 | 全局 HTTP 代理带认证 | 低 | NOPROXY 只是跳过代理设置，不涉及认证传递 |
+| 2 | Bridge 手动设置代理 | 高 | 如果 Bridge 代码中硬编码代理，NOPROXY 不生效 |
+| 3 | URL 内嵌凭证 + NOPROXY | 中 | 凭证可能被缓存或错误日志记录 |
+| 4 | 进程复用导致代理状态混乱 | 中 | worker 进程的 NOPROXY 状态污染后续请求 |
+
+#### 代码层面的隔离缺失
+
+`lib/contents.php:100-102` 的检查是基于全局常量的：
+
+```php
+if (Configuration::getConfig('proxy', 'url') && !defined('NOPROXY')) {
+    $config['proxy'] = Configuration::getConfig('proxy', 'url');
+}
+```
+
+**没有请求级别的代理开关**——NOPROXY 是进程级的，不是请求级的。
+
+#### 改进建议
+
+```php
+// 现有：全局常量
+define('NOPROXY', true);
+
+// 改进：通过 Request 对象传递
+$config['noproxy'] = $request->get('_noproxy');
+// getContents() 中检查请求级配置而非全局常量
+if (Configuration::getConfig('proxy', 'url') && !($config['noproxy'] ?? false)) {
+    $config['proxy'] = Configuration::getConfig('proxy', 'url');
+}
+```
+
+---
+
+### 15.3 Circuit Breaker HALF_OPEN 探活退避
+
+#### 现有实现的缺陷
+
+如 14.3 节所述，RSS-Bridge 的熔断机制缺少 HALF-OPEN 状态，导致：
+- 缓存过期后直接全量请求
+- 无法区分永久封禁和临时限速
+- 连续 429 会进入"熔断→过期→再熔断"的无限循环
+
+#### HALF_OPEN 探活的参考实现
+
+可以基于现有缓存机制扩展出探活逻辑：
+
+```php
+// 概念实现（可集成到现有 Bridge 中）
+trait CircuitBreakerTrait
+{
+    private function checkCircuitBreaker(string $cacheKey, int $failureThreshold = 3): bool
+    {
+        $state = $this->cache->get($cacheKey . '_state');
+
+        if ($state === 'open') {
+            // OPEN 状态：全部拒绝
+            throwRateLimitException();
+        }
+
+        if ($state === 'half_open') {
+            // HALF_OPEN 状态：只允许一个探活请求
+            $probeCount = $this->cache->get($cacheKey . '_probe_count') ?? 0;
+            if ($probeCount >= 1) {
+                // 已有探活请求在进行，拒绝新请求
+                throwRateLimitException();
+            }
+            $this->cache->set($cacheKey . '_probe_count', $probeCount + 1, 60);
+            return true;  // 允许探活
+        }
+
+        return true;  // CLOSED 状态：正常通行
+    }
+
+    private function onSuccess(string $cacheKey): void
+    {
+        // 成功：清除失败计数，回到 CLOSED
+        $this->cache->delete($cacheKey . '_state');
+        $this->cache->delete($cacheKey . '_failures');
+    }
+
+    private function onFailure(string $cacheKey, int $code, int $backoffBase = 60): void
+    {
+        $failures = ($this->cache->get($cacheKey . '_failures') ?? 0) + 1;
+        $this->cache->set($cacheKey . '_failures', $failures, 86400);
+
+        // 指数退避：60s, 120s, 240s, 480s, ... 最大 1h
+        $backoff = min($backoffBase * pow(2, $failures - 1), 3600);
+
+        if ($failures >= 3) {
+            // 连续 3 次失败：进入 HALF_OPEN
+            $this->cache->set($cacheKey . '_state', 'half_open', $backoff);
+        } else {
+            // 未达阈值：OPEN 状态
+            $this->cache->set($cacheKey . '_state', 'open', $backoff);
+        }
+    }
+}
+```
+
+#### 三态模型的行为对比
+
+| 状态 | 触发条件 | 熔断时长 | 行为 | 成功后 | 失败后 |
+|------|---------|---------|------|--------|--------|
+| CLOSED | 初始状态或探活成功 | - | 所有请求正常通行 | - | 失败计数 +1 |
+| OPEN | 连续失败 1-2 次 | 指数退避（60s→120s） | 全部请求拒绝 | - | 保持 OPEN |
+| HALF_OPEN | 连续失败 ≥3 次 | 指数退避（240s→...） | 仅放行 1 个探活请求 | 回到 CLOSED | 失败计数 +1，延长 HALF_OPEN |
+
+#### 探活请求的退避策略
+
+探活请求应该**逐渐增加间隔**，避免频繁触发目标站点的反爬：
+
+| 连续失败次数 | 熔断时长 | 探活策略 |
+|-------------|---------|---------|
+| 1 | 60s | 到期后全量恢复 |
+| 2 | 120s | 到期后全量恢复 |
+| 3 | 240s | 到期后仅放行 1 个探活请求 |
+| 4 | 480s | 到期后仅放行 1 个探活请求 |
+| 5 | 960s | 到期后仅放行 1 个探活请求 |
+| N | min(60×2^(N-1), 3600) | 到期后仅放行 1 个探活请求 |
+
+> **注意**：TikTokBridge 已经实现了简单的重试退避（0.1s × 3 次），但这是请求级的重试，不是 Circuit Breaker 级的熔断。
+
+---
+
+### 15.4 Alpine 与 Debian 编译 curl-impersonate 差异
+
+#### 官方 Dockerfile 基于 Debian 12
+
+`Dockerfile:1` 明确使用 `debian:12-slim`：
+
+```dockerfile
+FROM debian:12-slim AS rssbridge
+```
+
+没有官方 Alpine 镜像，主要原因是 curl-impersonate 的编译依赖差异。
+
+#### musl vs glibc 核心差异
+
+| 维度 | Debian (glibc) | Alpine (musl) |
+|------|---------------|---------------|
+| C 标准库 | GNU libc 2.36 | musl libc 1.2+ |
+| curl-impersonate 预编译包 | ✅ 官方提供 | ❌ 官方不提供 |
+| BoringSSL 编译 | ✅ 容易 | ⚠️ 需要 patch |
+| 线程模型 | NPTL（Native POSIX Threads） | musl 自有线程实现 |
+| DNS 解析 | glibc nsswitch | musl 内置解析器 |
+| 镜像体积 | ~50 MB（基础）+ ~800 MB（含 Chrome） | ~20 MB（基础） |
+
+#### curl-impersonate 在 Alpine 上的编译挑战
+
+1. **BoringSSL 与 musl 的兼容性**：BoringSSL 主要面向 glibc 开发，在 musl 上编译需要补丁
+
+2. **Go 运行时交叉编译**：curl-impersonate 的部分工具链用 Go 编写，Alpine 的静态链接会有问题
+
+3. **patchelf 可用性**：Dockerfile 中使用 `patchelf` 修改 SONAME，Alpine 上同样可用，但处理 musl 的动态链接有差异
+
+4. **PHP 版本兼容性**：Alpine 3.18 带 PHP 8.2，理论上可以运行 RSS-Bridge，但 curl 扩展的编译选项不同
+
+#### 手动编译 curl-impersonate for Alpine 的概念步骤
+
+```dockerfile
+# Alpine 概念 Dockerfile（未验证）
+FROM alpine:3.18
+
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    go \
+    rust \
+    cargo \
+    patchelf \
+    git \
+    python3
+
+# 1. 下载 curl-impersonate 源码
+# 2. 应用 musl 兼容性补丁
+# 3. 编译 BoringSSL
+# 4. 编译 libcurl-impersonate
+# 5. patchelf 修改 SONAME
+# 6. 安装 PHP + 扩展
+```
+
+#### 为什么 Alpine 不是优先选择
+
+| 考虑因素 | Debian | Alpine |
+|---------|--------|--------|
+| curl-impersonate 支持 | ✅ 官方预编译，开箱即用 | ❌ 需要自行编译维护 |
+| PHP 扩展兼容性 | ✅ 所有扩展都有官方包 | ⚠️ 部分扩展需要自行编译 |
+| 调试便利性 | ✅ gdb、strace 等工具齐全 | ⚠️ musl 堆栈跟踪困难 |
+| 长期维护成本 | 低（依赖官方包） | 高（每次升级都要重新编译） |
+| 镜像体积 | 较大 | 较小 |
+
+> **建议**：除非对镜像体积有极端要求，否则优先使用官方 Debian 镜像。如果必须用 Alpine，考虑使用多阶段构建，在 Debian 阶段编译 curl-impersonate，然后复制 .so 文件到 Alpine 阶段（但仍需处理 glibc 与 musl 的 ABI 不兼容问题）。
+
+---
+
+### 15.5 PSR-7 大小写不敏感合规
+
+#### PSR-7 规范要求
+
+PSR-7 `MessageInterface` 明确要求 Header 名称大小写不敏感：
+
+> "While header names are case-insensitive, the casing of the header will be preserved by the implementation, and returned by `getHeaders()`."
+> — PSR-7 Specification
+
+#### RSS-Bridge Response 类的分析
+
+`lib/http.php:254-389` 的 `Response` 类部分符合 PSR-7，但有差异：
+
+| PSR-7 方法 | RSS-Bridge 实现 | 合规性 | 说明 |
+|-----------|----------------|--------|------|
+| `getHeaders()` | ✅ 有 | ⚠️ 部分 | 返回所有 header，但全部转为小写 |
+| `hasHeader($name)` | ❌ 无 | - | 需要手动实现 |
+| `getHeader($name)` | ✅ 有 | ✅ 合规 | 内部 `mb_strtolower($name)` 归一化 |
+| `getHeaderLine($name)` | ❌ 无 | - | `getHeader()` 返回字符串（非数组）实现了类似功能 |
+| `withHeader($name, $value)` | ✅ 有 | ❌ 不合规 | 没有归一化 `$name`，直接存储 |
+| `withAddedHeader($name, $value)` | ❌ 无 | - | 需要手动实现 |
+| `withoutHeader($name)` | ❌ 无 | - | 需要手动实现 |
+
+#### 关键代码细节
+
+**读取时归一化（合规）**：
+```php
+// lib/http.php:352-363
+public function getHeader(string $name, bool $all = false)
+{
+    $name = mb_strtolower($name);  // ← 读取时归一化，合规
+    $header = $this->headers[$name] ?? null;
+    // ...
+}
+```
+
+**构造时归一化（合规）**：
+```php
+// lib/http.php:311-312
+$name = mb_strtolower($name);  // ← 存储前归一化
+```
+
+**响应 Header 解析时归一化（合规）**：
+```php
+// lib/http.php:161
+$name = mb_strtolower(trim($header[0]));  // ← 解析响应时归一化
+```
+
+**`withHeader()` 未归一化（不合规）**：
+```php
+// lib/http.php:365-370
+public function withHeader(string $name, string $value): self
+{
+    $clone = clone $this;
+    $clone->headers[$name] = [$value];  // ← $name 未归一化，不合规！
+    return $clone;
+}
+```
+
+**`send()` 时未还原大小写（潜在问题）**：
+```php
+// lib/http.php:379-388
+public function send(): void
+{
+    http_response_code($this->code);
+    foreach ($this->headers as $name => $values) {
+        foreach ($values as $value) {
+            header(sprintf('%s: %s', $name, $value));  // ← 用存储的小写名发送
+        }
+    }
+}
+```
+
+#### 不合规的影响
+
+当调用 `$response->withHeader('Content-Type', 'text/html')` 后：
+1. `$response->getHeaders()` 会同时包含 `'content-type'`（构造时的）和 `'Content-Type'`（withHeader 新增的）
+2. 最终 `send()` 会发送两个 Header，导致客户端行为异常
+3. `getHeader('Content-Type')` 仍能正常工作，因为读取时归一化
+
+#### 修复建议
+
+```php
+public function withHeader(string $name, string $value): self
+{
+    $clone = clone $this;
+    $name = mb_strtolower($name);  // ← 添加归一化
+    $clone->headers[$name] = [$value];
+    return $clone;
+}
+```
+
+---
+
+### 15.6 cgroup 限制下 Xvfb 内存弹性
+
+#### Docker cgroup 内存限制
+
+在 Docker 环境下，可以通过 `--memory` 参数限制容器内存：
+
+```bash
+docker run --memory=512m rss-bridge:latest
+```
+
+但 RSS-Bridge 代码中**没有 cgroup 内存检测**，也没有针对内存限制的弹性调整。
+
+#### Xvfb 的内存模型
+
+Xvfb（X Virtual Framebuffer）将整个显示缓冲区存在内存中：
+
+```
+内存占用 ≈ 宽 × 高 × 色深 / 8
+        ≈ 1920 × 1080 × 24 / 8
+        ≈ 6.2 MB （仅帧缓冲）
+```
+
+加上 Chrome 的内存占用，实际情况：
+
+| 配置 | Xvfb 内存 | Chrome 内存 | 总占用 | cgroup 限制建议 |
+|------|----------|------------|--------|----------------|
+| 1024×768×24 | ~2.4 MB | ~150 MB | ~200 MB | ≥ 512 MB |
+| 1920×1080×24 | ~6.2 MB | ~250 MB | ~350 MB | ≥ 1 GB |
+| 1920×1080×24 + WebGL | ~6.2 MB | ~400 MB | ~500 MB | ≥ 1.5 GB |
+
+#### cgroup OOM Killer 风险
+
+当内存超过 cgroup 限制时，Linux 内核的 OOM Killer 会：
+1. 选择内存占用最高的进程杀死
+2. Chrome 通常是内存占用最高的，会被优先杀死
+3. PHP-FPM 进程可能存活，但 WebDriver 连接已断开
+
+**代码层面没有任何防护**——`WebDriverAbstract` 不会检测 Chrome 是否被 OOM 杀死，也不会自动重启。
+
+#### 内存弹性的改进方向
+
+1. **cgroup 内存检测**：
+
+```php
+function getCgroupMemoryLimit(): ?int
+{
+    if (is_readable('/sys/fs/cgroup/memory/memory.limit_in_bytes')) {
+        return (int) file_get_contents('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    }
+    // cgroup v2
+    if (is_readable('/sys/fs/cgroup/memory.max')) {
+        $val = trim(file_get_contents('/sys/fs/cgroup/memory.max'));
+        return $val === 'max' ? null : (int) $val;
+    }
+    return null;
+}
+```
+
+2. **根据内存限制动态调整 Chrome 参数**：
+
+```php
+protected function getBrowserOptions()
+{
+    $chromeOptions = new ChromeOptions();
+    $memoryLimit = getCgroupMemoryLimit();
+
+    if ($memoryLimit && $memoryLimit < 512 * 1024 * 1024) {
+        // 内存不足 512MB：激进的内存优化
+        $chromeOptions->addArguments([
+            '--headless',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--disable-dev-shm-usage',  // 避免使用 /dev/shm
+            '--memory-pressure-off',
+            '--enable-features=VaapiVideoDecoder',
+        ]);
+    } else {
+        // 正常配置
+        $chromeOptions->addArguments(['--headless']);
+    }
+
+    return $chromeOptions;
+}
+```
+
+3. **共享内存（/dev/shm）限制**：
+
+```bash
+# Docker 默认 /dev/shm 只有 64MB，Chrome 需要更大
+docker run --shm-size=1g rss-bridge:latest
+```
+
+或者通过 Chrome 参数绕过：
+```php
+$chromeOptions->addArguments(['--disable-dev-shm-usage']);
+```
+
+---
+
+### 15.7 QUIC 与 HTTP/3 在 ALPN 降级中的位置
+
+#### QUIC/HTTP/3 现状
+
+RSS-Bridge **完全不支持 QUIC 和 HTTP/3**。
+
+| 协议 | ALPN 标识符 | cURL 支持 | RSS-Bridge 支持 |
+|------|------------|-----------|----------------|
+| HTTP/1.1 | `http/1.1` | ✅ | ✅ |
+| HTTP/2 | `h2` | ✅ | ✅（自动协商） |
+| HTTP/3 | `h3` | cURL 7.66+ 实验性支持 | ❌ |
+
+#### ALPN 协商顺序
+
+curl-impersonate 模拟的 Chrome 142 的 ALPN 顺序是：
+
+```
+["h2", "http/1.1"]
+```
+
+**不包含 `h3`**——这是有意的，因为：
+1. curl-impersonate 的主要目标是模拟浏览器 TLS 指纹，而不是追求最新协议
+2. HTTP/3 的 UDP 传输与 TCP 上的 TLS 握手机制完全不同
+3. 大多数反爬系统仍然主要检测 TCP 上的 TLS 指纹
+
+#### 如果服务端强制 HTTP/3
+
+某些站点（如 CloudFlare 保护的站点）可能通过 `Alt-Svc` 头声明 HTTP/3 支持：
+
+```
+Alt-Svc: h3=":443"; ma=86400, h3-29=":443"; ma=86400
+```
+
+但 RSS-Bridge 的 cURL 配置会：
+1. 忽略 `Alt-Svc` 头（默认行为）
+2. 继续使用 HTTP/1.1 或 HTTP/2
+3. 不会自动升级到 HTTP/3
+
+#### 启用 HTTP/3 的代价
+
+如果需要支持 HTTP/3，需要：
+
+1. **cURL 支持**：编译 cURL 时启用 `--enable-http3`，需要 ngtcp2 + nghttp3 + OpenSSL 3.0+
+2. **curl-impersonate 不支持**：curl-impersonate 目前不模拟 HTTP/3 指纹
+3. **UDP 网络**：HTTP/3 基于 UDP，需要防火墙放行 UDP 443
+4. **指纹一致性**：如果声明支持 `h3` 但实际不使用，会造成指纹不一致
+
+#### 降级链的完整路径
+
+```
+ClientHello ALPN: ["h2", "http/1.1"]
+    ↓ 服务端支持 h2
+HTTP/2 正常通信
+    ↓ 服务端不支持 h2 但支持 http/1.1
+HTTP/1.1 正常通信
+    ↓ 服务端仅支持 h3（极罕见）
+TLS 握手成功，但没有匹配的 ALPN → cURL 默认回退到 HTTP/1.1
+```
+
+> **注意**：HTTP/3 在 RSS-Bridge 的场景下收益不大——RSS 抓取通常是小请求，HTTP/3 的多路复用和 0-RTT 优势不明显。反而 TLS 指纹的一致性更重要。如果反爬系统检测到客户端声明支持 `h3` 但实际使用 HTTP/2，可能会触发额外的检查。
+
+---
+
+## 16. 最终架构总结
+
+### HTTP 客户端决策树
+
+```
+发起请求
+   ↓
+是否有缓存且未过期？
+   ├─ 是 → 直接返回缓存 ✅
+   └─ 否 → 继续
+         ↓
+是否 BoringSSL 环境？
+   ├─ 是 → curl-impersonate 自动设置 Chrome 142 指纹
+   └─ 否 → 手动设置 Firefox 102 UA + Headers
+         ↓
+是否配置了代理且未 NOPROXY？
+   ├─ 是 → CURLOPT_PROXY 设置代理
+   └─ 否 → 直连
+         ↓
+网络请求成功？
+   ├─ 是 → 检查状态码
+   │     ├─ 200/201/202 → 写入缓存 → 返回
+   │     ├─ 304 → 回填缓存 Body → 返回
+   │     ├─ 429 → Bridge 级熔断 → 抛出 RateLimitException
+   │     ├─ 503 → 返回 503 给客户端
+   │     └─ 其他 → 抛出 HttpException
+   └─ 否 → 重试 retries 次 → 仍失败 → 抛出 HttpException
+```
+
+### 反爬能力矩阵
+
+| 反爬措施 | curl-impersonate | WebDriver | 手动指纹 |
+|---------|-----------------|-----------|----------|
+| TLS JA3 指纹 | ✅ 精确模拟 | ⚠️ 真实浏览器但可被检测 headless | ❌ OpenSSL 默认指纹 |
+| ALPN 顺序 | ✅ 与 Chrome 一致 | ✅ 真实浏览器 | ❌ OpenSSL 默认顺序 |
+| HTTP/2 帧顺序 | ✅ 精确模拟 | ✅ 真实浏览器 | ❌ 原生 cURL |
+| Header 顺序 | ✅ 与 Chrome 一致 | ✅ 真实浏览器 | ⚠️ 硬编码 Firefox 顺序 |
+| JavaScript 执行 | ❌ 不支持 | ✅ 完整支持 | ❌ 不支持 |
+| Canvas/WebGL 指纹 | ❌ 不支持 | ⚠️ 可被检测 | ❌ 不支持 |
+| cf_clearance Cookie | ❌ 需手动 | ✅ 自动获取 | ❌ 需手动 |
+| 资源占用 | 极低 | 极高 | 极低 |
+
+### 部署选型建议
+
+| 场景 | 推荐方案 | 镜像体积 | 内存占用 |
+|------|---------|---------|---------|
+| 通用场景 | Docker Debian 官方镜像 | ~1.5 GB | ~100 MB |
+| 严格反爬站点 | Docker + 独立 Selenium 容器 | ~2 GB | ~500 MB |
+| 嵌入式/低资源 | Debian 原生部署（无 Docker） | N/A | ~50 MB |
+| 仅 HTTP API 类 Bridge | 无 curl-impersonate，手动指纹 | ~200 MB | ~30 MB |
+| 极端反爬 + 无 GUI | Xvfb + Chrome（非 headless） | ~2 GB | ~700 MB |
+
+> **核心原则**：优先使用 curl-impersonate，失败时才考虑 WebDriver。WebDriver 是终极武器但代价高昂，应作为最后退路。
