@@ -1327,3 +1327,478 @@ private $options = [
 | curl-impersonate 覆盖 | 完整模拟 | 仅 TLS 层 |
 
 > **安全提示**：HTTP/2 的指纹特征比 HTTP/1.1 多得多。如果 curl-impersonate 模拟的 HTTP/2 指纹被识别，降级到 HTTP/1.1 有时能绕过检测，因为服务端对 HTTP/1.1 的指纹检查通常较松。
+
+---
+
+## 14. 深度边界分析
+
+### 14.1 连接池满时新请求的等待行为
+
+#### RSS-Bridge 没有连接池
+
+`CurlHttpClient` 每次 `request()` 调用都执行完整的 `curl_init()` → `curl_exec()` → `curl_close()` 生命周期（`lib/http.php:67, 195`），不存在连接池概念。
+
+**因此不存在"连接池满"的等待行为**——每个请求都独立建立 TCP + TLS 连接。
+
+#### PHP-FPM 层面的并发控制
+
+虽然没有连接池，但 PHP-FPM 进程模型本身就起到了并发限制的作用：
+
+| 配置项 | 默认值 | 作用 |
+|--------|--------|------|
+| `pm.max_children` | 5 | 最大同时处理的请求数 |
+| `pm.max_requests` | 500 | 进程处理多少请求后重启 |
+| `request_terminate_timeout` | 0 | 请求超时（0=不限制） |
+
+当 PHP-FPM 的 worker 进程全部忙碌时，新请求会排队等待空闲 worker，而非等待连接池。等待行为取决于 `pm` 配置（static / dynamic / ondemand）。
+
+#### Docker 环境下的并发
+
+`config/php-fpm.conf` 控制了容器内的 FPM 配置。默认配置下：
+- 同时最多 5 个并发 Bridge 请求
+- 每个请求独立创建 cURL 连接，互不干扰
+- 不存在连接池满导致的阻塞
+
+> **如果需要连接池**：可通过 `curl_multi_*` 系列函数实现，但 RSS-Bridge 目前未使用。`curl_multi_init` 允许在一个 cURL 句柄组内并发执行多个请求并复用连接，但需要重构 `CurlHttpClient`。
+
+---
+
+### 14.2 HTTP CONNECT 隧道下 Basic 认证泄漏场景
+
+#### CONNECT 隧道的工作原理
+
+当通过 HTTP 代理访问 HTTPS 站点时，cURL 使用 CONNECT 方法建立隧道：
+
+```
+客户端 → 代理: CONNECT target.com:443 HTTP/1.1
+代理 → 客户端: HTTP/1.1 200 Connection Established
+[此时建立端到端 TLS 隧道，代理不再可见明文]
+```
+
+#### 认证泄漏的三个场景
+
+**场景 1：代理认证泄漏到目标站点**
+
+如果代理使用 Basic 认证，cURL 会通过 `Proxy-Authorization` 头发送凭证：
+
+```
+CONNECT target.com:443 HTTP/1.1
+Proxy-Authorization: Basic dXNlcjpwYXNz  ← Base64 编码的 user:pass
+Host: target.com:443
+```
+
+这个头只应该被代理读取，但以下情况会泄漏：
+
+| 泄漏场景 | 风险 | 说明 |
+|---------|------|------|
+| 代理是恶意的 | 高 | 代理可以记录并复用凭证 |
+| 代理误转发 `Proxy-Authorization` 到源站 | 中 | 某些配置错误的代理会这样做 |
+| 中间人攻击 | 高 | HTTP 代理的 CONNECT 请求可被窃听 |
+
+RSS-Bridge 的代码（`lib/http.php:133-135`）直接设置代理 URL，不做认证信息分离：
+
+```php
+if ($config['proxy']) {
+    curl_setopt($ch, CURLOPT_PROXY, $config['proxy']);
+}
+```
+
+**场景 2：目标站点认证泄漏到代理**
+
+当使用 Basic Auth 访问目标站点时（如 Spotify 的 `Authorization: Basic` 头）：
+
+```php
+// SpotifyBridge.php:158-163
+$basicAuth = base64_encode(sprintf('%s:%s', $this->getInput('clientid'), $this->getInput('clientsecret')));
+$json = getContents('https://accounts.spotify.com/api/token', [
+    "Authorization: Basic $basicAuth",
+], [...]);
+```
+
+通过 HTTP 代理时，`Authorization` 头在 TLS 隧道内传输（加密），代理无法看到。但如果代理是 HTTPS 代理（而非 HTTP 代理），则整条链路都是加密的，更安全。
+
+**场景 3：URL 内嵌凭证泄漏**
+
+```ini
+[proxy]
+url = "http://admin:secret@proxy.example.com:8080"
+```
+
+cURL 会将 `admin:secret` 转为 `Proxy-Authorization: Basic` 头。如果代理 URL 被：
+- 记录到日志（`CURLOPT_VERBOSE`）
+- 显示在错误信息中
+- 泄漏到 HTTP_REFERER
+
+就会造成凭证泄漏。RSS-Bridge 通过 `name` 配置项隐藏代理 URL：
+
+```ini
+[proxy]
+name = "Hidden proxy name"  ; 前台显示此名称，不显示 URL
+```
+
+#### 安全建议
+
+1. **永远不要在代理 URL 中嵌入凭证**——使用 `CURLOPT_PROXYUSERPWD` 单独设置
+2. **使用 HTTPS 代理**——CONNECT 隧道在 TLS 内建立，防止凭证窃听
+3. **使用 SOCKS5h**——认证子协商不走明文 HTTP
+4. **代理凭证与站点凭证使用不同密码**——避免连锁泄漏
+
+---
+
+### 14.3 连续命中限速后切到 Circuit Breaker
+
+#### 现有实现：Cache-Based 半熔断
+
+RSS-Bridge 的限速保护本质上是**基于缓存的熔断器（Circuit Breaker）**，但只实现了"断开"状态，没有完整的 Circuit Breaker 三态模型：
+
+```
+标准 Circuit Breaker 三态模型：
+┌────────────┐  失败超阈值  ┌────────────┐  超时后   ┌─────────────┐
+│  CLOSED    │ ──────────→ │   OPEN     │ ────────→ │ HALF-OPEN   │
+│ (正常通行) │             │ (全部拒绝) │           │ (试探放行)   │
+└────────────┘  ←────────── └────────────┘ ←──────── └─────────────┘
+                  成功恢复                      试探失败
+```
+
+#### RSS-Bridge 的实现对比
+
+| 状态 | 标准 CB | RSS-Bridge 实现 | Bridge |
+|------|---------|----------------|--------|
+| CLOSED（正常） | 请求正常通行 | 请求正常通行 | 所有 Bridge |
+| OPEN（断开） | 全部请求立即拒绝 | 全部请求立即拒绝（`throwRateLimitException()`） | 所有 Bridge |
+| HALF-OPEN（试探） | 放行一个请求测试 | ❌ 不存在 | 无 |
+| 超时恢复 | 超时后自动进入 HALF-OPEN | 缓存过期后自动恢复 | 所有 Bridge |
+
+**关键区别**：RSS-Bridge 缓存过期后直接回到 CLOSED 状态，没有 HALF-OPEN 试探期。这意味着缓存过期后的第一个请求会直接打到目标站点——如果目标站点仍在限速，会再次触发 429，重新进入 OPEN 状态。
+
+#### 各 Bridge 的熔断阈值
+
+| Bridge | 熔断触发条件 | 熔断时长 | 重新打开后行为 |
+|--------|-------------|---------|--------------|
+| YoutubeBridge | 1 次 429 | 16 分钟 | 缓存过期后直接全量请求 |
+| RedditBridge | 1 次 429 或 1 次 403 | 61 分钟 | 缓存过期后直接全量请求 |
+| SpotifyBridge | 1 次 429 | 5 分钟或 Retry-After | 缓存过期后直接全量请求 |
+| TikTokBridge | 任意 HTTP 错误 | 0.1 秒 × 3 次 | 立即重试，无熔断 |
+
+**TikTokBridge 是唯一实现了"渐进式"退避的 Bridge**（`bridges/TikTokBridge.php:47-59`）：
+
+```php
+$attempts = 0;
+do {
+    try {
+        $json = getContents('https://www.tiktok.com/oembed?url=' . $url);
+    } catch (HttpException $e) {
+        $attempts++;
+        usleep(100000);  // 0.1 秒等待
+        continue;
+    }
+    break;
+} while ($attempts < 3);
+```
+
+#### 连续命中的风险场景
+
+```
+t=0    首次请求 → 429 → 熔断开启（缓存 16 分钟）
+t=16m  缓存过期 → 请求 → 429 → 熔断重新开启
+t=32m  缓存过期 → 请求 → 429 → 熔断重新开启
+       ↑ 无限循环，永远不会试探性放行
+```
+
+因为没有 HALF-OPEN 状态，RSS-Bridge 无法区分：
+- 目标站点永久封禁（应该停止请求）
+- 目标站点临时限速（可以试探恢复）
+
+**改进方向**：引入连续失败计数器，如果连续 N 次进入 OPEN 状态，则指数增加熔断时长。
+
+---
+
+### 14.4 curl-impersonate 在 PHP 7.x 老环境安装难度
+
+#### 兼容性矩阵
+
+| 环境 | PHP 版本 | curl-impersonate | 安装难度 | 问题 |
+|------|---------|-----------------|----------|------|
+| Docker (Debian 12) | 8.2 | ✅ 原生支持 | 低 | Dockerfile 一键安装 |
+| Ubuntu 22.04 | 8.1 | ✅ 手动安装 | 中 | 需要编译或下载预编译包 |
+| Ubuntu 20.04 | 7.4 | ⚠️ 可行但困难 | 高 | glibc 版本不匹配 |
+| CentOS 7 | 7.2 | ❌ 极难 | 极高 | glibc 2.17 vs 需要 2.31+ |
+| Debian 10 | 7.3 | ⚠️ 可行但困难 | 高 | 同 glibc 问题 |
+
+#### 核心障碍：glibc 版本
+
+curl-impersonate 的预编译包依赖 glibc 2.31+（Debian 11+），而 PHP 7.x 通常运行在旧版系统上：
+
+```
+curl-impersonate v1.2.5 预编译包依赖链：
+  libcurl-impersonate.so
+    → libssl.so (BoringSSL)
+      → glibc >= 2.31
+      → libstdc++ >= GLIBCXX_3.4.26
+```
+
+| 系统 | glibc 版本 | PHP 版本 | 能否运行 curl-impersonate |
+|------|-----------|---------|--------------------------|
+| Debian 12 | 2.36 | 8.2 | ✅ |
+| Debian 11 | 2.31 | 7.4 | ✅ 最低要求 |
+| Debian 10 | 2.28 | 7.3 | ❌ glibc 不够 |
+| Ubuntu 20.04 | 2.31 | 7.4 | ✅ 刚好 |
+| Ubuntu 18.04 | 2.27 | 7.2 | ❌ glibc 不够 |
+| CentOS 7 | 2.17 | 7.2 | ❌ 远远不够 |
+
+#### 安装方案对比
+
+| 方案 | 难度 | 可靠性 | 说明 |
+|------|------|--------|------|
+| Docker 部署（推荐） | 低 | 高 | 最简单，Dockerfile 自带 curl-impersonate |
+| 预编译包 + LD_PRELOAD | 中 | 中 | 仅 glibc 2.31+ 系统 |
+| 从源码编译 curl-impersonate | 高 | 中 | 需要 Go、Rust、CMake 等编译工具链 |
+| 静态编译版本 | 高 | 低 | 可能与 PHP 的动态链接 libcurl 冲突 |
+| 降级到 Firefox 102 指纹（无 impersonate） | 无 | 中 | 不需要安装，但反爬能力弱 |
+
+#### PHP 7.x 的额外问题
+
+1. **`curl_version()` 返回值差异**：PHP 7.x 的 cURL 扩展可能不支持 `ssl_version` 字段的 BoringSSL 值，导致 `lib/http.php:93` 的检测分支失效
+2. **`CURLOPT_ENCODING` 空字符串行为**：PHP 7.x 搭配旧版 cURL 可能不支持自动 brotli 解码
+3. **`CURLOPT_PROGRESSFUNCTION` 签名**：PHP 7.x 的回调参数签名可能不同
+
+> **建议**：PHP 7.x 环境下如果无法安装 curl-impersonate，代码会自动降级到 Firefox 102 手动指纹（`lib/http.php:95-101` 的 else 分支），虽然没有 TLS 指纹模拟，但至少能保持基本功能。
+
+---
+
+### 14.5 forceHeaders 同名大小写归一化
+
+#### Header 名称大小写处理的三层不一致
+
+HTTP/1.1 规范规定 Header 名称不区分大小写（RFC 7230 §3.2），但 RSS-Bridge 在不同层级对大小写的处理不一致，可能导致同名 Header 重复。
+
+**第 1 层：Bridge 传入的 Headers（`getContents()` 的 `$httpHeaders`）**
+
+`lib/contents.php:59-65` 解析时不做大小写归一化：
+
+```php
+$httpHeadersNormalized = [];
+foreach ($httpHeaders as $httpHeader) {
+    $parts = explode(':', $httpHeader);
+    $headerName = trim($parts[0]);              // ← 保留原始大小写！
+    $headerValue = trim(implode(':', array_slice($parts, 1)));
+    $httpHeadersNormalized[$headerName] = $headerValue;
+}
+```
+
+**第 2 层：`CurlHttpClient` 的默认 Headers（`$defaultHeaders`）**
+
+`lib/http.php:82-91` 使用首字母大写格式（PascalCase）：
+
+```php
+$defaultHeaders = [
+    'Accept' => '...',
+    'Accept-Language' => '...',
+    'Upgrade-Insecure-Requests' => '1',
+    'Sec-Fetch-Dest' => 'document',
+    // ...
+];
+```
+
+**第 3 层：Bridge 自定义 Headers 的大小写混用**
+
+从代码中搜索到的实际案例：
+
+| Bridge | Header 写法 | 大小写风格 |
+|--------|-----------|-----------|
+| InstagramBridge | `User-Agent:` | PascalCase |
+| SlusheBridge | `user-agent:` | 全小写 |
+| EconomistBridge | `User-agent:` | 混合 |
+| AppleAppStoreBridge | `user-agent:` | 全小写 |
+| RobinhoodSnacksBridge | `User-Agent:` | PascalCase |
+
+#### 合并时的问题
+
+`lib/http.php:98` 使用 `array_merge` 合并 Headers：
+
+```php
+$headers = array_merge($defaultHeaders, $config['headers']);
+```
+
+由于 `$defaultHeaders` 使用关联数组（`'Accept' => '...'`），而 `$config['headers']` 也使用关联数组，PHP 的 `array_merge` 对字符串键的行为是**后覆盖前**。
+
+但问题在于**大小写不归一化时，同名键不被认为是同一个键**：
+
+```php
+$defaultHeaders['User-Agent'] = 'Firefox/102';     // 键: "User-Agent"
+$config['headers']['user-agent'] = 'Chrome/112';    // 键: "user-agent"
+
+// array_merge 后两者都存在！
+// 最终发送给 cURL 时会有两个 UA 头
+```
+
+#### 最终发送到 cURL 时的行为
+
+`lib/http.php:104-108` 将关联数组转为字符串数组：
+
+```php
+$httpHeaders = [];
+foreach ($config['headers'] as $name => $value) {
+    $httpHeaders[] = sprintf('%s: %s', $name, $value);
+}
+curl_setopt($ch, CURLOPT_HTTPHEADER, $httpHeaders);
+```
+
+如果存在 `User-Agent` 和 `user-agent` 两个键，cURL 会发送两个 Header。服务端通常只取最后一个，但行为取决于具体实现。
+
+#### 响应 Header 的归一化
+
+与请求 Header 不同，**响应 Header 在解析时做了小写归一化**（`lib/http.php:161`）：
+
+```php
+$name = mb_strtolower(trim($header[0]));
+```
+
+`Response` 构造函数也做了同样处理（`lib/http.php:312`）：
+
+```php
+$name = mb_strtolower($name);
+```
+
+`getHeader()` 方法也做了小写归一化（`lib/http.php:354`）：
+
+```php
+$name = mb_strtolower($name);
+```
+
+**总结**：响应侧完全归一化，请求侧不归一化——这是一个潜在的一致性问题。
+
+---
+
+### 14.6 Xvfb Docker 化资源对比
+
+#### 三种浏览器渲染方案的资源对比
+
+| 维度 | curl-impersonate | WebDriver + headless Chrome | WebDriver + Xvfb + Chrome |
+|------|-----------------|---------------------------|--------------------------|
+| 内存占用 | ~10 MB | ~200-500 MB | ~300-700 MB |
+| CPU 占用 | 极低（无渲染） | 中（渲染但无显示） | 高（渲染+虚拟显示） |
+| 启动时间 | 0 ms（库级注入） | 2-5 秒 | 3-8 秒 |
+| 镜像体积 | ~50 MB（库文件） | ~800 MB（Chrome+依赖） | ~1.2 GB（Chrome+Xvfb+依赖） |
+| 磁盘 I/O | 无 | 低 | 中（帧缓冲写入） |
+| 并发能力 | 受 PHP-FPM 限制 | 受 Selenium 并发限制 | 受 Xvfb 显示号限制 |
+| JS 执行 | ❌ 不支持 | ✅ 完整支持 | ✅ 完整支持 |
+| Canvas/WebGL | ❌ 不支持 | ⚠️ headless 可能不支持 | ✅ 完整支持 |
+| 反检测能力 | TLS 指纹模拟 | headless 可能被识别 | 接近真实浏览器 |
+
+#### Xvfb 的使用场景
+
+RSS-Bridge 的 `WebDriverAbstract` 支持 headless 模式（`lib/WebDriverAbstract.php:74`），**不需要 Xvfb**。Xvfb 只在以下场景需要：
+
+1. **Chrome 不支持 headless 模式的旧版本**：Chrome 59 之前没有 headless 模式
+2. **需要 Canvas/WebGL 渲染**：某些反爬系统会检测 Canvas 指纹
+3. **需要真实窗口大小**：headless Chrome 的 `window.innerWidth`/`innerHeight` 可能有差异
+4. **网站检测 headless 标志**：`navigator.webdriver` 属性在 headless 模式下为 `true`
+
+#### Docker 化 Xvfb 方案
+
+```dockerfile
+# 在 RSS-Bridge 基础镜像上叠加 Xvfb
+FROM rss-bridge:latest
+
+RUN apt-get update && apt-get install -y \
+    xvfb \
+    chromium \
+    && rm -rf /var/lib/apt/lists/*
+
+# 启动虚拟显示器
+ENV DISPLAY=:99
+CMD Xvfb :99 -screen 0 1920x1080x24 & \
+    php-fpm
+```
+
+#### 资源优化建议
+
+| 优化项 | 效果 | 方式 |
+|--------|------|------|
+| 使用 `--headless=new` | 减少 30% 内存 | Chrome 112+ 的新 headless 模式，指纹更接近真实浏览器 |
+| 限制 Chrome 启动参数 | 减少 20% 内存 | `--disable-gpu --disable-software-rasterizer --no-sandbox` |
+| 复用 Selenium 容器 | 减少镜像体积 | 独立 Selenium 容器，多实例共享 |
+| 使用 Chromium 替代 Chrome | 减少 100 MB 镜像体积 | `chromium` 包比 `google-chrome` 小 |
+| 连接池化 WebDriver | 减少启动开销 | 保持浏览器实例常驻，不要每次请求都启停 |
+
+---
+
+### 14.7 ALPN 协商失败下的降级差异
+
+#### ALPN 的作用
+
+ALPN（Application-Layer Protocol Negotiation）是 TLS 扩展，客户端在 ClientHello 中声明支持的应用层协议（如 `h2` 和 `http/1.1`），服务端从中选择一个。
+
+```
+ClientHello:
+  ALPN extension: ["h2", "http/1.1"]
+
+ServerHello:
+  ALPN extension: "h2"    ← 服务端选择 HTTP/2
+  或
+  ALPN extension: "http/1.1"  ← 服务端选择 HTTP/1.1
+  或
+  无 ALPN extension          ← 服务端不支持 ALPN，回退到默认
+```
+
+#### curl-impersonate 环境下的 ALPN
+
+curl-impersonate 模拟 Chrome 142 时，会自动设置与 Chrome 一致的 ALPN 扩展：
+
+```
+Chrome 142 的 ALPN 顺序: ["h2", "http/1.1"]
+```
+
+这个顺序本身就是指纹特征——Chrome 总是先声明 `h2`，某些爬虫库可能顺序相反。
+
+#### ALPN 协商失败的场景
+
+| 场景 | 服务端行为 | cURL 行为 | RSS-Bridge 影响 |
+|------|-----------|----------|----------------|
+| 服务端支持 ALPN，选择 h2 | 返回 `ALPN: h2` | 使用 HTTP/2 | 正常 |
+| 服务端支持 ALPN，选择 http/1.1 | 返回 `ALPN: http/1.1` | 使用 HTTP/1.1 | 正常 |
+| 服务端不支持 ALPN | 不返回 ALPN 扩展 | cURL 默认回退到 HTTP/1.1 | 正常但可能被检测 |
+| ALPN 协商失败（服务端返回不支持的协议） | TLS 握手失败 | 连接失败 | 触发重试 |
+| TLS 握手成功但 HTTP/2 帧解析失败 | 连接已建立 | `CURLOPT_HTTP_VERSION` 未显式设置时自动降级 | 正常 |
+
+#### 非 impersonate 环境的差异
+
+在原生 OpenSSL 环境下（非 BoringSSL），ALPN 的设置取决于 cURL 版本和编译选项：
+
+| cURL 版本 | 默认 ALPN | 说明 |
+|-----------|----------|------|
+| 7.36+ | `h2` 和 `http/1.1` | 自动启用 ALPN |
+| 7.47+ | `h2` 和 `http/1.1` | 默认尝试 HTTP/2（`CURL_HTTP_VERSION_2TLS`） |
+| 7.88+ | `h2` 和 `http/1.1` | 同上，支持更完善的 HTTP/2 |
+
+**关键差异**：非 impersonate 环境下，ALPN 扩展中协议的声明顺序取决于 OpenSSL 的实现，可能与 Chrome 不一致。反爬系统可以据此区分真实浏览器和爬虫。
+
+#### ALPN 与 JA3 指纹的关系
+
+JA3 指纹包含了 ALPN 扩展的存在与否及内容。如果：
+- 客户端声明了 `h2` 但 ALPN 顺序与 Chrome 不同 → 可能被识别
+- 客户端未声明 ALPN（某些旧版 cURL）→ 一定会被识别为非浏览器
+- 客户端声明了 `h2` 但使用 HTTP/1.1 通信 → 行为与声明不一致
+
+curl-impersonate 确保了 ALPN 声明与实际协议使用的完全一致性，这是其核心价值之一。
+
+#### 降级检测代码
+
+RSS-Bridge **没有 ALPN 降级检测代码**。`lib/http.php:194` 只获取了 HTTP 状态码：
+
+```php
+$statusCode = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+```
+
+如果需要检测实际使用的协议版本，可以添加：
+
+```php
+// 可用但未使用的检测方式
+$httpVersion = curl_getinfo($ch, CURLINFO_HTTP_VERSION);
+// CURL_HTTP_VERSION_2_0 = 3
+// CURL_HTTP_VERSION_1_1 = 2
+// CURL_HTTP_VERSION_1_0 = 1
+```
+
+> **提示**：如果目标站点的反爬系统同时检测 TLS 指纹和 ALPN 行为，确保 curl-impersonate 版本与目标浏览器匹配至关重要。过时的 impersonate 版本（如 chrome110）在新版 CloudFlare 下可能已被识别。
