@@ -408,3 +408,303 @@ $cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
 4. **缓存键包含全部 GET 参数**：参数值的任何差异（包括 format、token）都产生不同缓存
 5. **校验与清洗一体**：`ParameterValidator::validateInput()` 同时完成类型校验和值清洗，原地修改 `$input`
 6. **默认值回填在 setInputWithContext 中完成**：校验只处理用户提交的值，未提交的参数由回填逻辑根据类型补全
+
+---
+
+## 七、深度细节：边界场景与扩展机制
+
+### 7.1 PARAMETERS 热更新场景
+
+**PHP 常量的不可变性**：`PARAMETERS` 是类级 `const` 常量，在 PHP 编译阶段绑定到类，一旦定义就**无法在运行时修改**。尝试 `$bridge::PARAMETERS = [...]` 会直接报错。
+
+**热更新路径**：只有修改 `.php` 源码文件，让 PHP 重新解析才能更新 PARAMETERS。但这里有两层缓存需要注意：
+
+1. **OPcache 字节码缓存**：生产环境通常启用 `opcache.enable=1`，修改源码后 PHP 不会立即重新解析。需调用 `opcache_reset()` 或等待 `opcache.revalidate_freq`（默认 2 秒）过期。
+
+2. **BridgeFactory 类名缓存**：`BridgeFactory::__construct()` (`lib/BridgeFactory.php:18-23`) 在实例化时扫描 `bridges/` 目录生成可用类名列表。如果新增 Bridge 文件，需要重新实例化 `BridgeFactory`（通常每次请求都会重新创建，所以无影响）。
+
+**热更新的风险**：
+- PARAMETERS 变更不会自动作废已有缓存，旧参数生成的缓存键可能与新参数不兼容
+- 前端用户可能看到旧表单（浏览器缓存），提交后与新参数结构不匹配
+- 建议：修改 PARAMETERS 后手动清空缓存目录
+
+### 7.2 Context 命名冲突解决
+
+PHP 数组的键名具有**唯一性**，后声明的键会**静默覆盖**先声明的同名键。
+
+**PARAMETERS 内部冲突**：
+```php
+const PARAMETERS = [
+    'Context A' => [ 'q' => ... ],
+    'Context A' => [ 'u' => ... ],  // 覆盖前者！
+];
+```
+第二个 `'Context A'` 会完全覆盖第一个，前者的参数定义永久丢失，无任何警告。
+
+**渲染侧冲突（global 合并）**：
+```php
+// FrontpageAction.php:117-119
+$contextParameters = array_merge($contextParameters, $parameters['global']);
+```
+`array_merge()` 的行为是：**后面的数组覆盖前面的数组中相同字符串键**。如果某个 context 中的参数名与 global 中的参数名相同，**global 的定义会覆盖 context 的定义**。
+
+**防范措施**：
+- Bridge 开发者需自行确保 context 名称和参数名的唯一性
+- global 参数命名应使用不易冲突的前缀（如 `global_` 或 `sys_`）
+- 代码审查时重点检查 PARAMETERS 中的键名重复
+
+### 7.3 LIMIT 边界值兜底
+
+**内置 LIMIT 常量** (`lib/BridgeAbstract.php:25-31`) 只定义了参数元数据，**不包含任何边界校验逻辑**：
+```php
+protected const LIMIT = [
+    'name' => 'Limit',
+    'type' => 'number',
+    'title' => 'Maximum number of items to return',
+];
+```
+
+**校验层**：`ParameterValidator::validateNumberValue()` (`lib/ParameterValidator.php:137-144`) 仅用 `FILTER_VALIDATE_INT` 检查是否为合法整数，**不做 min/max 范围校验**。负值、零、极大值都能通过校验。
+
+**业务层兜底**：边界值完全由 Bridge 业务代码自行处理，常见模式：
+
+| 兜底模式 | 示例代码 | 说明 |
+|---------|----------|------|
+| `?:` 短路默认值 | `$limit = $this->getInput('limit') ?: 5;` | 0、null、false 都会触发兜底 |
+| `??` 空合并 | `$limit = $this->getInput('limit') ?? 10;` | 仅 null 触发兜底，0 是有效值 |
+| `max()` 保护下界 | `$limit = max(1, $this->getInput('limit'));` | 确保至少为 1 |
+| `min()` 保护上界 | `$limit = min(50, $this->getInput('limit'));` | 限制最大返回数量 |
+| `array_slice` 容错 | `array_slice($items, 0, $limit)` | `$limit` 为 null 时取全部，为负时从末尾截取 |
+
+**风险**：如果业务代码未做边界兜底，用户传入 `-1` 或 `999999` 可能导致：
+- 上游 API 被请求大量数据，触发限流
+- `array_slice($items, 0, -1)` 意外截断最后一项
+- 数据库查询无 `LIMIT` 导致全表扫描
+
+### 7.4 getQueriedContext 歧义解析
+
+当用户输入参数集合可能匹配多个上下文时，`getQueriedContext()` 有明确的歧义处理策略。
+
+**歧义产生场景**：
+```php
+const PARAMETERS = [
+    'By keyword'  => ['q' => ['name' => 'Query', 'required' => true]],
+    'By username' => ['u' => ['name' => 'User', 'required' => true]],
+];
+```
+如果用户同时提交 `q=bird&u=alice`，两个上下文的必填参数都有值，`array_sum($queriedContexts) = 2`。
+
+**歧义处理流程** (`lib/ParameterValidator.php:103-120`)：
+```php
+switch (array_sum($queriedContexts)) {
+    case 0:      // 无匹配 → 尝试找空参数 context
+    case 1:      // 唯一匹配 → 返回 context 名
+    default:     // 歧义匹配 → return false
+}
+```
+
+**歧义产生后果**：`BridgeAbstract::setInput()` 检测到返回 `false` 后，会在 `lib/BridgeAbstract.php:170-176` 抛出：
+```php
+if ($this->queriedContext === false) {
+    throwClientException('Mixed context parameters');
+}
+```
+
+**消歧手段**：表单中可通过隐藏字段 `context` 显式指定目标上下文：
+```html
+<input type="hidden" name="context" value="By keyword">
+```
+当 `input['context']` 存在时，`getQueriedContext()` (`lib/ParameterValidator.php:106-108`) 会直接返回该值，**跳过自动推断**，从根源避免歧义。
+
+### 7.5 global 合并覆盖语义
+
+`global` 上下文与普通 context 的合并在**渲染侧**和**运行侧**都使用了「后发覆盖」语义。
+
+**渲染侧合并** (`FrontpageAction.php:117-119`)：
+```php
+$contextParameters = array_merge($contextParameters, $parameters['global']);
+```
+`array_merge()` 中 `$parameters['global']` 作为第二个参数，其同名参数会**覆盖** `$contextParameters` 中的定义。
+
+**运行侧合并** (`BridgeAbstract.php:235-253`)：
+```php
+foreach ($contextNames as $contextName) {
+    foreach ($parameters[$contextName] as $name => $parameter) {
+        // 回填默认值...
+        if (isset($this->inputs[$queriedContext][$name])) {
+            // 已存在，跳过（保留用户提交值）
+        } else {
+            $this->inputs[$queriedContext][$name]['value'] = $defaultValue;
+        }
+    }
+}
+```
+`$contextNames` 的遍历顺序是 `[$queriedContext, 'global']`，所以 global 的默认值**不会覆盖**用户已提交的值，但会**覆盖** context 中已存在的同名参数的默认值。
+
+**覆盖顺序优先级**（从高到低）：
+1. 用户通过 GET/POST 提交的值
+2. global 上下文中的 `defaultValue`
+3. 普通 context 中的 `defaultValue`
+4. 系统兜底（`false` / `values[0]` / `null`）
+
+**潜在陷阱**：如果 global 和 context 定义了同名参数但类型不同，渲染侧使用 global 的类型定义，运行侧校验时也按 global 的类型校验，context 中的类型定义被完全忽略。
+
+### 7.6 ParameterValidator 自定义类型扩展
+
+`ParameterValidator` 目前支持 `text`、`number`、`checkbox`、`list` 四种类型。扩展新类型需要修改源码，**无插件化扩展机制**。
+
+**当前类型分发逻辑** (`lib/ParameterValidator.php:24-42`)：
+```php
+switch ($contextParameters[$name]['type']) {
+    case 'number':
+        $input[$name] = $this->validateNumberValue($value);
+        break;
+    case 'checkbox':
+        $input[$name] = $this->validateCheckboxValue($value);
+        break;
+    case 'list':
+        $input[$name] = $this->validateListValue($value, $contextParameters[$name]['values']);
+        break;
+    default:
+    case 'text':
+        $input[$name] = $this->validateTextValue($value, $pattern ?? null);
+        break;
+}
+```
+
+**扩展新类型的三步法**：
+
+1. **新增 case 分支**：在 switch 中添加新类型，例如 `case 'email':`
+
+2. **新增校验方法**：添加 `private function validateEmailValue($value)`，返回 `null` 表示校验失败
+
+3. **补充默认值回填逻辑**：在 `BridgeAbstract::setInputWithContext()` 中添加新类型的默认值处理
+
+**扩展示例（email 类型）**：
+```php
+// ParameterValidator.php switch 中新增
+case 'email':
+    $input[$name] = $this->validateEmailValue($value);
+    break;
+
+// 新增方法
+private function validateEmailValue($value)
+{
+    $filtered = filter_var($value, FILTER_VALIDATE_EMAIL);
+    return $filtered === false ? null : $filtered;
+}
+
+// BridgeAbstract.php setInputWithContext() 中补充
+case 'email':
+    if (isset($parameter['defaultValue'])) {
+        $value = $parameter['defaultValue'];
+    }
+    break;
+```
+
+**扩展限制**：
+- `default: case 'text':` 是双重入口，未知类型会被当作 text 处理
+- 新类型的参数元数据（如 `values` 用于 list）需自行在 PARAMETERS 中定义并在校验方法中读取
+- 前端 HTML 渲染（`lib/html.php`）也需同步扩展，否则新类型会被渲染为普通 text input
+
+### 7.7 缓存键碰撞防护
+
+rss-bridge 通过**两级哈希**防止缓存键碰撞：
+
+**第一级：应用层键构造**
+```php
+// HTTP 响应缓存
+$cacheKey = 'http_' . json_encode($request->toArray());
+
+// Bridge 内部缓存
+$cacheKey = $this->getShortName() . '_' . $key;
+```
+应用层键是人类可读的，但可能很长（包含完整的 JSON 序列化）。
+
+**第二级：存储层键哈希**
+所有缓存实现（`SQLiteCache`、`MemcachedCache`、`FileCache`）都包含 `createCacheKey()` 方法：
+```php
+// SQLiteCache.php:131-134
+private function createCacheKey($key)
+{
+    return hash('sha1', $key, true);  // 返回 20 字节二进制哈希
+}
+```
+
+**SHA-1 哈希的碰撞防护能力**：
+- 输出空间：160 位 → 约 1.46×10⁴⁸ 种可能
+- 生日悖论下，产生碰撞需要约 10²⁴ 个缓存条目，实际系统中不可能发生
+- 注意：SHA-1 已被密码学攻破，但此处用于缓存键去重而非安全签名，仍是足够的
+
+**额外的唯一性约束**：
+- `SQLiteCache.php:39`: `'key' BLOB PRIMARY KEY` — 数据库层强制执行唯一性
+- `Memcached` / `Redis` 等 KV 存储天然按键名覆盖，不保证多客户端写入时的一致性
+
+**碰撞场景**：理论上，如果两个不同的 `$_GET` 数组序列化后产生相同的 SHA-1 哈希，会导致「错误的缓存命中」。但这种概率可以忽略不计。
+
+### 7.8 ShortName_key 的 TTL 串扰
+
+**缓存键格式** (`lib/BridgeAbstract.php:320-332`)：
+```php
+protected function loadCacheValue(string $key, $default = null)
+{
+    return $this->cache->get($this->getShortName() . '_' . $key, $default);
+}
+
+protected function saveCacheValue(string $key, $value, int $ttl = 86400)
+{
+    $this->cache->set($this->getShortName() . '_' . $key, $value, $ttl);
+}
+```
+
+**getShortName() 的行为** (`lib/BridgeAbstract.php:335-338`)：
+```php
+public function getShortName(): string
+{
+    return (new \ReflectionClass($this))->getShortName();
+}
+```
+返回的是**实际实例化类**的短名，而非定义该方法的类名。这意味着子类不会与父类共享缓存键。
+
+**TTL 串扰的产生场景**：
+
+1. **同一 Bridge 内的覆盖**：`SQLiteCache::set()` 使用 `INSERT OR REPLACE` (`SQLiteCache.php:88`)，如果同一 Bridge 对相同 `$key` 多次调用 `saveCacheValue()` 但传入不同 `$ttl`，**后一次的 TTL 会覆盖前一次**。
+
+   ```php
+   // 请求 A：缓存 1 小时
+   $this->saveCacheValue('api_token', $token, 3600);
+
+   // 请求 B（1 分钟后）：缓存 24 小时（覆盖！）
+   $this->saveCacheValue('api_token', $token, 86400);
+   ```
+   结果：缓存实际存活 24 小时，而非预期的 1 小时。
+
+2. **继承体系中的隔离**：假设有继承链 `BaseBridge → ChildBridge`：
+   ```php
+   class BaseBridge extends BridgeAbstract {
+       protected function cacheSomething() {
+           $this->saveCacheValue('shared_data', $data, 3600);
+       }
+   }
+   class ChildBridge extends BaseBridge {}
+   ```
+   - `BaseBridge` 产生键：`BaseBridge_shared_data`
+   - `ChildBridge` 产生键：`ChildBridge_shared_data`
+   - **两者完全隔离**，不会串扰。`getShortName()` 返回实际类名，这是关键的隔离机制。
+
+3. **HTTP 缓存的 TTL 优先级**：
+   ```php
+   // DisplayAction.php:57-63
+   $ttl = $request->get('_cache_timeout');
+   if (Configuration::getConfig('cache', 'custom_timeout') && isset($ttl)) {
+       $ttl = (int) $ttl;
+   } else {
+       $ttl = $bridge->getCacheTimeout();  // 来自 CACHE_TIMEOUT 常量
+   }
+   ```
+   用户可通过 `_cache_timeout` 参数自定义 TTL，这会覆盖 Bridge 定义的 `CACHE_TIMEOUT`。如果同一请求被不同用户用不同 `_cache_timeout` 访问，**后写入的 TTL 会覆盖先写入的**。
+
+**防范措施**：
+- Bridge 内部对同一 key 的 `saveCacheValue()` 调用应使用一致的 TTL
+- 如需不同 TTL，使用不同的 key 后缀（如 `api_token_short`、`api_token_long`）
+- 生产环境可关闭 `custom_timeout` 配置，避免用户随意设置 TTL
