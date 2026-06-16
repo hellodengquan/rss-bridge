@@ -1091,3 +1091,490 @@ public function getShortName(): string
    但当前代码未做此优化，因为性能差距在纳秒级别，对整体无感知影响。只有在极端场景（单个请求调用数千次 loadCacheValue）时才值得引入。
 
 5. **OPcache 的优化**：开启 OPcache 时 Reflection 操作有额外的内部缓存优化，实际开销比裸 benchmark 更低。
+
+---
+
+## 九、深度细节（再续）：运维与安全场景
+
+### 9.1 OPcache 热更新的运维信号
+
+修改 PARAMETERS 或 ParameterValidator 后，PHP OPcache 的状态对运维排障至关重要。以下是可观测的运维信号：
+
+**OPcache 配置检查清单**：
+
+| ini 参数 | 默认值 | 对热更新的影响 | 排障信号 |
+|---------|--------|---------------|---------|
+| `opcache.enable` | `1` | 关闭时每次请求重新解析 PHP，热更新即时生效 | `php -i \| grep "opcache.enable"` |
+| `opcache.validate_timestamps` | `1` | 关闭时完全不检查文件变更，必须手动 `opcache_reset()` | 生产环境常关闭以提升性能 |
+| `opcache.revalidate_freq` | `2` | 单位秒；每隔 N 秒重新校验 mtime | 修改源码后等 2 秒就能看到变更生效 |
+| `opcache.revalidate_path` | `0` | 同文件在不同 include_path 会缓存多个副本 | 软链接部署场景设为 1 |
+| `opcache.max_accelerated_files` | `10000` | 缓存满时随机驱逐旧条目，导致偶发热更新不生效 | `opcache_get_status()['num_cached_scripts']` 接近上限时警惕 |
+
+**运维可观测信号**：
+
+```php
+// 热更新后可执行此脚本确认 OPcache 状态
+$status = opcache_get_status(true);
+if ($status) {
+    echo "已缓存脚本数: " . $status['opcache_statistics']['num_cached_scripts'] . "\n";
+    echo "命中率: " . round($status['opcache_statistics']['opcache_hit_rate'], 2) . "%\n";
+    echo "最后重启时间: " . date('Y-m-d H:i:s', $status['opcache_statistics']['last_restart_time']) . "\n";
+    
+    // 检查特定 Bridge 是否已使用新版
+    foreach ($status['scripts'] as $file => $info) {
+        if (str_contains($file, 'FlickrBridge.php')) {
+            echo "FlickrBridge 最后修改: " . date('H:i:s', $info['timestamp']) . "\n";
+            echo "文件系统 mtime: " . date('H:i:s', filemtime($file)) . "\n";
+            // 如果 timestamp < filemtime，说明 OPcache 还未刷新
+        }
+    }
+}
+```
+
+**热更新失效的典型表现**：
+1. 前端页面显示旧的 PARAMETERS 参数表单（如新增的字段没出现）
+2. 提交后校验逻辑与代码不一致（如加了 required 仍能通过）
+3. `error_log` 中出现与代码逻辑矛盾的 Notice/Warning
+
+**一键安全热更新操作**：
+```bash
+# 方案 A：温和方案（推荐），等 revalidate_freq 自然过期
+sleep 3 && curl -s http://localhost/ > /dev/null
+
+# 方案 B：强制重置（需 PHP-FPM 进程内执行）
+php -r 'opcache_reset();'
+
+# 方案 C：重启 PHP-FPM（最粗暴但最可靠）
+systemctl reload php-fpm
+```
+
+### 9.2 三种缓存算法间的迁移兼容
+
+rss-bridge 支持 SQLiteCache / FileCache / MemcachedCache 三种后端，配置方式：
+```ini
+; config.ini.php
+[cache]
+type = "sqlite"   ; 或 "file" / "memcached"
+```
+不同缓存后端之间切换时，**完全不兼容**。
+
+**三种后端的不可互操作点**：
+
+| 维度 | SQLiteCache | FileCache | MemcachedCache |
+|------|-------------|-----------|----------------|
+| 哈希算法 | sha1 二进制 | md5 十六进制 | sha1 十六进制 |
+| 存储介质 | SQLite BLOB 列 | 本地文件 | 内存 KV |
+| 键空间 | `PRIMARY KEY` 全局 | 文件名（目录隔离） | Memcached 全局 |
+| 值格式 | `serialize()` 二进制 | `serialize()` 含 key/expiration 包装 | 原始 `serialize()` |
+| TTL 模型 | `updated` 列存绝对时间戳 | 文件内 `expiration` 字段存绝对时间戳 | Memcached 原生 TTL（相对秒或绝对 Unix 时间戳 <2592000） |
+| 过期清理 | `prune()` 定时 SQL DELETE | `prune()` 遍历 unlink | Memcached 原生 LRU |
+
+**迁移场景的影响**：
+
+1. **冷启动缓存全部失效**：切换后端后，原有缓存数据完全无法读取，所有请求都会穿透到上游 API。
+   - 风险：短时间内上游 API 请求量激增，可能触发限流
+   - 建议：切换前提前用爬虫预热热点 URL，或在低流量时段切换
+
+2. **Bridge 内部缓存也不互通**：
+   - 同一个 key（如 `YoutubeBridge_api_token`）在不同后端下实际存储键完全不同
+   - 切换后会重新生成 API token / 速率限制计数器
+   - 注意：`saveCacheValue()` 的硬编码 TTL（默认 86400s）在 Memcached 侧超过 2592000（30天）会被 Memcached 当作绝对 Unix 时间戳处理
+
+3. **FileCache → SQLiteCache 迁移工具（缺失）**：
+   当前代码无迁移工具。如需迁移，需自行编写脚本：
+   ```php
+   // 伪代码示例：FileCache -> SQLiteCache
+   foreach (glob(PATH_CACHE . '*.cache') as $f) {
+       $data = unserialize(file_get_contents($f));
+       $originalKey = $data['key'];  // FileCache 保存了原始 key
+       $sqlite->set($originalKey, $data['value'], $data['expiration'] - time());
+   }
+   ```
+   FileCache 恰好把原始 key 存在序列化数组里（`FileCache.php:54-58`），可以逆向还原；SQLiteCache 和 MemcachedCache 则丢弃了原始 key，只存哈希值。
+
+**Memcached 的 30 天 TTL 陷阱**：
+```
+Memcached TTL 规则：
+  ttl < 2592000 (30天) → 相对秒数
+  ttl >= 2592000       → 绝对 Unix 时间戳
+
+saveCacheValue() 默认 TTL = 86400（1 天）→ 没问题
+saveCacheValue('key', $v, 2592001)        → 被 Memcached 当作 1970-01-31，立即过期！
+```
+注意：`CACHE_TIMEOUT` 常量最大的值在现有 Bridge 中是 86400（WarhammerComBridge、StripeAPIChangeLogBridge 等），未触达 30 天阈值，暂无风险。但自定义 Bridge 如果设置更大的 TTL 会踩坑。
+
+### 9.3 SQLite 锁等待超时熔断
+
+SQLiteCache 的锁等待与熔断机制：
+
+**锁升级与等待链** (`SQLiteCache.php:42` + SQLite 内核)：
+
+```
+写入请求
+   │
+   ├─ 1. 获取 SHARED 锁（读，所有连接共享）
+   │
+   ├─ 2. prepare(INSERT OR REPLACE)
+   │       → 尝试升级到 RESERVED 锁
+   │       → 如果已有写者持有 RESERVED，阻塞等待
+   │       → busy_timeout 计时开始（默认 5000ms）
+   │
+   ├─ 3. execute() 前升级到 PENDING 锁
+   │       → 阻止新读者获取 SHARED
+   │       → 等待现有读者释放 SHARED
+   │       → 如果超时 → SQLITE_BUSY
+   │
+   ├─ 4. 写入 WAL 页时升级到 EXCLUSIVE 锁
+   │       → 独占写
+   │       → 完成后立即释放
+   │
+   └─ 5. 提交事务（自动），释放所有锁
+```
+
+**超时熔断行为** (`SQLiteCache.php:92-97`)：
+```php
+try {
+    $stmt->execute();
+} catch (\Exception $e) {
+    $this->logger->warning(create_sane_exception_message($e));
+    // Intentionally not rethrowing exception
+}
+```
+**熔断策略**：写入失败时记录 warning 日志，**静默吞掉异常**，继续业务流程。相当于「降级为不缓存」模式，不影响用户拿到数据（虽然会慢一点，因为下次还得重新抓）。
+
+**5 秒超时的合理性分析**：
+- SQLite 单条 INSERT OR REPLACE + BLOB 写入通常 <1ms
+- 5000ms 超时意味着大约可以容忍 ~5000 个排队写入操作
+- 对于 rss-bridge 这种写入量不高的场景（每次 feed 请求最多 2-3 次缓存写入），5 秒绰绰有余
+- 如果 5 秒超时频繁触发，说明：
+  1. 某条缓存值特别大（如 BLOB > 10MB）导致 WAL 写入慢
+  2. 并发量过高，SQLite 已到达性能瓶颈 → 建议切换到 Memcached
+
+**观测超时的日志特征**：
+```
+[YYYY-MM-DD HH:MM:SS] rss-bridge.WARNING: The database is locked
+SQLite3Stmt::execute(): Unable to execute statement: database is locked
+```
+出现此警告意味着 **该次缓存写入被丢弃**，下次请求会重新走上游。单条偶发可忽略，连续出现需要运维介入。
+
+### 9.4 INSERT OR REPLACE 回滚链
+
+SQLiteCache 使用 `INSERT OR REPLACE` 而非显式事务，但 SQLite 的每一条语句都隐式在一个事务中执行。
+
+**隐式事务的回滚链**：
+
+```
+INSERT OR REPLACE INTO storage (key, value, updated) VALUES (...)
+   │
+   ├─ 自动开启隐式事务（AUTOCOMMIT）
+   │
+   ├─ 步骤 1：检查 PRIMARY KEY 冲突
+   │   ├─ 存在相同 key → DELETE 旧行
+   │   │   │
+   │   │   ├─ 如果 DELETE 时磁盘满 / I/O 错误
+   │   │   │   → 语句失败
+   │   │   │   → 事务回滚（旧行保留）
+   │   │   │   → 抛出异常，被 catch 记 warning
+   │   │   └─ DELETE 成功
+   │   └─ 不存在相同 key → 跳过 DELETE
+   │
+   ├─ 步骤 2：INSERT 新行
+   │   ├─ PRIMARY KEY 冲突（极端竞态）→ 理论上不会发生
+   │   ├─ BLOB 绑定失败（内存不足）→ 失败
+   │   ├─ updated 列写入失败 → 失败
+   │   └─ 存储页分配失败（磁盘满）→ 失败
+   │   → 任一失败：事务回滚，DELETE 操作一并撤销
+   │
+   └─ 两步均成功 → 自动 COMMIT
+       → WAL 追加一条记录
+       → 下次 checkpoint 时合并到主 DB
+```
+
+**关键保障：原子性**：
+即使 `DELETE` 成功但 `INSERT` 失败（极端 I/O 故障），SQLite 的隐式事务会把 `DELETE` 也回滚，**不会出现「旧值已删、新值未写」的空档**。这是 ACID 中 Atomicity 的直接体现。
+
+**并发竞态下的保障**：
+```
+时间线：
+  T0: 进程 A 开始 INSERT OR REPLACE (key=X, val=V1) → 获取 RESERVED 锁
+  T1: 进程 B 开始 INSERT OR REPLACE (key=X, val=V2) → 阻塞等锁
+  T2: 进程 A 完成 DELETE+INSERT，释放锁
+  T3: 进程 B 获取锁
+  T4: 进程 B DELETE 进程 A 写入的行，INSERT V2
+  T5: 进程 B 完成，最终 DB 中是 V2
+```
+不会出现两条相同 key 的行（PRIMARY KEY 约束保障），也不会出现旧行删了新行没写（事务保障）。最坏情况就是最后写入者获胜，和缓存语义一致。
+
+**失败回滚的可观测性**：
+`SQLiteCache.php:92-97` 的 catch 块会把所有异常（含 I/O 错误、约束冲突、磁盘满）都转为 warning 日志，不会中断业务。但此时**缓存处于不一致状态**（旧值可能还在、也可能被回滚恢复），下一次读请求要么拿到旧值，要么 miss。
+
+### 9.5 _cache_timeout 边界的覆盖测试
+
+现有测试套件（`tests/`）中关于 `_cache_timeout` 和 `ParameterValidator` 的覆盖率极低。
+
+**ParameterValidator 测试现状** (`tests/ParameterValidatorTest.php`)：
+```php
+// 仅 2 个用例：
+// test1：匿名 context + text 类型，合法输入 → 无错误
+// test2：匿名 context + 参数名不匹配 → 报错
+```
+完全未覆盖以下边界：
+- number / checkbox / list 类型的校验
+- text 带 pattern 的正则校验
+- required 必填项校验
+- global context 合并
+- getQueriedContext 三态（唯一匹配/零匹配/歧义匹配）
+- 空值、null、负值等边界输入
+
+**Cache 测试现状** (`tests/CacheTest.php` + `tests/CacheImplementationTest.php`)：
+```php
+// CacheTest：仅 FileCache 的基本 set/get/clear 测试
+// CacheImplementationTest：仅类名/接口契约检查
+```
+未覆盖：
+- SQLiteCache / MemcachedCache 的读写测试
+- TTL 过期行为（set 后等待 >TTL 再读应返回 null）
+- TTL=0 跳过写入的行为
+- TTL=null 永久缓存的行为
+- `prune()` 过期清理
+- 大 BLOB（>1MB）读写
+- 并发写入
+
+**_cache_timeout 边界的理论覆盖矩阵（当前 0%）**：
+
+| 用例 | 输入 | 预期 TTL | 预期缓存命中 |
+|------|------|---------|-------------|
+| 未传 _cache_timeout，`custom_timeout=true` | 无 | Bridge::CACHE_TIMEOUT | 是 |
+| 未传 _cache_timeout，`custom_timeout=false` | 无 | Bridge::CACHE_TIMEOUT | 是 |
+| `_cache_timeout=0`，`custom_timeout=true` | `"0"` | **跳过写入** | 否 |
+| `_cache_timeout=""`，`custom_timeout=true` | `""` | **跳过写入**（`(int)"" = 0`） | 否 |
+| `_cache_timeout="abc"`，`custom_timeout=true` | `"abc"` | **跳过写入**（`(int)"abc" = 0`） | 否 |
+| `_cache_timeout="-1"`，`custom_timeout=true` | `"-1"` | `time()-1`（写入即过期） | 否（读时立即过期） |
+| `_cache_timeout="3600"`，`custom_timeout=true` | `"3600"` | 3600s | 是 |
+| `_cache_timeout="3600.9"`，`custom_timeout=true` | `"3600.9"` | 3600s（截断） | 是 |
+| `_cache_timeout="999999999"`，`custom_timeout=true` | `"999999999"` | ~31.7 年 | 是 |
+| `_cache_timeout=3600`，`custom_timeout=false` | `"3600"` | Bridge::CACHE_TIMEOUT（忽略用户值） | 是 |
+
+**建议新增测试用例的优先级**：
+1. P0：`ttl=0` 跳过写入（安全边界）
+2. P0：负值 TTL 立即过期
+3. P1：`custom_timeout=false` 时忽略用户值
+4. P1：非数字字符串转 int=0 跳过写入
+5. P2：浮点数截断行为
+
+### 9.6 ReflectionClass 热点路径降级方案
+
+`getShortName()` 在每个 `loadCacheValue` / `saveCacheValue` 调用时都会新建 `ReflectionClass` 对象。对于常规 Bridge，这个开销可忽略；但对于热点 Bridge（单请求调用 100+ 次缓存读写），可以考虑以下降级/优化方案：
+
+**方案 A：属性缓存（零改动风险）**：
+```php
+// BridgeAbstract.php 新增属性
+private ?string $shortName = null;
+
+public function getShortName(): string
+{
+    if ($this->shortName === null) {
+        $this->shortName = (new \ReflectionClass($this))->getShortName();
+    }
+    return $this->shortName;
+}
+```
+- 效果：单请求第一次调用时反射一次，后续直接返回字符串
+- 性能提升：2μs → 约 0.1μs，20 倍提升
+- 风险：无，仅增加 8 字节对象内存
+
+**方案 B：get_class() 替代（更简单，但依赖无命名空间约定）**：
+```php
+public function getShortName(): string
+{
+    $class = get_class($this);
+    return substr($class, strrpos($class, '\\') + 1);
+}
+```
+- 效果：~0.1μs，与方案 A 相当
+- 风险：如果未来 Bridge 引入命名空间（如 `namespace RssBridge\Bridges;`），此方案仍能正确截取短名（因为用了 `strrpos('\\')`），所以其实比 Reflection 更通用
+
+**方案 C：静态缓存（跨请求）**：
+```php
+private static array $shortNameCache = [];
+
+public function getShortName(): string
+{
+    $class = static::class;
+    return self::$shortNameCache[$class]
+        ?? (self::$shortNameCache[$class] = (new \ReflectionClass($this))->getShortName());
+}
+```
+- 效果：跨请求共享缓存（同一 PHP-FPM 进程内）
+- 风险：OPcache 下类名静态数组可能与旧缓存冲突，热更新后需重启 PHP-FPM
+
+**方案 D：BridgeFactory 在构造时注入**：
+```php
+// BridgeFactory.php:46
+public function create(string $name): BridgeAbstract
+{
+    $bridge = new $name($this->cache, $this->logger);
+    $bridge->setShortName($name);  // Factory 已知类名，直接注入
+    return $bridge;
+}
+```
+- 效果：0μs，完全消除反射
+- 风险：需要修改 BridgeAbstract 构造函数，所有子类需同步
+
+**结论**：方案 A 最稳妥，与现有实现语义完全等价，无兼容性风险，代码改动量最小。在 rss-bridge 当前量级下其实没必要优化，但如果出现性能瓶颈，这是首选方案。
+
+### 9.7 unserialize 反序列化攻击防护
+
+rss-bridge 的三种缓存实现（SQLiteCache / FileCache / MemcachedCache）都使用 `serialize()` + `unserialize()` 作为序列化格式。`unserialize()` 在 PHP 中是**高危函数**，如果攻击者能控制缓存内容，可触发 PHP 对象注入（POP chain）攻击，甚至 RCE。
+
+**调用链与攻击面**：
+
+```
+攻击者控制缓存存储
+   │
+   ├─ SQLiteCache：攻击者能写入 SQLite 文件
+   │   → 构造序列化恶意对象写入 storage.value 列
+   │   → 下次合法请求 cache->get() 调用 unserialize()
+   │   → 触发 __wakeup() / __destruct() 等魔术方法
+   │
+   ├─ FileCache：攻击者能写入缓存目录的 .cache 文件
+   │   → 同上，写入恶意序列化数据
+   │
+   └─ MemcachedCache：攻击者能访问 Memcached 端口（11211）
+       → 直接 SET key 为恶意序列化数据
+```
+
+**现有防护的脆弱性**：
+1. **无 `allowed_classes` 白名单**：所有 `unserialize()` 调用均为裸调用：
+   ```php
+   // SQLiteCache.php:67
+   $value = unserialize($blob);  // ❌ 无白名单，允许反序列化任意类
+   
+   // FileCache.php:34
+   $item = unserialize($data);  // ❌ 同上
+   ```
+   PHP 7+ 提供的 `unserialize($data, ['allowed_classes' => [...])` 机制完全未使用。
+
+2. **无完整性校验（HMAC / 签名）**：缓存值没有 MAC，攻击者可随意篡改内容，读取方无法发现。
+
+3. **缓存文件权限**：FileCache 的创建权限受 `umask` 影响，`FileCache.php:62` 的 TODO 注释明确指出了这个问题：
+   ```php
+   // TODO: Consider tightening the permissions of the created file.
+   // It usually allow others to read, depending on umask
+   ```
+   默认 `umask=022` 时，缓存文件权限为 0644，同服务器其他用户可读取内容。
+
+**加固建议**（按优先级）：
+
+P0：添加 `allowed_classes` 白名单
+```php
+// 只允许反序列化内置类和 rss-bridge 的值对象
+$allowed = [
+    'stdClass',
+    'DateTime',
+    // Response 对象等 rss-bridge 内部类
+    'Response',
+];
+$value = unserialize($blob, ['allowed_classes' => $allowed]);
+```
+如果缓存值只有标量+数组，直接用 `['allowed_classes' => false]` 完全禁止对象。
+
+P1：改用 `json_encode` / `json_decode` 替代 `serialize()`
+- JSON 格式无法携带 PHP 对象，从根源消除反序列化风险
+- 注意：`Response` 对象需要实现 `jsonSerialize()` 接口或自定义 encode/decode
+- `error_reporting_` 前缀的缓存已经用 JSON 了（`DisplayAction.php:178-189`），是良好示范
+
+P2：添加 HMAC-SHA256 完整性校验
+```php
+// 写入时
+$payload = serialize($value);
+$hmac = hash_hmac('sha256', $payload, $secretKey);
+$store = $hmac . '::' . $payload;
+
+// 读取时
+[$hmac, $payload] = explode('::', $stored, 2);
+if (!hash_equals($hmac, hash_hmac('sha256', $payload, $secretKey))) {
+    throw new \Exception('Cache integrity check failed');
+}
+return unserialize($payload);
+```
+防止数据被篡改，即使攻击者能读文件也无法伪造内容。
+
+P3：收紧 FileCache 文件权限
+```php
+// FileCache.php set() 中
+file_put_contents($cacheFile, serialize($item));
+chmod($cacheFile, 0600);  // 仅所有者可读写
+```
+
+### 9.8 error_reporting_ 前缀的大对象拆分
+
+错误报告缓存的结构与潜在问题：
+
+**存储结构** (`DisplayAction.php:172-190`)：
+```php
+private function logBridgeError($bridgeName, $code)
+{
+    $cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+    $report = $this->cache->get($cacheKey);
+    if ($report) {
+        $report = Json::decode($report);
+        $report['time'] = time();       // 覆盖时间
+        $report['count']++;             // 累加计数
+    } else {
+        $report = [
+            'error' => $code,
+            'time'  => time(),
+            'count' => 1,
+        ];
+    }
+    $ttl = 86400 * 5;
+    $this->cache->set($cacheKey, Json::encode($report), $ttl);
+    return $report['count'];
+}
+```
+
+**键的构成**：`error_reporting_{BridgeName}_{ErrorCode}`
+- `BridgeName`：短类名（如 `FlickrBridge`）
+- `ErrorCode`：通常是错误代码字符串或异常类名 hash
+- TTL：硬编码 86400 * 5 = 432000 秒（5 天）
+
+**大对象风险场景**：
+
+1. **`$code` 异常膨胀**：如果 `$code` 是完整的堆栈跟踪字符串（含文件名、行号、参数值），长度可达数 KB。但目前 `$code` 看起来是简短的错误码，风险不大。
+
+2. **错误类型爆炸导致键空间膨胀**：
+   - 每个 Bridge × 每种错误类型 = 一个缓存条目
+   - 假设有 400 个 Bridge，每个平均产生 10 种不同错误 → 4000 条缓存
+   - 每条 JSON 约 100 字节 → 总计约 400KB，完全可接受
+
+3. **并发丢失更新（lost update）风险**：
+   ```
+   请求 A: get(key) → count=5
+   请求 B: get(key) → count=5
+   请求 A: count=6, set(key)
+   请求 B: count=6, set(key) → 覆盖 A 的写入！实际应该是 7
+   ```
+   这是典型的读-改-写竞态。当前无 CAS 或事务保护，并发错误场景下计数会丢失。对于错误报告统计来说，计数器少量偏差通常可以接受。
+
+**潜在的大对象拆分建议**（当前非必要，但为未来预留）：
+
+如果未来需要在错误报告里存堆栈跟踪、请求参数、调试上下文等大对象：
+
+1. **拆分为元数据 + 详情**：
+   ```
+   error_reporting_{Bridge}_{Code}_meta  → {"count": N, "time": ...}   // 小，高频读写
+   error_reporting_{Bridge}_{Code}_trace → {"stack": "...", "params": ...}  // 大，首次出错时写入
+   ```
+
+2. **滚动时间窗口拆分**：避免单条目 TTL 5 天导致数据陈旧：
+   ```
+   error_reporting_{Bridge}_{Code}_20260617  // 每天独立计数
+   error_reporting_{Bridge}_{Code}_20260618
+   ```
+   聚合查询时合并最近 N 天，更符合「最近 5 天出现 X 次」的实际语义。
+
+3. **序列化格式选择**：
+   当前使用 JSON 而非 `serialize()` 是正确选择（`DisplayAction.php:175` 的 todo 评论也提到没必要 json encode）。但从反序列化安全角度，JSON 比 `serialize()` 安全得多，建议保持。
+
+4. **SQLite 下的 BLOB 成本**：虽然 error_reporting 的 JSON 很小，但 SQLite 的 `INSERT OR REPLACE` 是「先删后插」操作，如果频繁更新同一错误的 count，会产生大量 WAL 页碎片。高并发下建议用 Redis/INCR 指令替代，避免全量读改写。
