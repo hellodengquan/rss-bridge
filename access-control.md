@@ -205,6 +205,193 @@ Token 在后续流程中的两处使用：
 
 ---
 
+## 七、运行时变更代码走向深度分析
+
+### 7.1 场景一：Token 运行时变更对正在进行请求的影响
+
+**问题**：管理员在 config.ini.php 中重命名或删除 token 条目时，正好有访问者在用旧 token 拉数据，这条请求是被截断返 401 还是按旧 token 继续完成？
+
+#### 7.1.1 关键代码基础
+
+**配置加载时机**（`index.php:13-14`）：
+```php
+require __DIR__ . '/lib/bootstrap.php';
+require __DIR__ . '/lib/config.php';  // 这里调用 Configuration::loadConfiguration()
+```
+
+**Configuration 存储结构**（`lib/Configuration.php:12`）：
+```php
+private static $config = [];  // 静态变量，进程生命周期内常驻内存
+```
+
+**Token 中间件读取方式**（`middlewares/TokenAuthenticationMiddleware.php:9,22`）：
+```php
+if (! Configuration::getConfig('authentication', 'token')) { ... }
+if (! hash_equals(Configuration::getConfig('authentication', 'token'), $token)) { ... }
+```
+
+#### 7.1.2 请求生命周期时序分析
+
+**单个请求的完整时间线**：
+```
+T0: 进程启动，index.php 开始执行
+    → require lib/config.php
+    → Configuration::loadConfiguration() 读取 config.ini.php
+    → 将 authentication.token 值写入 self::$config 静态变量
+T1: TokenAuthenticationMiddleware::__invoke() 执行
+    → 从 self::$config 静态变量读取 token 值进行比较
+T2: DisplayAction 执行，isEnabled() 检查，collectData() 拉取数据
+T3: Response 返回
+```
+
+**管理员变更 token 发生在 T1.5（Token 校验通过后，数据拉取中）**：
+
+```
+T0: 配置加载，token = "old-secret" 写入静态变量
+T1: Token 中间件校验通过（用的是内存中的 "old-secret"）
+    ← 管理员此时修改 config.ini.php，token = "new-secret"
+T1.5: 正在执行 bridge->collectData()，可能耗时几秒
+T2: DisplayAction 正常完成，返回 200
+    （全程没有重新读取配置文件）
+```
+
+#### 7.1.3 结论：不会被截断
+
+**代码层面的铁证**：
+1. `Configuration::$config` 是 `private static` 静态变量，在请求开始时一次性加载
+2. `getConfig()` 直接从静态变量读取，**不会重新读取文件**
+3. 没有任何 `reloadConfiguration()` 或动态刷新机制
+4. `TokenAuthenticationMiddleware` 只在流水线入口执行一次，通过后不再复检
+
+**所以**：正在进行的请求会**按旧 token 继续完成**，不会中途被截断返 401。只有**下一个新请求**才会加载新配置，使用新 token 校验。
+
+---
+
+### 7.2 场景二：Whitelist 热更新与 BridgeFactory 重建
+
+**问题**：Whitelist 重新打开之前已下线的 bridge 时，BridgeFactory 是否真能在不重启进程的前提下恢复其访问？缓存路径在哪段代码处理？
+
+#### 7.2.1 对象生命周期分析
+
+**PHP Share-Nothing 架构前提**：每个 HTTP 请求对应独立的 PHP 进程，请求结束进程销毁。
+
+**Container 单例范围**（`lib/Container.php:8,21-24`）：
+```php
+private array $resolved = [];  // 非静态，每个 Container 实例独立
+
+public function offsetGet($offset)
+{
+    if (!isset($this->resolved[$offset])) {
+        $this->resolved[$offset] = $this->values[$offset]($this);  // 首次访问时创建
+    }
+    return $this->resolved[$offset];
+}
+```
+
+**BridgeFactory 注册**（`lib/dependencies.php:35-37`）：
+```php
+$container['bridge_factory'] = function ($c) {
+    return new BridgeFactory($c['cache'], $c['logger']);  // 每次新建 Container 都会重新构造
+};
+```
+
+**BridgeFactory 构造时读取白名单**（`lib/BridgeFactory.php:25`）：
+```php
+$enabledBridges = Configuration::getConfig('system', 'enabled_bridges');
+```
+
+#### 7.2.2 热更新生效路径
+
+```
+请求 A（白名单 = [Twitter]）:
+  → 新进程，新 Container
+  → BridgeFactory 新建，enabledBridges = [Twitter]
+  → isEnabled("Twitch") = false → 返回 400
+  → 进程结束，Container 销毁
+
+管理员修改 config.ini.php: enabled_bridges[] = TwitchBridge
+
+请求 B（白名单 = [Twitter, Twitch]）:
+  → 全新进程，全新 Container
+  → BridgeFactory 全新构造，enabledBridges = [Twitter, Twitch]
+  → isEnabled("Twitch") = true → 正常返回 200
+```
+
+**结论**：**BridgeFactory 确实能在不重启服务的前提下热更新**，因为：
+1. 每次请求创建全新的 Container 和 BridgeFactory
+2. BridgeFactory 构造时重新读取 Configuration（每次请求也重新加载）
+3. 无需重启 php-fpm 或 web 服务器
+
+#### 7.2.3 缓存陷阱：400 错误缓存导致的"假失效"
+
+**关键发现**：即使 Whitelist 已更新，已缓存的 400 响应可能导致"看起来仍然不能访问"。
+
+**缓存 key 构成**（`lib/http.php:248-251`）：
+```php
+public function toArray(): array
+{
+    return $this->get;  // 返回所有 $_GET 参数，包括 token, bridge, format 等
+}
+```
+
+**CacheMiddleware 两处使用相同的 cacheKey**：
+- `middlewares/CacheMiddleware.php:24`: `$cacheKey = 'http_' . json_encode($request->toArray());`
+- `actions/DisplayAction.php:50`: `$cacheKey = 'http_' . json_encode($request->toArray());`
+
+**400 错误缓存策略**（`middlewares/CacheMiddleware.php:48-50`）：
+```php
+} elseif (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+    // Cache these responses for about ~10 mins on average
+    $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+}
+```
+
+#### 7.2.4 完整的缓存链路时序
+
+```
+请求 1（Twitch 未在白名单）:
+  CacheMiddleware:
+    → cacheKey = http_{"action":"display","bridge":"Twitch",...}
+    → cache->get() 不存在
+    → 继续执行
+  TokenAuthenticationMiddleware: 通过
+  DisplayAction:
+    → isEnabled("TwitchBridge") = false
+    → 返回 400 "not whitelisted"
+  CacheMiddleware 后置处理:
+    → 400 属于错误缓存列表
+    → cache->set(cacheKey, 400_response, 300~900秒)
+
+管理员将 Twitch 加入白名单
+
+请求 2（同一 URL，缓存期内）:
+  CacheMiddleware:
+    → cacheKey 完全相同
+    → cache->get() 命中 → 直接返回 400
+    → **根本不会执行到 DisplayAction 的 isEnabled() 检查**
+    → 用户感知："还是不能访问"
+
+请求 N（缓存过期后）:
+  CacheMiddleware:
+    → cache->get() 不存在
+    → 继续执行
+  DisplayAction:
+    → isEnabled("TwitchBridge") = true
+    → 正常返回 200
+```
+
+#### 7.2.5 缓存代码路径索引
+
+| 执行阶段 | 代码位置 | 行为 |
+|---------|---------|------|
+| **缓存命中检查**（最前置） | `middlewares/CacheMiddleware.php:23-41` | 先于所有业务中间件，命中直接返回 |
+| **缓存 key 计算** | `middlewares/CacheMiddleware.php:24` / `lib/http.php:248-251` | 包含所有 GET 参数，不包含 attributes |
+| **200 成功缓存** | `actions/DisplayAction.php:56-63` | DisplayAction 内部缓存，使用 bridge 自身的 TTL |
+| **4xx/5xx 错误缓存** | `middlewares/CacheMiddleware.php:46-54` | 固定 5~15 分钟随机 TTL |
+| **缓存 key 不包含** | `actions/DisplayAction.php:77` | token 等控制参数会从 bridge 输入中剥离，但**已在 cacheKey 中** |
+
+---
+
 ## 五、协作场景完整示例
 
 ### 场景 A：标准私用部署（Token + 全量 Bridge）
@@ -281,14 +468,23 @@ Token 在后续流程中的两处使用：
 | Whitelist 文件加载 | `lib/Configuration.php` | 46-53 |
 | enabled_bridges 校验 | `lib/Configuration.php` | 88-90 |
 | 环境变量 enabled_bridges 解析 | `lib/Configuration.php` | 71-74 |
+| Configuration 静态存储结构 | `lib/Configuration.php` | 12 |
+| Configuration getConfig 读取 | `lib/Configuration.php` | 158-164 |
 | BridgeFactory 白名单构建 | `lib/BridgeFactory.php` | 25-42 |
 | BridgeFactory isEnabled | `lib/BridgeFactory.php` | 49-52 |
 | Bridge 名称规范化 | `lib/BridgeFactory.php` | 66-75 |
 | DisplayAction 白名单检查 | `actions/DisplayAction.php` | 36-38 |
 | DisplayAction 剥离 token | `actions/DisplayAction.php` | 77 |
+| DisplayAction 200 缓存写入 | `actions/DisplayAction.php` | 56-63 |
 | FrontpageAction 过滤未启用 bridge | `actions/FrontpageAction.php` | 30-36 |
 | FrontpageAction 表单注入 token | `actions/FrontpageAction.php` | 163-169 |
 | ListAction status 标记 | `actions/ListAction.php` | 22-24 |
 | Token 中间件主逻辑 | `middlewares/TokenAuthenticationMiddleware.php` | 7-32 |
 | Basic Auth 中间件 | `middlewares/BasicAuthMiddleware.php` | 10-37 |
+| CacheMiddleware 缓存命中检查 | `middlewares/CacheMiddleware.php` | 23-41 |
 | CacheMiddleware 错误缓存策略 | `middlewares/CacheMiddleware.php` | 46-54 |
+| 配置加载入口 | `index.php` | 13-14 |
+| 配置加载执行 | `lib/config.php` | 13 |
+| Container 单例缓存 | `lib/Container.php` | 8, 21-24 |
+| BridgeFactory 容器注册 | `lib/dependencies.php` | 35-37 |
+| Request toArray 构成 | `lib/http.php` | 248-251 |
