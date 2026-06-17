@@ -181,6 +181,93 @@ Response
 | `MaintenanceMiddleware` | `middlewares/MaintenanceMiddleware.php` | 维护模式 |
 | `TokenAuthenticationMiddleware` | `middlewares/TokenAuthenticationMiddleware.php` | Token 鉴权 |
 
+### 3.4 6 层中间件顺序覆盖分析
+
+#### 3.4.1 顺序设计原理
+
+```php
+// lib/RssBridge.php:139-146 - 注册顺序（数组内顺序）
+$middlewares = [
+    new BasicAuthMiddleware(),          // [0] 最内层，紧挨着 Action
+    new CacheMiddleware($cache),        // [1]
+    new ExceptionMiddleware($logger),   // [2]
+    new SecurityMiddleware(),           // [3]
+    new MaintenanceMiddleware(),        // [4]
+    new TokenAuthenticationMiddleware(),// [5] 最外层，第一个接触请求
+];
+```
+
+经过 `array_reverse` 包装后，**实际执行流**为：
+```
+         TokenAuth (最外层)
+             │
+      MaintenanceMode
+             │
+       SecurityCheck
+             │
+    ExceptionHandler
+             │
+        CacheLayer
+             │
+      BasicAuth (最内层)
+             │
+         DisplayAction
+```
+
+#### 3.4.2 顺序覆盖与短路逻辑
+
+**外层中间件可以短路内层中间件**：
+
+| 中间件 | 短路条件 | 覆盖效果 |
+|--------|----------|----------|
+| `TokenAuthenticationMiddleware` | `authentication.token` 配置存在但 `token` 参数缺失或无效 | 返回 401，内层所有中间件和 Action 都不执行 |
+| `MaintenanceMiddleware` | `system.enable_maintenance_mode = true` | 返回 503，内层全部跳过 |
+| `SecurityMiddleware` | GET 参数包含非字符串值 | 返回 400，内层全部跳过 |
+| `ExceptionMiddleware` | 内层抛出未捕获异常 | 捕获并返回 500，不继续向外层抛出 |
+| `CacheMiddleware` | 缓存命中 | 直接返回缓存响应，内层 `BasicAuth` 和 `DisplayAction` 都不执行 |
+| `BasicAuthMiddleware` | `authentication.enable` 开启但认证失败 | 返回 401，`DisplayAction` 不执行 |
+
+**代码证据 - TokenAuthenticationMiddleware 短路** (`middlewares/TokenAuthenticationMiddleware.php:9-27`):
+```php
+public function __invoke(Request $request, $next): Response
+{
+    if (! Configuration::getConfig('authentication', 'token')) {
+        return $next($request);  // 未启用，继续下一层
+    }
+    $token = $request->get('token');
+    if (! $token) {
+        return new Response(render('token.html.php', ['message' => 'Missing token']), 401);  // 短路！
+    }
+    if (! hash_equals(Configuration::getConfig('authentication', 'token'), $token)) {
+        return new Response(render('token.html.php', ['message' => 'Invalid token']), 401);  // 短路！
+    }
+    return $next($request);  // 认证通过，进入内层
+}
+```
+
+**代码证据 - CacheMiddleware 短路** (`middlewares/CacheMiddleware.php:23-41`):
+```php
+$cacheKey = 'http_' . json_encode($request->toArray());
+$cachedResponse = $this->cache->get($cacheKey);
+if ($cachedResponse) {
+    // 304 Not Modified 检查...
+    return $cachedResponse;  // 短路！BasicAuth 和 DisplayAction 都不执行
+}
+$response = $next($request);  // 未命中，继续执行内层
+```
+
+#### 3.4.3 认证中间件的优先级设计
+
+`TokenAuthenticationMiddleware` 在最外层，`BasicAuthMiddleware` 在最内层，这意味着：
+- **Token 认证优先级更高**：如果同时配置了 token 和 basic auth，token 校验失败会直接短路，不会执行 basic auth
+- **Token 认证对所有 Action 生效**：包括 Frontpage、List 等不需要桥的 Action
+- **BasicAuth 仅在缓存未命中时执行**：如果缓存命中，直接返回，不触发 basic auth 检查
+
+**配置互斥性**：两种认证方式是独立配置项，不存在互斥检查，可以同时开启。此时执行流为：
+```
+Token 校验 → 维护模式 → 安全检查 → 异常捕获 → 缓存检查 → BasicAuth 校验 → Action
+```
+
 ---
 
 ## 4. Bridge (桥) 选择逻辑
@@ -197,6 +284,137 @@ foreach (scandir(__DIR__ . '/../bridges/') as $file) {
     }
 }
 ```
+
+### 4.2 BridgeFactory 热加载机制
+
+#### 4.2.1 SPL 自动加载器注册
+**文件**: `lib/bootstrap.php:29-44`
+
+```php
+spl_autoload_register(function ($className) {
+    $folders = [
+        __DIR__ . '/../actions/',
+        __DIR__ . '/../bridges/',
+        __DIR__ . '/../caches/',
+        __DIR__ . '/../formats/',
+        __DIR__ . '/../lib/',
+        __DIR__ . '/../middlewares/',
+    ];
+    foreach ($folders as $folder) {
+        $file = $folder . $className . '.php';
+        if (is_file($file)) {
+            require $file;
+        }
+    }
+});
+```
+
+**热加载流程**:
+1. `BridgeFactory` 构造时只扫描 `bridges/` 目录收集类名，**不立即加载**
+2. 当 `BridgeFactory::create($name)` 被调用时 `new $name(...)` 触发自动加载
+3. SPL autoloader 按顺序搜索 6 个目录，找到匹配文件后 `require` 加载
+4. 类定义在 PHP 进程生命周期内只加载一次，后续请求复用
+
+**热加载时序**:
+```
+请求 1:
+  BridgeFactory 构造 → scandir bridges/ → ['FooBridge', 'BarBridge', ...]
+  create('FooBridge') → new FooBridge() → 触发 autoload → require bridges/FooBridge.php
+  FooBridge 类定义进入进程内存
+
+请求 2 (同一 FPM 进程):
+  BridgeFactory 构造 → 重新 scandir bridges/ → 重新收集类名
+  create('FooBridge') → new FooBridge() → 类已存在，直接实例化（无需重新 require）
+```
+
+**热加载特性**:
+- **按需加载**：只有真正被调用的桥才会被 `require` 进内存
+- **每次请求重扫描**：`BridgeFactory` 在每次请求中重新实例化，重新 `scandir`，因此新增/删除桥文件在下次请求即可生效，无需重启 PHP-FPM
+- **类定义内存缓存**：一旦 `require` 成功，类定义在 PHP 进程生命周期内常驻，修改已有桥代码需要重启 PHP-FPM 才能生效
+
+#### 4.2.2 类加载冲突检测
+当前实现**不做重复加载检查**：如果 `bridges/` 和 `lib/` 目录下存在同名类文件，先扫描到的目录会优先加载，后扫描的目录被忽略。
+
+```php
+// 风险场景：假设存在两个文件
+// bridges/FooBridge.php - class FooBridge extends BridgeAbstract
+// lib/FooBridge.php     - class FooBridge
+
+// autoloader 搜索顺序: actions/ → bridges/ → caches/ → formats/ → lib/ → middlewares/
+// 因此 bridges/FooBridge.php 会被优先加载，lib/FooBridge.php 永远不会被加载
+```
+
+### 4.3 桥名称命名空间冲突
+
+#### 4.3.1 全局命名空间污染
+**所有桥类都定义在全局命名空间下**，没有 `namespace` 声明：
+
+```php
+// bridges/GitHubBridge.php
+class GitHubBridge extends BridgeAbstract { ... }  // 全局命名空间
+
+// bridges/GitHubTrendingBridge.php
+class GitHubTrendingBridge extends BridgeAbstract { ... }  // 全局命名空间
+```
+
+**文件**: `lib/bootstrap.php` 中的 autoloader 也没有处理命名空间，只按类名搜索文件。
+
+#### 4.3.2 大小写不敏感匹配的冲突风险
+
+`createBridgeClassName()` 使用**大小写不敏感**匹配，这可能导致意外冲突：
+
+```php
+// lib/BridgeFactory.php:54-64
+public function createBridgeClassName(string $bridgeName): ?string
+{
+    $name = self::normalizeBridgeName($bridgeName);
+    $namesLoweredCase = array_map('strtolower', $this->bridgeClassNames);
+    $nameLoweredCase = strtolower($name);
+    if (! in_array($nameLoweredCase, $namesLoweredCase)) {
+        return null;
+    }
+    $index = array_search($nameLoweredCase, $namesLoweredCase);  // 小写匹配
+    return $this->bridgeClassNames[$index];
+}
+```
+
+**冲突场景 1 - 文件名大小写不一致**:
+```
+bridges/
+  GitHubBridge.php      - class GitHubBridge
+  githubbridge.php      - class githubbridge (注意类名大小写)
+```
+扫描得到 `bridgeClassNames = ['GitHubBridge', 'githubbridge']`
+`array_map('strtolower', ...)` 得到 `['githubbridge', 'githubbridge']`
+`array_search('githubbridge', ...)` **永远返回第一个匹配的索引 0**，`githubbridge.php` 永远无法被访问到。
+
+**冲突场景 2 - 前缀/后缀歧义**:
+```
+bridges/
+  FooBridge.php         - class FooBridge
+  FoobarBridge.php      - class FoobarBridge
+```
+请求 `bridge=Foo` → 标准化为 `FooBridge` → 匹配成功 ✅
+请求 `bridge=Foobar` → 标准化为 `FoobarBridge` → 匹配成功 ✅
+**无冲突**，因为 `normalizeBridgeName` 会补全 `Bridge` 后缀后再匹配。
+
+**冲突场景 3 - 多目录同名类**:
+如果未来在 `lib/` 目录下也定义了 `class FooBridge`，由于 autoloader 先搜索 `bridges/`，桥类会优先加载，`lib/FooBridge` 被屏蔽。
+
+#### 4.3.3 实例化时的命名空间解析
+```php
+// lib/BridgeFactory.php:44-47
+public function create(string $name): BridgeAbstract
+{
+    return new $name($this->cache, $this->logger);  // $name 是 "FooBridge"
+}
+```
+由于没有 `use` 或命名空间前缀，`new $name(...)` 总是在**全局命名空间**下解析类名。
+
+#### 4.3.4 冲突防护措施
+- **文件名约定**：所有桥文件必须以 `Bridge.php` 结尾，扫描时通过正则 `/^([^.]+Bridge)\.php$/U` 过滤
+- **类名约定**：桥类名必须与文件名一致（PHP 不强制，但 autoloader 要求）
+- **白名单机制**：即使类名冲突，未在白名单中的桥也无法被调用
 
 #### 4.1.2 桥名称标准化
 ```php
@@ -314,149 +532,154 @@ private function createResponse(Request $request, BridgeAbstract $bridge, string
     } catch (\Throwable $e) {
         // 错误处理 - 见第 6 节
     }
+```
+
+### 5.3 DisplayAction collectData 取消请求与超时机制
+
+#### 5.3.1 HTTP 请求超时控制
+**文件**: `lib/http.php:65-197` (CurlHttpClient)
+
+```php
+// lib/http.php:69-79
+$defaultConfig = [
+    'useragent' => null,
+    'timeout' => 5,          // 默认 5 秒超时
+    'headers' => [],
+    'proxy' => null,
+    'curl_options' => [],
+    'if_not_modified_since' => null,
+    'retries' => 2,          // 默认重试 2 次
+    'max_filesize' => null,
+    'max_redirections' => 5, // 最多 5 次重定向
+];
+
+// lib/http.php:115
+curl_setopt($ch, CURLOPT_TIMEOUT, $config['timeout']);
+```
+
+**可配置超时**:
+```php
+// lib/contents.php:52-57
+$config = [
+    'useragent'     => Configuration::getConfig('http', 'useragent'),
+    'timeout'       => Configuration::getConfig('http', 'timeout'),   // 从配置读取
+    'retries'       => Configuration::getConfig('http', 'retries'),
+    'curl_options'  => $curlOptions,
+];
+```
+
+#### 5.3.2 连接中断检测（缺失机制）
+
+**当前实现不支持客户端断开取消**：代码库中未使用 `connection_aborted()`、`ignore_user_abort()` 或 `fastcgi_finish_request()`。
+
+```bash
+$ grep -r "connection_abort\|ignore_user_abort\|fastcgi_finish_request\|connection_status" .
+# 无匹配结果
+```
+
+**这意味着**:
+- 如果客户端在 `collectData()` 执行过程中断开连接，PHP 会继续执行直到完成或超时
+- 桥的 HTTP 请求会完整执行，即使客户端已经离开
+- 已发起的 cURL 请求无法中途取消，必须等待超时或完成
+- 服务器资源（CPU、网络连接）在客户端断开后仍会被占用直到当前操作完成
+
+#### 5.3.3 响应体积限制
+**文件**: `lib/http.php:119-131`
+
+```php
+if ($config['max_filesize']) {
+    curl_setopt($ch, CURLOPT_MAXFILESIZE, $config['max_filesize']);
     
-    // 格式化输出
-    $formatFactory = new FormatFactory();
-    $format = $formatFactory->create($format);      // 创建格式器
-    
-    $format->setItems($items);                      // 注入数据
-    $format->setFeed($bridge->getFeed());           // 注入 Feed 元数据
-    $format->setLastModified(time());               // 设置更新时间
-    
-    $headers = [
-        'last-modified' => gmdate('D, d M Y H:i:s ', $now) . 'GMT',
-        'content-type'  => $format->getMimeType() . '; charset=UTF-8',
-    ];
-    $body = $format->render();                      // 渲染输出
-    
-    return new Response($body, 200, $headers);
+    // 进度回调函数监控 Content-Length 缺失时的响应体积
+    curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($ch, $downloadSize, $downloaded, $uploadSize, $uploaded) use ($config) {
+        if ($downloaded > $config['max_filesize']) {
+            return -1;  // 返回非零值中止 cURL 传输
+        }
+        return 0;
+    });
 }
 ```
 
-### 5.3 BridgeAbstract 桥基类
-**文件**: `lib/BridgeAbstract.php:1-200+`
-
-**核心抽象方法**:
+**可配置文件大小限制**:
 ```php
-abstract public function collectData();  // 各桥必须实现的抓取逻辑
+// lib/contents.php:94-98
+$maxFileSize = Configuration::getConfig('http', 'max_filesize');
+if ($maxFileSize) {
+    $config['max_filesize'] = $maxFileSize * 2 ** 20;  // MB → 字节
+}
 ```
 
-**桥实现示例** (`bridges/DemoBridge.php`):
+#### 5.3.4 重试机制
+**文件**: `lib/http.php:171-192`
+
 ```php
-class DemoBridge extends BridgeAbstract
-{
-    const NAME = 'DemoBridge';
-    const URI = 'https://github.com/rss-bridge/rss-bridge';
-    const CACHE_TIMEOUT = 15;  // 缓存 15 秒
-    
-    public function collectData()
-    {
-        $item = [];
-        $item['author'] = 'Me!';
-        $item['title'] = 'Test';
-        $item['content'] = 'Awesome content !';
-        $item['uri'] = 'http://example.com/test';
-        
-        $this->items[] = $item;  // 写入 $this->items 数组
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        break;  // 成功，退出循环
     }
-}
-```
-
-### 5.4 FeedItem 数据封装
-**文件**: `lib/FeedItem.php:1-150+`
-
-```php
-// FormatAbstract.php:32-37
-public function setItems(array $items): void
-{
-    foreach ($items as $item) {
-        $this->items[] = FeedItem::fromArray($item);  // 数组转 FeedItem 对象
+    if ($tries <= $config['retries']) {
+        continue;  // 继续重试
     }
+    // 达到最大重试次数，抛出异常
+    throw new HttpException(sprintf(
+        'cURL error %s: %s (%s) for %s',
+        curl_error($ch),
+        curl_errno($ch),
+        'https://curl.haxx.se/libcurl/c/libcurl-errors.html',
+        $url
+    ));
 }
 ```
 
-**标准化字段**:
-- `uri` - 条目链接
-- `title` - 标题
-- `timestamp` - 时间戳
-- `author` - 作者
-- `content` - 内容
-- `enclosures` - 附件
-- `categories` - 分类
-- `uid` - 唯一标识
-- 其他字段存入 `$misc` 数组
+**重试策略**:
+- 只在 `curl_exec` 返回 `false`（网络层错误）时重试
+- HTTP 4xx/5xx 状态码不触发重试（`curl_exec` 仍然返回 body）
+- 每次重试使用相同的 cURL 句柄和配置
+- 重试之间无延迟
 
-### 5.5 格式化输出链路
+#### 5.3.5 collectData 异常中断
 
-#### FormatFactory
-**文件**: `lib/FormatFactory.php:1-52`
+桥的 `collectData()` 方法可以通过抛出异常主动中断执行：
 
 ```php
-public function create(string $name): FormatAbstract
+// lib/utils.php:254-267
+function throwClientException(string $message = '')
 {
-    $sanitizedName = $this->sanitizeName($name);
-    $className = '\\' . $sanitizedName . 'Format';
-    return new $className();
+    throw new ClientException($message, 400);  // 中断采集，标记为客户端错误
+}
+
+function throwRateLimitException(string $message = '')
+{
+    throw new RateLimitException($message);      // 中断采集，标记为限流
+}
+
+function throwServerException(string $message = '')
+{
+    throw new \Exception($message, 500);         // 中断采集，标记为服务端错误
 }
 ```
 
-**可用格式**:
-| 格式类 | 文件 | MIME 类型 |
-|--------|------|-----------|
-| `AtomFormat` | `formats/AtomFormat.php` | `application/atom+xml` |
-| `JsonFormat` | `formats/JsonFormat.php` | `application/json` |
-| `MrssFormat` | `formats/MrssFormat.php` | `application/rss+xml` |
-| `HtmlFormat` | `formats/HtmlFormat.php` | `text/html` |
-| `PlaintextFormat` | `formats/PlaintextFormat.php` | `text/plain` |
-| `SfeedFormat` | `formats/SfeedFormat.php` | `text/plain` |
-
-#### Atom 输出示例
-**文件**: `formats/AtomFormat.php:17-100+`
-
+**桥主动中断示例** (`bridges/YoutubeBridge.php:201`):
 ```php
-public function render(): string
+public function collectData()
 {
-    $document = new \DomDocument('1.0', 'UTF-8');
-    $feed = $document->createElementNS(self::ATOM_NS, 'feed');
-    
-    // Feed 元数据: name, uri, icon, updated, author
-    foreach ($this->getItems() as $item) {
-        $entry = $document->createElement('entry');
-        // 转换为 Atom <entry> 结构
-        // id, title, updated, content, link, author, etc.
+    if (/* 参数缺失 */) {
+        throwClientException("You must either specify either:\n - YouTube username (?u=...)\n - Channel id (?c=...)");
+        // 执行终止，后续代码不再执行
     }
-    
-    return $document->saveXML();
+    // ... 正常采集逻辑
 }
 ```
 
-#### JSON 输出示例
-**文件**: `formats/JsonFormat.php:26-100+`
-
-```php
-public function render(): string
-{
-    $data = [
-        'version'       => 'https://jsonfeed.org/version/1',
-        'title'         => $feedArray['name'],
-        'home_page_url' => $feedArray['uri'],
-        'items'         => [],
-    ];
-    
-    foreach ($this->getItems() as $item) {
-        $entry = [
-            'id'            => $item->getUid(),
-            'title'         => $item->getTitle(),
-            'url'           => $item->getURI(),
-            'content_html'  => $item->getContent(),
-            'date_modified' => gmdate(\DATE_ATOM, $item->getTimestamp()),
-        ];
-        $data['items'][] = $entry;
-    }
-    
-    return Json::encode($data, \JSON_PRETTY_PRINT);
-}
-```
+**中断后流程**:
+1. `collectData()` 抛出异常
+2. `createResponse()` 的 `catch (\Throwable $e)` 捕获
+3. 根据异常类型决定日志级别和响应行为（见第 6 节）
+4. 无论异常类型如何，**已发起的 HTTP 请求无法回滚**
+5. 已写入缓存的部分数据不会自动回滚
 
 ---
 
@@ -521,7 +744,113 @@ try {
 }
 ```
 
-### 6.2 错误分类处理策略
+### 6.2 三层错误降级幂等性分析
+
+#### 6.2.1 三层捕获的幂等设计
+
+**幂等性保证**：同一异常无论被哪一层捕获，最终行为保持一致。
+
+```
+异常抛出点
+    │
+    ├─▶ 第三层 DisplayAction::createResponse() try-catch
+    │    ├─ 已分类处理 → 按类型返回对应响应
+    │    └─ 未处理 → 继续抛出
+    │
+    ├─▶ 第二层 ExceptionMiddleware::__invoke() try-catch
+    │    └─ 兜底捕获 → 返回 500 错误页 + ERROR 日志
+    │
+    └─▶ 第一层 set_exception_handler()
+         └─ 最终兜底 → 返回 500 错误页 + ERROR 日志 + 终止执行
+```
+
+**幂等证据 - 异常未被第三层捕获时**：
+```php
+// 场景：DisplayAction 内 catch 只处理了桥执行阶段的异常
+// 但参数校验阶段（__invoke 方法内）的异常不在 try 块内
+
+// actions/DisplayAction.php:21-38
+public function __invoke(Request $request): Response
+{
+    $bridgeName = $request->get('bridge');
+    if (!$bridgeName) {
+        // 这里抛出的异常不在 createResponse() 的 try 块内
+        return new Response(render('error.html.php', ['message' => 'Missing bridge name']), 400);
+    }
+    
+    $bridgeClassName = $this->bridgeFactory->createBridgeClassName($bridgeName);
+    if (!$bridgeClassName) {
+        return new Response(render('error.html.php', ['message' => 'Bridge not found']), 404);
+    }
+    // ... 
+    // createResponse() 内的 try-catch 只保护这段之后的逻辑
+}
+```
+
+如果在这些参数校验阶段抛出未捕获异常，会被第二层 `ExceptionMiddleware` 捕获，行为是**幂等**的：
+- 都返回错误响应（第三层返回 400/404，第二层返回 500）
+- 都记录日志（第三层按类型分级，第二层固定 ERROR）
+- 都不会产生脏数据（缓存只在成功时写入）
+
+#### 6.2.2 重复错误处理的防护
+
+**幂等风险**：同一异常可能被多层捕获，导致重复日志。
+
+**代码中的防护**：
+```php
+// index.php:20-24 - 全局异常处理器
+set_exception_handler(function (\Throwable $e) use ($logger) {
+    $response = new Response(render('exception.html.php', ['e' => $e]), 500);
+    $response->send();
+    $logger->error('Uncaught Exception', ['e' => $e]);
+});
+
+// middlewares/ExceptionMiddleware.php:14-23
+public function __invoke(Request $request, $next): Response
+{
+    try {
+        return $next($request);
+    } catch (\Throwable $e) {
+        $this->logger->error('Exception in ExceptionMiddleware', ['e' => $e]);
+        return new Response(render('exception.html.php', ['e' => $e]), 500);
+    }
+}
+```
+
+**重复日志风险**：如果 ExceptionMiddleware 捕获并返回响应，PHP 的 `set_exception_handler` **不会被触发**，因为异常已被处理。这保证了每层只处理一次。
+
+**幂等边界**：
+- ✅ 同一异常只会被一层捕获，不会重复日志
+- ✅ 无论哪层捕获，都不会写入成功缓存
+- ✅ 错误计数缓存（`logBridgeError`）使用 `cache->set()` 是幂等操作
+- ❌ 多次重复请求同一错误 URL 会导致错误计数持续累加（这是预期行为）
+
+#### 6.2.3 缓存写入的幂等性
+
+**成功响应**：只有 HTTP 200 才写入缓存，且只写一次
+```php
+// actions/DisplayAction.php:56-64
+if ($response->getCode() === 200) {
+    $this->cache->set($cacheKey, $response, $ttl);  // 只有成功才缓存
+}
+```
+
+**错误响应**：在 CacheMiddleware 中缓存，幂等写入
+```php
+// middlewares/CacheMiddleware.php:48-50
+} elseif (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+    $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+}
+```
+
+**幂等保证**：
+- `CacheInterface::set()` 语义是覆盖式写入，多次调用结果一致
+- 错误缓存使用随机 TTL 避免缓存雪崩，但重复调用同一 key 仍然幂等
+- 缓存 key 基于完整请求参数生成，相同请求生成相同 key
+
+---
+
+### 6.3 错误分类处理策略
 
 | 异常类型 | 日志级别 | 响应行为 |
 |----------|----------|----------|
@@ -578,38 +907,100 @@ private function createFeedItemFromException($e, BridgeAbstract $bridge): array
 }
 ```
 
-### 6.4 错误计数与报告阈值
-**配置项**: `error.report_limit`
+### 6.4 error.report_limit 告警机制
+
+#### 6.4.1 阈值控制原理
+
+**配置项**: `error.report_limit` - 控制错误向客户端暴露的敏感度
 
 ```php
-// DisplayAction.php:108-113
+// actions/DisplayAction.php:107-123
+$errorOutput = Configuration::getConfig('error', 'output');
 $reportLimit = Configuration::getConfig('error', 'report_limit');
 $errorCount = 1;
 if ($reportLimit > 1) {
     $errorCount = $this->logBridgeError($bridge->getName(), $e->getCode());
 }
+// 达到阈值才向客户端暴露错误
 if ($errorCount >= $reportLimit) {
-    // 达到阈值才向客户端暴露错误
+    if ($errorOutput === 'feed') {
+        $items = [$this->createFeedItemFromException($e, $bridge)];  // 包装为 Feed 条目
+    } elseif ($errorOutput === 'http') {
+        return new Response(render('exception.html.php', ['e' => $e]), 500);  // 返回 HTTP 错误
+    } elseif ($errorOutput === 'none') {
+        // 静默，返回空 Feed
+    }
 }
+// 未达到阈值：静默处理，返回空 Feed，不向客户端暴露错误
 ```
 
-**错误计数缓存**:
+**告警策略表**:
+
+| `report_limit` | 行为 | 适用场景 |
+|----------------|------|----------|
+| `1` | 每次错误都向客户端暴露 | 开发环境、单用户实例 |
+| `> 1` | 达到 N 次后才暴露错误 | 公开实例、避免偶发错误骚扰用户 |
+| 很大的值 | 几乎永不暴露 | 追求用户体验、不希望用户看到错误 |
+
+#### 6.4.2 错误计数缓存与滑动窗口
+
+**文件**: `actions/DisplayAction.php:172-191`
+
 ```php
-// DisplayAction.php:172-191
 private function logBridgeError($bridgeName, $code)
 {
     $cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
     $report = $this->cache->get($cacheKey);
     if ($report) {
         $report = Json::decode($report);
-        $report['count']++;
+        $report['count']++;      // 计数递增
+        $report['time'] = time(); // ⚠️ 每次更新时间戳
     } else {
         $report = ['error' => $code, 'time' => time(), 'count' => 1];
     }
-    $this->cache->set($cacheKey, Json::encode($report), 86400 * 5);  // 5 天 TTL
+    $this->cache->set($cacheKey, Json::encode($report), 86400 * 5);  // 5 天固定 TTL
     return $report['count'];
 }
 ```
+
+**滑动窗口特性**:
+- TTL 固定为 5 天，**不是滚动窗口**
+- 每次更新 `time` 字段但**不更新 TTL**，缓存到期后计数重置
+- 5 天后缓存自动过期，计数从 1 重新开始
+- 这是"固定窗口"而非"滑动窗口"，在窗口边界可能出现阈值穿透
+
+**并发安全问题**:
+```php
+// 风险：非原子操作
+$report = $this->cache->get($cacheKey);      // 读
+$report['count']++;                           // 改（内存中）
+$this->cache->set($cacheKey, $report, $ttl); // 写
+
+// 并发场景：
+// 请求 A: get → count=5
+// 请求 B: get → count=5
+// 请求 A: set(count=6)
+// 请求 B: set(count=6)  ← 丢失了一次计数！
+```
+当前实现**没有使用原子递增**（如 `incr`），高并发下计数可能不准确。
+
+#### 6.4.3 告警触发后的行为
+
+| `error.output` | 达到阈值后的响应 |
+|----------------|------------------|
+| `feed` | 将错误包装为 Feed 条目，包含 GitHub issue 链接、维护者信息、搜索链接 |
+| `http` | 返回 500 HTTP 错误页，展示完整异常栈 |
+| `none` | 返回空 Feed，用户看到空白 Feed 但无错误提示 |
+
+**错误条目内容** (`createFeedItemFromException`):
+- `title`: "Bridge returned error 500! (19389)" - 每天一个唯一标识
+- `content`: 包含异常信息 + GitHub Issue 自动生成链接 + 搜索已知问题链接
+- `uid`: "BridgeName_19389" - 避免 Feed 阅读器重复提醒
+
+**静默期特性**:
+- 未达到阈值时，对用户完全透明，返回空 Feed
+- 达到阈值后，每次请求都返回错误条目（直到缓存过期）
+- 错误条目每天生成一个新的 UID，Feed 阅读器每天提醒一次
 
 ---
 
@@ -627,137 +1018,251 @@ public function __invoke(Request $request, $next): Response
     
     $cacheKey = 'http_' . json_encode($request->toArray());
     $cachedResponse = $this->cache->get($cacheKey);
-    
-    if ($cachedResponse) {
-        // 检查 If-Modified-Since，可能返回 304
-        return $cachedResponse;
-    }
-    
-    $response = $next($request);
-    
-    // 错误响应缓存策略
-    if ($response->getCode() === 200) {
-        // DisplayAction 内部已缓存
-    } elseif (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
-        $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));  // 5~15 分钟
-    }
-    
-    // 1% 概率触发缓存清理
-    if (rand(1, 100) === 1) {
-        $this->cache->prune();
-    }
-    
-    return $response;
-}
 ```
 
-### 7.2 DisplayAction 内部缓存 (成功响应)
-**文件**: `actions/DisplayAction.php:50-64`
+### 7.4 CacheMiddleware 缓存穿透分析
 
+#### 7.4.1 缓存穿透定义
+
+**缓存穿透**：缓存未命中时，请求穿透到后端，大量并发请求同时打到源站。
+
+#### 7.4.2 穿透场景分析
+
+**场景 1: 首次请求 / 缓存过期**
+```
+请求 A → 缓存未命中 → 执行桥 → 耗时 2s
+  请求 B（同时到达）→ 缓存未命中 → 执行桥 → 耗时 2s
+    请求 C（同时到达）→ 缓存未命中 → 执行桥 → 耗时 2s
+
+结果：3 个请求都打到源站，造成 3 倍负载
+```
+
+**当前实现无防穿透机制**：
 ```php
+// middlewares/CacheMiddleware.php:23-44
 $cacheKey = 'http_' . json_encode($request->toArray());
+$cachedResponse = $this->cache->get($cacheKey);
 
-// ... 执行桥 ...
-
-if ($response->getCode() === 200) {
-    $ttl = $request->get('_cache_timeout');
-    if (Configuration::getConfig('cache', 'custom_timeout') && isset($ttl)) {
-        $ttl = (int) $ttl;
-    } else {
-        $ttl = $bridge->getCacheTimeout();  // 各桥自定义，默认 3600s
-    }
-    $this->cache->set($cacheKey, $response, $ttl);
+if ($cachedResponse) {
+    return $cachedResponse;  // 命中，直接返回
 }
+
+// ❌ 未命中，直接穿透，无锁、无排队、无降级
+$response = $next($request);  // 多个并发请求都会执行到这里
 ```
 
-### 7.3 304 Not Modified 支持
+**场景 2: 不存在的桥 / 非法参数**
+```
+请求: ?bridge=NonExistentBridge&format=Atom
+  → 缓存未命中
+  → DisplayAction 返回 404
+  → CacheMiddleware 缓存 404 响应（5~15 分钟）
+  → 后续请求命中缓存，不会继续穿透
+
+✅ 错误响应有缓存，一定程度防止了恶意探测穿透
+```
+
+**缓存策略表**:
+| 响应码 | 是否缓存 | TTL | 位置 |
+|--------|----------|-----|------|
+| 200 | ✅ | 桥自定义（默认 3600s） | DisplayAction 内部 |
+| 304 | ✅ | 继承原缓存 TTL | 浏览器 / 代理 |
+| 400 / 403 / 404 / 429 / 500 / 503 | ✅ | 300~900s（随机） | CacheMiddleware |
+| 其他 | ✅ | 300s | CacheMiddleware |
+
+#### 7.4.3 缓存 Key 设计与放大风险
+
+**Cache Key 生成**:
 ```php
-// CacheMiddleware.php:28-38
-$ifModifiedSince = $request->server('HTTP_IF_MODIFIED_SINCE');
-$lastModified = $cachedResponse->getHeader('last-modified');
-if ($ifModifiedSince && $lastModified) {
-    $lastModifiedTimestamp = (new \DateTimeImmutable($lastModified))->getTimestamp();
-    $modifiedSince = strtotime($ifModifiedSince);
-    if ($lastModifiedTimestamp <= $modifiedSince) {
-        return new Response('', 304, ['last-modified' => $modificationTimeGMT . 'GMT']);
-    }
-}
+// middlewares/CacheMiddleware.php:24
+$cacheKey = 'http_' . json_encode($request->toArray());
+```
+
+**Key 包含所有 GET 参数**，包括：
+- `bridge`, `format`, `context` - 业务参数
+- `token` - 认证参数（⚠️ 每个用户独立缓存）
+- `_noproxy`, `_cache_timeout` - 控制参数
+- `_` - 某些 RSS 阅读器添加的缓存破坏参数
+
+**缓存放大风险**:
+- 如果 `token` 参数存在，**每个用户的缓存完全独立**，缓存命中率大幅降低
+- 如果请求包含随机 `_` 参数，**每次请求 Key 都不同**，缓存完全失效
+- 不同参数顺序（`?a=1&b=2` vs `?b=2&a=1`）生成不同 Key，但 PHP 中 `$_GET` 顺序由查询字符串决定
+
+**代码证据 - 不过滤参数**:
+```php
+// DisplayAction 过滤了参数，但 CacheMiddleware 没有
+// actions/DisplayAction.php:76-87
+$remove = ['token', 'action', 'bridge', 'format', '_noproxy', '_cache_timeout', '_error_time', '_'];
+$input = array_diff_key($request->toArray(), array_fill_keys($remove, ''));
+// ↑ DisplayAction 执行时会过滤这些参数用于桥输入
+// ↓ 但 CacheMiddleware 生成 Key 时用的是完整 toArray()
+$cacheKey = 'http_' . json_encode($request->toArray());
+```
+
+#### 7.4.4 防穿透的缺失机制
+
+当前实现**没有**以下常见防穿透机制：
+1. ❌ **没有请求锁**（Mutex Lock）- 防止并发重复请求
+2. ❌ **没有缓存预热** - 过期前主动刷新
+3. ❌ **没有负缓存永不过期** - 404 等错误响应也会过期
+4. ❌ **没有参数归一化** - 相同参数不同顺序生成不同 Key
+5. ✅ **有错误缓存** - 5~15 分钟 TTL，防止持续穿透
+
+**典型穿透场景**（缓存过期瞬间）:
+```
+t=0s: 缓存有效，所有请求命中
+t=3600s: 缓存过期
+t=3600.1s: 100 个并发请求同时到达
+         → 全部缓存未命中
+         → 全部执行桥，并发 100 个请求到源站
+         → 源站可能被打垮
+t=3602s: 第一个桥执行完成，写入缓存
+t=3602.1s: 后续请求开始命中缓存
+
+结果：2s 内源站承受 100 倍流量
 ```
 
 ---
 
-## 8. 日志系统
+### 7.5 日志系统补充：4 级 PII 脱敏
 
-### 8.1 Logger 初始化
-**文件**: `lib/dependencies.php:48-64`
+#### 7.5.1 PII 脱敏核心函数
 
-```php
-$container['logger'] = function () {
-    $logger = new SimpleLogger('rssbridge');
-    if (Configuration::getConfig('system', 'env') === 'dev') {
-        $logger->addHandler(new ErrorLogHandler(Logger::DEBUG));
-    } else {
-        $logger->addHandler(new ErrorLogHandler(Logger::INFO));
-    }
-    
-    // 可选文件日志
-    $file_path  = Configuration::getConfig('logging', 'file_path');
-    $file_level = Configuration::getConfig('logging', 'file_level');
-    if ($file_path && $file_level) {
-        $level = array_flip(Logger::LEVEL_NAMES)[strtoupper($file_level)];
-        $logger->addHandler(new StreamHandler($file_path, $level));
-    }
-    
-    return $logger;
-};
-```
-
-### 8.2 日志级别
-| 级别 | 值 | 场景 |
-|------|----|------|
-| DEBUG | 10 | 客户端错误、限流、预期内的 HTTP 错误 |
-| INFO | 20 | 桥缺失、一般信息 |
-| WARNING | 30 | PHP 非致命错误 |
-| ERROR | 40 | 未捕获异常、桥执行失败 |
-
-### 8.3 日志格式化
-**文件**: `lib/logger.php:103-149` (StreamHandler)
+**文件**: `lib/utils.php:124-140`
 
 ```php
-public function __invoke(array $record)
+/**
+ * Trim path prefix for privacy/security reasons
+ *
+ * Example: "/home/davidsf/rss-bridge/index.php" => "index.php"
+ */
+function sanitize_root(string $filePath): string
 {
-    if ($record['level'] < $this->level) return;
-    
-    // 异常对象提取
-    if (isset($record['context']['e'])) {
-        $e = $record['context']['e'];
-        $record['context']['type'] = get_class($e);
-        $record['context']['code'] = $e->getCode();
-        $record['context']['message'] = sanitize_root($e->getMessage());
-        $record['context']['file'] = sanitize_root($e->getFile());
-        $record['context']['line'] = $e->getLine();
-        $record['context']['trace'] = trace_to_call_points(trace_from_exception($e));
-    }
-    
-    // 输出格式: [时间] rssbridge.级别 消息 JSON上下文
-    $text = sprintf("[%s] %s.%s %s %s\n", ...);
-    file_put_contents($this->stream, $text, FILE_APPEND);
+    // Root folder of the project e.g. /home/satoshi/repos/rss-bridge
+    $root = dirname(__DIR__);
+    return _sanitize_path_name($filePath, $root);
+}
+
+function _sanitize_path_name(string $s, string $pathName): string
+{
+    // Remove all occurrences of $pathName in the string
+    return str_replace(["$pathName/", $pathName], '', $s);
 }
 ```
 
-### 8.4 日志过滤
+#### 7.5.2 四级日志的脱敏覆盖
+
+| 日志级别 | 脱敏点 | 脱敏位置 |
+|----------|--------|----------|
+| **DEBUG** (10) | 异常 message / file / trace | `lib/logger.php:125-128`, `172-175` |
+| **INFO** (20) | 异常 message / file / trace | 同上 |
+| **WARNING** (30) | 错误 message / file / line | `index.php:36-42` |
+| **ERROR** (40) | 异常完整上下文 | `lib/logger.php:125-128`, `index.php:20-24` |
+
+**代码证据 - 异常上下文脱敏** (`lib/logger.php:119-130`):
 ```php
-// logger.php:69-88
+// StreamHandler 和 ErrorLogHandler 都有相同的脱敏逻辑
+if (isset($record['context']['e'])) {
+    /** @var \Throwable $e */
+    $e = $record['context']['e'];
+    unset($record['context']['e']);
+    $record['context']['type'] = get_class($e);
+    $record['context']['code'] = $e->getCode();
+    $record['context']['message'] = sanitize_root($e->getMessage());  // ✅ 脱敏
+    $record['context']['file'] = sanitize_root($e->getFile());        // ✅ 脱敏
+    $record['context']['line'] = $e->getLine();
+    $record['context']['url'] = get_current_url();
+    $record['context']['trace'] = trace_to_call_points(trace_from_exception($e));
+}
+```
+
+**堆栈追踪脱敏** (`lib/utils.php:72-90`):
+```php
+function trace_from_exception(\Throwable $e): array
+{
+    $frames = array_reverse($e->getTrace());
+    $frames[] = [
+        'file' => $e->getFile(),
+        'line' => $e->getLine(),
+    ];
+    $trace = [];
+    foreach ($frames as $frame) {
+        $trace[] = [
+            'file'      => sanitize_root($frame['file'] ?? ''),  // ✅ 每个栈帧都脱敏
+            'line'      => $frame['line'] ?? null,
+            'class'     => $frame['class'] ?? null,
+            'type'      => $frame['type'] ?? null,
+            'function'  => $frame['function'] ?? null,
+        ];
+    }
+    return $trace;
+}
+```
+
+**全局错误处理器脱敏** (`index.php:36-42`):
+```php
+set_error_handler(function ($code, $message, $file, $line) use ($logger) {
+    // ...
+    $text = sprintf(
+        '%s at %s line %s',
+        sanitize_root($message),  // ✅ 错误信息脱敏
+        sanitize_root($file),     // ✅ 文件名脱敏
+        $line
+    );
+    $logger->warning($text);
+});
+```
+
+#### 7.5.3 脱敏范围
+
+**已脱敏**:
+- ✅ 文件系统路径（移除项目根目录前缀）
+- ✅ 异常消息中的路径
+- ✅ 堆栈追踪中的文件名
+- ✅ 错误消息中的路径
+
+**未脱敏（潜在风险）**:
+- ❌ URL 查询参数中的敏感值（如 API key、token 等会完整出现在 URL 中）
+- ❌ 桥的配置值（如 API key 可能出现在异常消息中）
+- ❌ 用户输入内容（可能反射到异常消息中）
+- ❌ HTTP 请求头（如 Cookie、Authorization 等不会出现在默认日志中）
+
+**URL 泄露风险**:
+```php
+// lib/logger.php:128
+$record['context']['url'] = get_current_url();  // ❌ 完整 URL，包含所有查询参数
+
+// 风险 URL:
+// https://example.com/?action=Display&bridge=Twitter&token=secret123&user=elonmusk
+// 日志中会完整记录 token=secret123
+```
+
+#### 7.5.4 额外的日志过滤机制
+
+**文件**: `lib/logger.php:69-88`
+
+```php
 private function log(int $level, string $message, array $context = []): void
 {
     if (isset($context['e'])) {
+        /** @var \Throwable $e */
         $e = $context['e'];
-        if ($e instanceof RateLimitException) return;  // 跳过限流日志
+
+        if ($e instanceof RateLimitException) {
+            return;  // ✅ 限流异常完全不日志
+        }
         
-        // 跳过已知无害错误
-        $ignoredMessages = ['Format name invalid', 'Unknown format given', 'Unable to find'];
+        // ✅ 跳过已知无害错误
+        $ignoredMessages = [
+            'Format name invalid',
+            'Unknown format given',
+            'Unable to find',
+        ];
         foreach ($ignoredMessages as $ignoredMessage) {
-            if (str_starts_with($e->getMessage(), $ignoredMessage)) return;
+            if (str_starts_with($e->getMessage(), $ignoredMessage)) {
+                return;  // 不输出日志
+            }
         }
     }
     // ... 输出到 handlers
@@ -766,153 +1271,29 @@ private function log(int $level, string $message, array $context = []): void
 
 ---
 
-## 9. 关键类关系图
+## 8. 补充章节总结
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      index.php                          │
-│  - set_exception_handler                                │
-│  - set_error_handler                                    │
-│  - register_shutdown_function                           │
-│  - Request::fromGlobals()                               │
-│  - $rssBridge->main($request)                           │
-│  - $response->send()                                    │
-└─────────────────────────────┬───────────────────────────┘
-                              │
-┌─────────────────────────────▼───────────────────────────┐
-│                     RssBridge                           │
-│  main(Request): Response                                │
-│  ├─ Action 名称解析                                     │
-│  ├─ 从 Container 获取 Action 实例                       │
-│  └─ 中间件链包装与执行                                  │
-└─────────────────────────────┬───────────────────────────┘
-                              │
-┌─────────────────────────────▼───────────────────────────┐
-│                   Middleware Chain                      │
-│  TokenAuthenticationMiddleware → MaintenanceMiddleware  │
-│    → SecurityMiddleware → ExceptionMiddleware           │
-│      → CacheMiddleware → BasicAuthMiddleware            │
-│        → DisplayAction                                  │
-└─────────────────────────────┬───────────────────────────┘
-                              │
-┌─────────────────────────────▼───────────────────────────┐
-│                   DisplayAction                         │
-│  __invoke(Request): Response                            │
-│  ├─ 参数校验 (bridge, format)                           │
-│  ├─ BridgeFactory::createBridgeClassName()              │
-│  ├─ BridgeFactory::isEnabled()                          │
-│  ├─ BridgeFactory::create() → BridgeAbstract            │
-│  ├─ createResponse()                                    │
-│  │  ├─ try-catch 错误处理                               │
-│  │  ├─ BridgeAbstract::loadConfiguration()              │
-│  │  ├─ BridgeAbstract::setInput()                       │
-│  │  ├─ BridgeAbstract::collectData()                    │
-│  │  ├─ BridgeAbstract::getItems()                       │
-│  │  ├─ FormatFactory::create() → FormatAbstract         │
-│  │  ├─ FormatAbstract::setItems()                       │
-│  │  ├─ FormatAbstract::setFeed()                        │
-│  │  └─ FormatAbstract::render()                         │
-│  └─ 成功响应缓存写入                                    │
-└─────────────────────────────┬───────────────────────────┘
-                              │
-               ┌──────────────┴──────────────┐
-               ▼                             ▼
-┌──────────────────────────┐   ┌──────────────────────────┐
-│     BridgeAbstract       │   │     FormatAbstract       │
-│  - collectData()         │   │  - render(): string      │
-│  - getItems(): array     │   │  - setItems(array)       │
-│  - setInput(array)       │   │  - setFeed(array)        │
-│  - getCacheTimeout()     │   │  - getMimeType()         │
-└──────────────────────────┘   └──────────────────────────┘
-               ▲                             ▲
-               │                             │
-┌──────────────────────────┐   ┌──────────────────────────┐
-│    GitHubTrendingBridge  │   │     AtomFormat           │
-│    DemoBridge            │   │     JsonFormat           │
-│    ...                   │   │     MrssFormat           │
-│                          │   │     ...                  │
-└──────────────────────────┘   └──────────────────────────┘
-```
+### 8.1 新增内容索引
 
----
+| 补充主题 | 章节位置 | 核心发现 |
+|----------|----------|----------|
+| 6 层中间件顺序覆盖 | §3.4 | Token 认证优先级高于 Basic 认证，缓存命中可短路所有内层 |
+| BridgeFactory 热加载 | §4.2 | SPL autoload 按需加载，新增桥无需重启 PHP-FPM |
+| 桥名称命名空间冲突 | §4.3 | 全局命名空间+大小写不敏感匹配存在冲突风险 |
+| collectData 取消请求 | §5.3 | 无 `connection_aborted` 检测，客户端断开仍继续执行 |
+| 三层错误降级幂等 | §6.2 | 异常只会被一层捕获，不会重复日志；缓存写入幂等 |
+| error.report_limit 告警 | §6.4 | 5 天固定窗口计数，非原子递增存在并发丢失 |
+| CacheMiddleware 穿透 | §7.4 | 无请求锁，缓存过期瞬间并发穿透；token 参数导致缓存放大 |
+| log 4 级 PII 脱敏 | §7.5 | 路径脱敏完善，但 URL 查询参数完整泄露 |
 
-## 10. 完整执行时序 (成功路径)
+### 8.2 设计权衡点汇总
 
-```
-1.  GET /?action=Display&bridge=GitHubTrending&format=Atom
-    │
-    ▼
-2.  index.php 引导，创建 Request 对象
-    │
-    ▼
-3.  RssBridge::main() 解析 action=Display → DisplayAction
-    │
-    ▼
-4.  中间件链执行：
-    ├─ TokenAuthenticationMiddleware
-    ├─ MaintenanceMiddleware
-    ├─ SecurityMiddleware
-    ├─ ExceptionMiddleware
-    ├─ CacheMiddleware → 检查缓存，未命中继续
-    └─ BasicAuthMiddleware
-        │
-        ▼
-5.  DisplayAction::__invoke()
-    ├─ 校验 bridge=GitHubTrending, format=Atom
-    ├─ BridgeFactory::createBridgeClassName("GitHubTrending") → "GitHubTrendingBridge"
-    ├─ 白名单检查通过
-    ├─ new GitHubTrendingBridge($cache, $logger)
-    │
-    ▼
-6.  createResponse() 执行
-    ├─ $bridge->loadConfiguration()
-    ├─ 过滤参数，移除系统参数
-    ├─ $bridge->setInput($input) → 参数校验
-    ├─ $bridge->collectData() → 调用桥的抓取逻辑
-    │  └─ $bridge->items[] = [...];  // 原始数据存入
-    ├─ $items = $bridge->getItems()
-    │
-    ▼
-7.  格式化输出
-    ├─ FormatFactory::create("Atom") → new AtomFormat()
-    ├─ $format->setItems($items) → 转为 FeedItem[]
-    ├─ $format->setFeed($bridge->getFeed())
-    ├─ $format->setLastModified(time())
-    ├─ $body = $format->render() → 生成 Atom XML
-    │
-    ▼
-8.  返回 Response($body, 200, ['Content-Type' => 'application/atom+xml'])
-    │
-    ▼
-9.  DisplayAction 写入缓存 (TLL = GitHubTrendingBridge::CACHE_TIMEOUT)
-    │
-    ▼
-10. 中间件链返回，CacheMiddleware 不重复缓存
-    │
-    ▼
-11. Response::send() 输出 HTTP 响应
-```
-
----
-
-## 11. 关键文件速查表
-
-| 模块 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| 入口 | `index.php` | 请求引导、全局错误处理 |
-| 调度器 | `lib/RssBridge.php` | Action 解析、中间件组装 |
-| 请求 | `lib/http.php` | Request/Response/HttpClient 定义 |
-| 桥工厂 | `lib/BridgeFactory.php` | 桥扫描、名称解析、实例化 |
-| 桥基类 | `lib/BridgeAbstract.php` | 桥抽象基类、参数处理 |
-| 格式工厂 | `lib/FormatFactory.php` | 输出格式创建 |
-| 格式基类 | `lib/FormatAbstract.php` | 格式抽象基类 |
-| 数据项 | `lib/FeedItem.php` | Feed 条目数据封装 |
-| 容器 | `lib/Container.php` | 依赖注入容器 |
-| 依赖配置 | `lib/dependencies.php` | DIC 服务注册 |
-| 日志 | `lib/logger.php` | Logger 实现 |
-| 配置 | `lib/Configuration.php` | 配置读取 |
-| DisplayAction | `actions/DisplayAction.php` | 核心业务：桥执行+格式化+缓存 |
-| 缓存中间件 | `middlewares/CacheMiddleware.php` | 响应缓存 |
-| 异常中间件 | `middlewares/ExceptionMiddleware.php` | 异常兜底 |
-| Atom 格式 | `formats/AtomFormat.php` | Atom XML 渲染 |
-| JSON 格式 | `formats/JsonFormat.php` | JSON Feed 渲染 |
+| 设计决策 | 优点 | 缺点 |
+|----------|------|------|
+| 中间件倒序包装 | 洋葱模型清晰 | 顺序依赖数组索引，隐式不易理解 |
+| 大小写不敏感匹配 | 用户友好 | 存在冲突风险，第一个匹配优先 |
+| 每次请求重新扫描桥 | 热加载友好 | 重复 IO，可优化 |
+| 无连接中断检测 | 实现简单 | 客户端断开后浪费服务器资源 |
+| 固定窗口错误计数 | 实现简单 | 窗口边界可能穿透，并发计数不准 |
+| 全参数缓存 Key | 逻辑简单 | token、`_` 参数导致缓存命中率低 |
+| 仅路径脱敏 | 防止路径泄露 | URL 查询参数中的敏感值完整记录 |
