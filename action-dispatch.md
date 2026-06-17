@@ -1297,3 +1297,1016 @@ private function log(int $level, string $message, array $context = []): void
 | 固定窗口错误计数 | 实现简单 | 窗口边界可能穿透，并发计数不准 |
 | 全参数缓存 Key | 逻辑简单 | token、`_` 参数导致缓存命中率低 |
 | 仅路径脱敏 | 防止路径泄露 | URL 查询参数中的敏感值完整记录 |
+
+---
+
+## 9. 改进方案详述
+
+> 以下每个方案均包含：问题定位 → 当前代码 → 改造代码 → 变更影响。
+
+### 9.1 中间件倒序数组显式 enum 改造
+
+#### 9.1.1 问题定位
+
+**文件**: `lib/RssBridge.php:25-38`
+
+当前中间件顺序由数组索引隐式决定，依赖 `array_reverse` 倒序包装。开发者在调整顺序时必须心算 reverse 后的执行流，容易出错。
+
+```php
+// 当前实现 - 注册顺序≠执行顺序，需要心算 reverse
+$middlewares = [
+    new BasicAuthMiddleware(),          // [0] → 反转后最内层
+    new CacheMiddleware($cache),        // [1]
+    new ExceptionMiddleware($logger),   // [2]
+    new SecurityMiddleware(),           // [3]
+    new MaintenanceMiddleware(),        // [4]
+    new TokenAuthenticationMiddleware(),// [5] → 反转后最外层
+];
+foreach (array_reverse($middlewares) as $middleware) {
+    $action = fn ($req) => $middleware($req, $action);
+}
+```
+
+#### 9.1.2 改造方案：显式 enum + 有序注册
+
+```php
+// lib/MiddlewarePriority.php - 新增文件
+enum MiddlewarePriority: int
+{
+    case TokenAuthentication = 100;
+    case Maintenance         = 200;
+    case Security            = 300;
+    case Exception           = 400;
+    case Cache               = 500;
+    case BasicAuth           = 600;
+
+    public function create(Container $container): Middleware
+    {
+        return match ($this) {
+            self::TokenAuthentication => new TokenAuthenticationMiddleware(),
+            self::Maintenance         => new MaintenanceMiddleware(),
+            self::Security            => new SecurityMiddleware(),
+            self::Exception           => new ExceptionMiddleware($container['logger']),
+            self::Cache               => new CacheMiddleware($container['cache']),
+            self::BasicAuth           => new BasicAuthMiddleware(),
+        };
+    }
+}
+```
+
+```php
+// lib/RssBridge.php - 改造后
+public function main(Request $request): Response
+{
+    // ... action 解析 ...
+
+    $priorities = MiddlewarePriority::cases(); // 按 enum 声明顺序 = 执行顺序（从外到内）
+    $action = function ($req) use ($handler) {
+        return $handler($req);
+    };
+    // 从最内层往最外层包装（倒序遍历）
+    foreach (array_reverse($priorities) as $priority) {
+        $middleware = $priority->create($this->container);
+        $action = fn ($req) => $middleware($req, $action);
+    }
+    return $action($request->withAttribute('action', $actionName));
+}
+```
+
+#### 9.1.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| 顺序可见性 | 数组索引 + reverse 心算 | enum 声明顺序 = 执行顺序 |
+| 新增中间件 | 在数组中插入，需计算 reverse 位置 | 在 enum 中按优先级插入 |
+| 中间件依赖 | 构造函数在 RssBridge::main 中硬编码 | 集中在 `MiddlewarePriority::create()` |
+| 运行时开销 | 无 | enum cases 无额外开销，`match` 编译期优化 |
+| 兼容性 | PHP 7.4+ | PHP 8.1+（enum 特性） |
+
+**回退方案**：若需保持 PHP 7.4 兼容，可用带常量的类替代 enum：
+
+```php
+class MiddlewarePriority
+{
+    const TOKEN_AUTH   = 100;
+    const MAINTENANCE  = 200;
+    const SECURITY     = 300;
+    const EXCEPTION    = 400;
+    const CACHE        = 500;
+    const BASIC_AUTH   = 600;
+
+    public static function ordered(): array
+    {
+        return [
+            self::TOKEN_AUTH,
+            self::MAINTENANCE,
+            self::SECURITY,
+            self::EXCEPTION,
+            self::CACHE,
+            self::BASIC_AUTH,
+        ];
+    }
+}
+```
+
+---
+
+### 9.2 大小写不敏感命名空间分隔
+
+#### 9.2.1 问题定位
+
+**文件**: `lib/BridgeFactory.php:54-64`
+
+`createBridgeClassName()` 用 `strtolower` + `array_search` 做大小写不敏感匹配。如果存在两个仅大小写不同的桥类名（如 `GithubBridge` 和 `GitHubBridge`），`array_search` 永远返回第一个匹配索引。
+
+```php
+// 当前实现 - 大小写不敏感但有冲突
+public function createBridgeClassName(string $bridgeName): ?string
+{
+    $name = self::normalizeBridgeName($bridgeName);
+    $namesLoweredCase = array_map('strtolower', $this->bridgeClassNames);
+    $nameLoweredCase = strtolower($name);
+    if (! in_array($nameLoweredCase, $namesLoweredCase)) {
+        return null;
+    }
+    $index = array_search($nameLoweredCase, $namesLoweredCase);
+    return $this->bridgeClassNames[$index];  // ← 永远返回首个匹配
+}
+```
+
+#### 9.2.2 改造方案：命名空间分隔符
+
+引入子命名空间前缀，将桥按来源/功能分组，消除大小写冲突空间：
+
+```php
+// lib/BridgeFactory.php - 改造后
+public function createBridgeClassName(string $bridgeName): ?string
+{
+    $name = self::normalizeBridgeName($bridgeName);
+
+    // 精确匹配优先（大小写敏感）
+    $exactIndex = array_search($name, $this->bridgeClassNames);
+    if ($exactIndex !== false) {
+        return $this->bridgeClassNames[$exactIndex];
+    }
+
+    // 降级为大小写不敏感匹配，但检测冲突
+    $namesLoweredCase = array_map('strtolower', $this->bridgeClassNames);
+    $nameLoweredCase = strtolower($name);
+    $matches = array_keys($namesLoweredCase, $nameLoweredCase);
+    if (count($matches) === 0) {
+        return null;
+    }
+    if (count($matches) > 1) {
+        // 冲突检测：多个桥仅在大小写上不同
+        $conflicting = array_map(fn($i) => $this->bridgeClassNames[$i], $matches);
+        $this->logger->warning(sprintf(
+            'Bridge name collision detected: %s. Using first match: %s',
+            implode(', ', $conflicting),
+            $this->bridgeClassNames[$matches[0]]
+        ));
+    }
+    return $this->bridgeClassNames[$matches[0]];
+}
+```
+
+**桥文件命名空间分隔**（长期方案）：
+
+```
+bridges/
+  Social/
+    TwitterBridge.php       → class Social\TwitterBridge
+    MastodonBridge.php      → class Social\MastodonBridge
+  Video/
+    YoutubeBridge.php       → class Video\YoutubeBridge
+    VimeoBridge.php         → class Video\VimeoBridge
+  Developer/
+    GithubBridge.php        → class Developer\GithubBridge
+    GitlabBridge.php        → class Developer\GitlabBridge
+```
+
+```php
+// 对应的 normalizeBridgeName 改造
+public static function normalizeBridgeName(string $name): string
+{
+    // 支持 "Social/Twitter" 或 "SocialTwitter" 两种输入格式
+    if (preg_match('/(.+)(?:\.php)/', $name, $matches)) {
+        $name = $matches[1];
+    }
+    if (!preg_match('/(Bridge)$/i', $name)) {
+        $name = sprintf('%sBridge', $name);
+    }
+    return $name;
+}
+
+// 对应的 autoloader 改造
+spl_autoload_register(function ($className) {
+    // 将命名空间分隔符转为目录分隔符
+    $filePath = __DIR__ . '/../bridges/' . str_replace('\\', '/', $className) . '.php';
+    if (is_file($filePath)) {
+        require $filePath;
+    }
+});
+```
+
+#### 9.2.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| 冲突检测 | 静默使用首个匹配 | 日志告警，明确冲突 |
+| 精确匹配 | 无，总是大小写不敏感 | 精确匹配优先 |
+| 命名空间 | 全局 | 按功能分组（长期） |
+| API 兼容性 | `?bridge=Github` | 短期完全兼容；长期需支持 `?bridge=Social/Twitter` |
+| 文件系统 | 扁平目录 | 子目录结构 |
+
+---
+
+### 9.3 APCu 重扫描锁
+
+#### 9.3.1 问题定位
+
+**文件**: `lib/BridgeFactory.php:18-23`
+
+每个请求都 `scandir` bridges 目录。在高并发场景下，100 个请求同时执行 `scandir`，产生 100 次重复 IO。
+
+```php
+// 当前实现 - 每次请求都扫描
+public function __construct(CacheInterface $cache, Logger $logger)
+{
+    foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+        if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+            $this->bridgeClassNames[] = $m[1];
+        }
+    }
+    // ...
+}
+```
+
+#### 9.3.2 改造方案：APCu 进程级缓存 + TTL 锁
+
+```php
+// lib/BridgeFactory.php - 改造后
+private const SCAN_CACHE_KEY = 'rssbridge_bridge_scan';
+private const SCAN_CACHE_TTL = 60; // 60 秒内复用扫描结果
+
+private function scanBridgeDir(): array
+{
+    // 尝试从 APCu 读取
+    if (function_exists('apcu_fetch')) {
+        $cached = apcu_fetch(self::SCAN_CACHE_KEY);
+        if ($cached !== false) {
+            return $cached;
+        }
+    }
+
+    // 缓存未命中，执行扫描
+    $classNames = [];
+    foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+        if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+            $classNames[] = $m[1];
+        }
+    }
+
+    // 写入 APCu
+    if (function_exists('apcu_store')) {
+        apcu_store(self::SCAN_CACHE_KEY, $classNames, self::SCAN_CACHE_TTL);
+    }
+
+    return $classNames;
+}
+
+public function __construct(CacheInterface $cache, Logger $logger)
+{
+    $this->cache = $cache;
+    $this->logger = $logger;
+    $this->bridgeClassNames = $this->scanBridgeDir();
+    // ... enabled_bridges 逻辑不变
+}
+```
+
+**无 APCu 时的降级方案**：
+
+```php
+// 使用类静态变量作为进程级缓存（PHP-FPM worker 复用）
+private static ?array $scannedClassNames = null;
+
+private function scanBridgeDir(): array
+{
+    if (self::$scannedClassNames !== null) {
+        return self::$scannedClassNames;
+    }
+
+    $classNames = [];
+    foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+        if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+            $classNames[] = $m[1];
+        }
+    }
+
+    self::$scannedClassNames = $classNames;
+    return $classNames;
+}
+```
+
+#### 9.3.3 变更影响
+
+| 维度 | 改造前 | 改造后（APCu） | 改造后（静态变量） |
+|------|--------|---------------|-------------------|
+| IO 次数/请求 | 1 次 scandir | 0 次（TTL 内） | 0 次（进程生命周期内） |
+| 热加载延迟 | 立即 | 最多 60 秒 | 直到 FPM worker 重启 |
+| 依赖 | 无 | ext-apcu | 无 |
+| 内存 | 无额外 | APCu 共享内存 | PHP 进程内存 |
+| 适用场景 | 开发 | 生产 | 生产（无 APCu 时） |
+
+**推荐组合**：生产用 APCu（TTL 60s，平衡热加载与性能），开发用静态变量 + 手动重启 FPM。
+
+---
+
+### 9.4 滑动窗口错误计数
+
+#### 9.4.1 问题定位
+
+**文件**: `actions/DisplayAction.php:172-191`
+
+当前错误计数使用固定窗口（5 天 TTL），存在两个问题：
+1. 窗口边界穿透：错误恰好在 TTL 过期前后集中时，两次窗口各自未达阈值
+2. 非原子读改写：`get → count++ → set` 在并发下丢失计数
+
+```php
+// 当前实现 - 固定窗口 + 非原子递增
+private function logBridgeError($bridgeName, $code)
+{
+    $cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+    $report = $this->cache->get($cacheKey);
+    if ($report) {
+        $report = Json::decode($report);
+        $report['count']++;
+    } else {
+        $report = ['error' => $code, 'time' => time(), 'count' => 1];
+    }
+    $this->cache->set($cacheKey, Json::encode($report), 86400 * 5);
+    return $report['count'];
+}
+```
+
+#### 9.4.2 改造方案：时间桶滑动窗口
+
+```php
+// actions/DisplayAction.php - 改造后
+private function logBridgeError(string $bridgeName, int $code): int
+{
+    $windowSeconds = 86400; // 1 天窗口
+    $bucketSize    = 3600;  // 1 小时一个桶
+    $now           = time();
+    $bucketCount   = $windowSeconds / $bucketSize; // 24 个桶
+
+    $prefix = 'err_bucket_' . $bridgeName . '_' . $code . '_';
+
+    // 写入当前桶（原子递增）
+    $currentBucket = (int)($now / $bucketSize);
+    $currentKey = $prefix . $currentBucket;
+
+    // 优先使用 APCu 原子递增
+    if (function_exists('apcu_inc')) {
+        $count = apcu_inc($currentKey, 1);
+        if ($count === 1) {
+            apcu_store($currentKey . '_ttl', true, $windowSeconds);
+        }
+    } else {
+        // 降级：使用 CacheInterface（非原子，但可接受）
+        $count = $this->cache->get($currentKey) ?? 0;
+        $count++;
+        $this->cache->set($currentKey, $count, $windowSeconds);
+    }
+
+    // 读取窗口内所有桶的总和
+    $totalCount = 0;
+    for ($i = 0; $i < $bucketCount; $i++) {
+        $bucketId = $currentBucket - $i;
+        $key = $prefix . $bucketId;
+        $bucketValue = $this->cache->get($key) ?? 0;
+        $totalCount += (int)$bucketValue;
+    }
+
+    return $totalCount;
+}
+```
+
+**SQLiteCache 原子递增替代方案**：
+
+```php
+// 利用 SQLite 的 INSERT OR REPLACE 实现原子计数
+public function inc(string $key, int $step = 1, ?int $ttl = null): int
+{
+    $cacheKey = $this->createCacheKey($key);
+    $expiration = $ttl ? time() + $ttl : 0;
+
+    $this->db->exec('BEGIN IMMEDIATE'); // 排他锁
+    $stmt = $this->db->prepare(
+        'INSERT INTO storage (key, value, updated) VALUES (:key, :value, :exp)
+         ON CONFLICT(key) DO UPDATE SET value = value + :step, updated = :exp'
+    );
+    $stmt->bindValue(':key', $cacheKey, \SQLITE3_BLOB);
+    $stmt->bindValue(':value', $step, \SQLITE3_INTEGER);
+    $stmt->bindValue(':step', $step, \SQLITE3_INTEGER);
+    $stmt->bindValue(':exp', $expiration, \SQLITE3_INTEGER);
+    $stmt->execute();
+    $this->db->exec('COMMIT');
+
+    $result = $this->db->querySingle(
+        "SELECT value FROM storage WHERE key = '" . bin2hex($cacheKey) . "'"
+    );
+    return (int)$result;
+}
+```
+
+#### 9.4.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| 窗口类型 | 固定 5 天 | 滑动 1 天（可配） |
+| 边界穿透 | 存在 | 消除 |
+| 并发安全 | 非原子 | APCu 原子 / SQLite 排他锁 |
+| 存储开销 | 1 个 key | 24 个桶 key |
+| 精度 | 5 天内粗略计数 | 1 小时粒度精确计数 |
+| 配置兼容 | `report_limit = 1` 含义不变 | 不变，但统计基础更精确 |
+
+---
+
+### 9.5 token 缓存白名单
+
+#### 9.5.1 问题定位
+
+**文件**: `middlewares/CacheMiddleware.php:24`, `actions/DisplayAction.php:50`
+
+缓存 Key 包含全部 GET 参数。当启用 Token 认证后，不同用户使用不同 token 产生不同 Key，缓存完全隔离，命中率趋近于 0。
+
+```php
+// 当前实现 - 完整参数作为 Key
+$cacheKey = 'http_' . json_encode($request->toArray());
+
+// 同一桥、同一格式，但 token 不同：
+// Key1: http_{"action":"Display","bridge":"Foo","format":"Atom","token":"abc123"}
+// Key2: http_{"action":"Display","bridge":"Foo","format":"Atom","token":"def456"}
+// → 两个完全独立的缓存条目，源站承受双倍请求
+```
+
+#### 9.5.2 改造方案：白名单过滤缓存 Key
+
+```php
+// middlewares/CacheMiddleware.php - 改造后
+private const CACHE_EXCLUDE_PARAMS = [
+    'token',          // 认证 token，不影响输出内容
+    '_',              // RSS 阅读器缓存破坏参数
+    '_error_time',    // 错误时间戳
+];
+
+private function createCacheKey(Request $request): string
+{
+    $params = $request->toArray();
+    foreach (self::CACHE_EXCLUDE_PARAMS as $exclude) {
+        unset($params[$exclude]);
+    }
+    ksort($params); // 参数排序归一化
+    return 'http_' . json_encode($params);
+}
+
+public function __invoke(Request $request, $next): Response
+{
+    $action = $request->getAttribute('action');
+    if ($action !== 'DisplayAction') {
+        return $next($request);
+    }
+
+    $cacheKey = $this->createCacheKey($request);
+    // ... 后续逻辑不变
+}
+```
+
+**DisplayAction 同步改造**：
+
+```php
+// actions/DisplayAction.php:50 - 同步改造
+$cacheKey = $this->createCacheKey($request);
+
+// 抽取公共方法
+private function createCacheKey(Request $request): string
+{
+    $params = $request->toArray();
+    foreach (CacheMiddleware::CACHE_EXCLUDE_PARAMS as $exclude) {
+        unset($params[$exclude]);
+    }
+    ksort($params);
+    return 'http_' . json_encode($params);
+}
+```
+
+**进一步优化：缓存 Key 工厂**：
+
+```php
+// lib/CacheKeyFactory.php - 新增文件
+final class CacheKeyFactory
+{
+    private const EXCLUDE_PARAMS = [
+        'token',
+        '_',
+        '_error_time',
+    ];
+
+    public static function forRequest(Request $request): string
+    {
+        $params = $request->toArray();
+        foreach (self::EXCLUDE_PARAMS as $exclude) {
+            unset($params[$exclude]);
+        }
+        ksort($params);
+        return 'http_' . json_encode($params);
+    }
+
+    public static function forBridgeError(string $bridgeName, int $code): string
+    {
+        return 'error_reporting_' . $bridgeName . '_' . $code;
+    }
+
+    public static function forServerCache(string $url, ?string $bodyHash = null): string
+    {
+        return implode('_', ['server', $url, $bodyHash]);
+    }
+}
+```
+
+#### 9.5.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| Token 用户缓存 | 完全隔离 | 共享（Token 不影响输出内容） |
+| `_` 参数影响 | 每次请求不同 Key | 忽略，Key 稳定 |
+| 参数顺序影响 | `?a=1&b=2` ≠ `?b=2&a=1` | `ksort` 归一化，Key 相同 |
+| 缓存命中率（Token 开启） | 极低 | 大幅提升 |
+| 安全性 | 无影响（Token 鉴权在缓存之前） | 无影响 |
+
+---
+
+### 9.6 URL 查询参数字段级 redact
+
+#### 9.6.1 问题定位
+
+**文件**: `lib/logger.php:128`, `lib/logger.php:175`
+
+日志中 `$record['context']['url'] = get_current_url()` 完整记录请求 URL，包含 `token` 等敏感查询参数。
+
+```php
+// 当前实现 - 完整 URL
+$record['context']['url'] = get_current_url();
+
+// 日志输出示例：
+// {"url":"https://example.com/?action=Display&bridge=Twitter&token=secret123&user=elonmusk"}
+//                                                 ^^^^^^^^^^^^^^^^ 敏感信息泄露
+```
+
+#### 9.6.2 改造方案：字段级 redact
+
+```php
+// lib/utils.php - 新增函数
+function redact_url(string $url): string
+{
+    $parsed = parse_url($url);
+    if (!isset($parsed['query'])) {
+        return $url;
+    }
+
+    parse_str($parsed['query'], $params);
+
+    $sensitiveKeys = [
+        'token',
+        'password',
+        'secret',
+        'api_key',
+        'apikey',
+        'access_token',
+        'refresh_token',
+        'session',
+        'session_id',
+        'auth',
+    ];
+
+    foreach ($params as $key => $value) {
+        $keyLower = strtolower($key);
+        foreach ($sensitiveKeys as $sensitive) {
+            if ($keyLower === $sensitive || str_contains($keyLower, $sensitive)) {
+                $params[$key] = '[REDACTED]';
+                break;
+            }
+        }
+    }
+
+    $parsed['query'] = http_build_query($params);
+    return self::buildUrl($parsed);
+}
+
+private static function buildUrl(array $parsed): string
+{
+    $scheme   = ($parsed['scheme'] ?? 'https') . '://';
+    $host     = $parsed['host'] ?? '';
+    $port     = isset($parsed['port']) ? ':' . $parsed['port'] : '';
+    $path     = $parsed['path'] ?? '';
+    $query    = isset($parsed['query']) ? '?' . $parsed['query'] : '';
+    $fragment = isset($parsed['fragment']) ? '#' . $parsed['fragment'] : '';
+    return $scheme . $host . $port . $path . $query . $fragment;
+}
+```
+
+**集成到 Logger**：
+
+```php
+// lib/logger.php - StreamHandler 和 ErrorLogHandler 共同改造
+public function __invoke(array $record)
+{
+    if (isset($record['context']['e'])) {
+        // ... 原有脱敏逻辑 ...
+        $record['context']['url'] = redact_url(get_current_url());  // ← 改造点
+    }
+    // ...
+}
+```
+
+**扩展：桥配置 API Key 脱敏**：
+
+```php
+// 桥的 CONFIGURATION 常量中标记敏感字段
+const CONFIGURATION = [
+    'api_key' => [
+        'required'      => true,
+        'sensitive'     => true,  // ← 新增标记
+        'defaultValue'  => '',
+    ],
+];
+
+// DisplayAction::createFeedItemFromException 中脱敏
+$exceptionMessage = create_sane_exception_message($e);
+if (method_exists($bridge, 'getConfiguration')) {
+    foreach ($bridge::CONFIGURATION as $key => $config) {
+        if (!empty($config['sensitive'])) {
+            $exceptionMessage = preg_replace(
+                '/' . preg_quote($bridge->getOption($key), '/') . '/',
+                '[REDACTED]',
+                $exceptionMessage
+            );
+        }
+    }
+}
+```
+
+#### 9.6.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| URL 日志 | `?token=secret123` | `?token=[REDACTED]` |
+| 覆盖范围 | 仅路径脱敏 | URL 查询参数 + 桥配置值 |
+| 性能 | 无开销 | `parse_url` + `parse_str` + 重建，< 0.1ms |
+| 误 redact 风险 | 无 | 包含 `token` 子串的参数名被 redact（可接受） |
+| 调试能力 | 完整 URL 可复现 | 需从其他来源获取 token |
+
+---
+
+### 9.7 4 级脱敏采样
+
+#### 9.7.1 问题定位
+
+**文件**: `lib/logger.php:69-100`
+
+四级日志（DEBUG/INFO/WARNING/ERROR）统一走相同的脱敏流程。DEBUG 级别日志量大但价值低，ERROR 级别日志量少但价值高。当前没有采样机制，在高流量场景下 DEBUG 日志可能占满磁盘。
+
+```php
+// 当前实现 - 所有级别同等处理
+private function log(int $level, string $message, array $context = []): void
+{
+    // 过滤逻辑 ...
+    foreach ($this->handlers as $handler) {
+        $handler([...]);  // 每条日志都输出
+    }
+}
+```
+
+#### 9.7.2 改造方案：分级采样率
+
+```php
+// lib/logger.php - 改造后
+final class SimpleLogger implements Logger
+{
+    private string $name;
+    private array $handlers;
+
+    // 每级日志的采样率（0.0~1.0）
+    private array $sampleRates = [
+        Logger::DEBUG   => 0.1,  // 10% 的 DEBUG 日志输出
+        Logger::INFO    => 0.5,  // 50% 的 INFO 日志输出
+        Logger::WARNING => 1.0,  // 100% WARNING
+        Logger::ERROR   => 1.0,  // 100% ERROR
+    ];
+
+    public function setSampleRate(int $level, float $rate): void
+    {
+        if ($rate < 0.0) $rate = 0.0;
+        if ($rate > 1.0) $rate = 1.0;
+        $this->sampleRates[$level] = $rate;
+    }
+
+    private function log(int $level, string $message, array $context = []): void
+    {
+        // 原有过滤逻辑 ...
+
+        // 采样检查
+        $sampleRate = $this->sampleRates[$level] ?? 1.0;
+        if ($sampleRate < 1.0 && mt_rand() / mt_getrandmax() > $sampleRate) {
+            return; // 被采样丢弃
+        }
+
+        foreach ($this->handlers as $handler) {
+            $handler([...]);
+        }
+    }
+}
+```
+
+**配置化采样率**：
+
+```ini
+; config.ini.php 新增
+[logging]
+sample_rate_debug   = 0.1
+sample_rate_info    = 0.5
+sample_rate_warning = 1.0
+sample_rate_error   = 1.0
+```
+
+```php
+// lib/dependencies.php - 读取配置
+$container['logger'] = function () {
+    $logger = new SimpleLogger('rssbridge');
+
+    // 设置采样率
+    $logger->setSampleRate(Logger::DEBUG,   (float)(Configuration::getConfig('logging', 'sample_rate_debug') ?? 0.1));
+    $logger->setSampleRate(Logger::INFO,    (float)(Configuration::getConfig('logging', 'sample_rate_info') ?? 0.5));
+    $logger->setSampleRate(Logger::WARNING, (float)(Configuration::getConfig('logging', 'sample_rate_warning') ?? 1.0));
+    $logger->setSampleRate(Logger::ERROR,   (float)(Configuration::getConfig('logging', 'sample_rate_error') ?? 1.0));
+
+    // ... handler 注册 ...
+    return $logger;
+};
+```
+
+**脱敏深度按级别递减**：
+
+```php
+// 不同级别使用不同脱敏深度
+private function sanitizeContext(array $context, int $level): array
+{
+    if (!isset($context['e'])) {
+        return $context;
+    }
+
+    // ERROR: 完整脱敏（保留 message, file, line, trace, url）
+    // WARNING: 保留 message, file, line（去掉 trace, url）
+    // INFO: 保留 message, file（去掉 line, trace, url）
+    // DEBUG: 最小化（仅 type, code, message）
+
+    $e = $context['e'];
+    unset($context['e']);
+    $context['type'] = get_class($e);
+    $context['code'] = $e->getCode();
+
+    switch ($level) {
+        case Logger::ERROR:
+            $context['message'] = sanitize_root($e->getMessage());
+            $context['file']    = sanitize_root($e->getFile());
+            $context['line']    = $e->getLine();
+            $context['url']     = redact_url(get_current_url());
+            $context['trace']   = trace_to_call_points(trace_from_exception($e));
+            break;
+        case Logger::WARNING:
+            $context['message'] = sanitize_root($e->getMessage());
+            $context['file']    = sanitize_root($e->getFile());
+            $context['line']    = $e->getLine();
+            break;
+        case Logger::INFO:
+            $context['message'] = sanitize_root($e->getMessage());
+            $context['file']    = sanitize_root($e->getFile());
+            break;
+        case Logger::DEBUG:
+            $context['message'] = sanitize_root($e->getMessage());
+            break;
+    }
+
+    return $context;
+}
+```
+
+#### 9.7.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| DEBUG 日志量 | 100% | 10%（可配） |
+| INFO 日志量 | 100% | 50%（可配） |
+| WARNING/ERROR | 100% | 100%（不变） |
+| 脱敏深度 | 统一完整 | 按级别递减 |
+| 磁盘占用 | 高（尤其 dev 模式） | 可控 |
+| 调试能力 | 完整 | 采样可能导致偶发问题难以复现 |
+
+**安全兜底**：ERROR 级别永远 100% 采样 + 最完整脱敏，确保关键错误不丢失。
+
+---
+
+### 9.8 无连接中断的监控指标
+
+#### 9.8.1 问题定位
+
+代码库无 `connection_aborted()` / `ignore_user_abort()` 调用。客户端断开连接后，PHP 继续执行 `collectData()`，浪费服务器资源。当前没有任何指标可观测此问题。
+
+#### 9.8.2 改造方案：Prometheus 风格监控指标
+
+```php
+// lib/Metrics.php - 新增文件
+final class Metrics
+{
+    private static array $counters = [];
+    private static array $histograms = [];
+    private static array $gauges = [];
+
+    public static function inc(string $name, array $labels = []): void
+    {
+        $key = self::key($name, $labels);
+        if (!isset(self::$counters[$key])) {
+            self::$counters[$key] = 0;
+        }
+        self::$counters[$key]++;
+    }
+
+    public static function observe(string $name, float $value, array $labels = []): void
+    {
+        $key = self::key($name, $labels);
+        if (!isset(self::$histograms[$key])) {
+            self::$histograms[$key] = [];
+        }
+        self::$histograms[$key][] = $value;
+    }
+
+    public static function gauge(string $name, float $value, array $labels = []): void
+    {
+        $key = self::key($name, $labels);
+        self::$gauges[$key] = $value;
+    }
+
+    public static function render(): string
+    {
+        $output = '';
+        foreach (self::$counters as $key => $value) {
+            $output .= sprintf("%s %d\n", $key, $value);
+        }
+        foreach (self::$gauges as $key => $value) {
+            $output .= sprintf("%s %f\n", $key, $value);
+        }
+        return $output;
+    }
+
+    private static function key(string $name, array $labels): string
+    {
+        if (empty($labels)) return 'rssbridge_' . $name;
+        $labelStr = implode(',', array_map(
+            fn($k, $v) => sprintf('%s="%s"', $k, $v),
+            array_keys($labels),
+            array_values($labels)
+        ));
+        return sprintf('rssbridge_%s{%s}', $name, $labelStr);
+    }
+}
+```
+
+**集成到关键路径**：
+
+```php
+// actions/DisplayAction.php - 采集指标
+public function __invoke(Request $request): Response
+{
+    $startTime = microtime(true);
+    $bridgeName = $request->get('bridge', 'unknown');
+
+    // ... 原有逻辑 ...
+
+    $response = $this->createResponse($request, $bridge, $format);
+
+    $duration = microtime(true) - $startTime;
+    Metrics::observe('request_duration_seconds', $duration, [
+        'bridge'  => $bridgeName,
+        'status'  => $response->getCode(),
+        'format'  => $format,
+    ]);
+
+    Metrics::inc('requests_total', [
+        'bridge'  => $bridgeName,
+        'status'  => $response->getCode(),
+    ]);
+
+    return $response;
+}
+
+// middlewares/CacheMiddleware.php - 缓存指标
+public function __invoke(Request $request, $next): Response
+{
+    $cacheKey = $this->createCacheKey($request);
+    $cachedResponse = $this->cache->get($cacheKey);
+
+    if ($cachedResponse) {
+        Metrics::inc('cache_hits_total', ['action' => $action]);
+        return $cachedResponse;
+    }
+
+    Metrics::inc('cache_misses_total', ['action' => $action]);
+    $response = $next($request);
+    // ...
+}
+```
+
+**连接中断检测指标**：
+
+```php
+// index.php - 在响应发送后检测连接中断
+register_shutdown_function(function () use ($logger) {
+    // ... 原有致命错误处理 ...
+
+    // 连接中断检测
+    if (connection_aborted()) {
+        Metrics::inc('client_disconnects_total', [
+            'bridge' => $currentBridge ?? 'unknown',
+        ]);
+        $logger->info('Client disconnected before response completed');
+    }
+});
+
+// actions/DisplayAction.php - collectData 前后记录
+private function createResponse(Request $request, BridgeAbstract $bridge, string $format)
+{
+    $items = [];
+    try {
+        Metrics::inc('bridge_collect_attempts_total', ['bridge' => $bridge->getShortName()]);
+        $bridge->collectData();
+        $items = $bridge->getItems();
+        Metrics::inc('bridge_items_count', ['bridge' => $bridge->getShortName()], count($items));
+    } catch (\Throwable $e) {
+        Metrics::inc('bridge_errors_total', [
+            'bridge' => $bridge->getShortName(),
+            'type'   => get_class($e),
+        ]);
+        // ... 原有错误处理 ...
+    }
+    // ...
+}
+```
+
+**指标暴露端点**：
+
+```php
+// actions/HealthAction.php - 扩展为 metrics 端点
+public function __invoke(Request $request): Response
+{
+    $action = $request->getAttribute('action');
+
+    if ($request->get('metrics') !== null) {
+        return new Response(Metrics::render(), 200, [
+            'content-type' => 'text/plain; version=0.0.4',
+        ]);
+    }
+
+    // 原有健康检查逻辑
+    return new Response('OK', 200);
+}
+```
+
+**关键指标清单**：
+
+| 指标名 | 类型 | 标签 | 含义 |
+|--------|------|------|------|
+| `rssbridge_requests_total` | Counter | bridge, status, format | 请求总数 |
+| `rssbridge_request_duration_seconds` | Histogram | bridge, status | 请求耗时 |
+| `rssbridge_cache_hits_total` | Counter | action | 缓存命中 |
+| `rssbridge_cache_misses_total` | Counter | action | 缓存未命中 |
+| `rssbridge_client_disconnects_total` | Counter | bridge | 客户端断开连接 |
+| `rssbridge_bridge_collect_attempts_total` | Counter | bridge | 桥采集尝试次数 |
+| `rssbridge_bridge_errors_total` | Counter | bridge, type | 桥错误次数 |
+| `rssbridge_bridge_items_count` | Gauge | bridge | 桥返回条目数 |
+| `rssbridge_http_client_requests_total` | Counter | status | HTTP 客户端请求总数 |
+
+#### 9.8.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| 可观测性 | 仅日志 | 日志 + Prometheus 指标 |
+| 连接中断感知 | 不可知 | `client_disconnects_total` 可观测 |
+| 性能影响 | 无 | 内存中累加计数器，< 0.01ms/op |
+| 部署依赖 | 无 | 可选：Prometheus 抓取 / Grafana 展示 |
+| 存储 | 无 | 进程内存（请求结束即清空，需导出） |
+
+**导出策略**：
+- **单进程**：`register_shutdown_function` 中写入 APCu
+- **FPM 多进程**：APCu 共享内存 + `/health?metrics` 端点供 Prometheus 抓取
+- **外部存储**：写入 SQLite 或 FileCache 持久化
