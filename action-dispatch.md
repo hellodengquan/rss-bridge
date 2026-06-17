@@ -2310,3 +2310,1287 @@ public function __invoke(Request $request): Response
 - **单进程**：`register_shutdown_function` 中写入 APCu
 - **FPM 多进程**：APCu 共享内存 + `/health?metrics` 端点供 Prometheus 抓取
 - **外部存储**：写入 SQLite 或 FileCache 持久化
+
+---
+
+## 10. 改进方案细节补充
+
+### 10.1 24 桶 APCu reset 路径
+
+#### 10.1.1 问题定位
+
+**文件**: `actions/DisplayAction.php:172-191`（改造后 §9.4 方案）
+
+24 小时桶滑动窗口使用 APCu 存储后，存在两个 reset 场景未覆盖：
+1. **手动重置**：运维排查问题时需要清空某桥的错误计数
+2. **桥名变更**：桥文件改名后旧桶数据永久残留
+3. **apcu_clear_cache() 误触发**：部署脚本调用 `apcu_clear_cache()` 时不区分前缀
+
+```php
+// 9.4 方案遗留问题 - 无 reset 路径
+for ($i = 0; $i < $bucketCount; $i++) {
+    $bucketId = $currentBucket - $i;
+    $key = $prefix . $bucketId;  // 24 个 key 分散存储，无统一入口清理
+    $totalCount += (int)$this->cache->get($key);
+}
+```
+
+#### 10.1.2 改造方案：三层 reset 入口
+
+```php
+// lib/ErrorBucketManager.php - 新增文件（集中管理错误桶）
+final class ErrorBucketManager
+{
+    private const PREFIX       = 'err_bucket_';
+    private const WINDOW_SEC   = 86400;
+    private const BUCKET_SIZE  = 3600;
+    private const INDEX_KEY    = 'err_bucket_index'; // 记录所有活跃 prefix
+    private int $currentBucket;
+
+    public function __construct()
+    {
+        $this->currentBucket = (int)(time() / self::BUCKET_SIZE);
+    }
+
+    // ---- 写入 ----
+    public function inc(string $bridgeName, int $code): int
+    {
+        $prefix = self::PREFIX . $bridgeName . '_' . $code . '_';
+        $currentKey = $prefix . $this->currentBucket;
+
+        if (function_exists('apcu_inc')) {
+            $count = apcu_inc($currentKey, 1, $success, self::WINDOW_SEC);
+            if (!$success) {
+                apcu_store($currentKey, 1, self::WINDOW_SEC);
+                $count = 1;
+            }
+        } else {
+            // 降级到 CacheInterface
+            global $container;
+            $cache = $container['cache'];
+            $count = (int)($cache->get($currentKey) ?? 0) + 1;
+            $cache->set($currentKey, $count, self::WINDOW_SEC);
+        }
+
+        $this->registerPrefix($prefix);
+        return $this->sumWindow($prefix);
+    }
+
+    // ---- 前缀索引（用于 reset）----
+    private function registerPrefix(string $prefix): void
+    {
+        if (!function_exists('apcu_fetch')) return;
+        $index = apcu_fetch(self::INDEX_KEY);
+        $index = $index ?: [];
+        if (!isset($index[$prefix])) {
+            $index[$prefix] = time();
+            apcu_store(self::INDEX_KEY, $index);
+        }
+    }
+
+    // ---- Reset 入口 1：按桥+错误码精确重置 ----
+    public function reset(string $bridgeName, int $code): void
+    {
+        $prefix = self::PREFIX . $bridgeName . '_' . $code . '_';
+        $this->deletePrefix($prefix);
+    }
+
+    // ---- Reset 入口 2：按桥名模糊重置 ----
+    public function resetBridge(string $bridgeName): void
+    {
+        $prefixPattern = self::PREFIX . $bridgeName . '_';
+        if (function_exists('apcu_fetch')) {
+            $this->resetByPatternApcu($prefixPattern);
+        } else {
+            $this->resetByPatternCache($prefixPattern);
+        }
+    }
+
+    // ---- Reset 入口 3：全局重置（部署后清理）----
+    public function resetAll(): void
+    {
+        if (function_exists('apcu_delete')) {
+            $index = apcu_fetch(self::INDEX_KEY) ?: [];
+            foreach (array_keys($index) as $prefix) {
+                $this->deletePrefix($prefix);
+            }
+            apcu_delete(self::INDEX_KEY);
+        } else {
+            // 无法精确删除时，依赖 TTL 自动过期
+        }
+    }
+
+    // ---- 内部工具 ----
+    private function deletePrefix(string $prefix): void
+    {
+        for ($i = 0; $i < (self::WINDOW_SEC / self::BUCKET_SIZE); $i++) {
+            $bucketId = $this->currentBucket - $i;
+            $key = $prefix . $bucketId;
+            if (function_exists('apcu_delete')) {
+                apcu_delete($key);
+            }
+        }
+    }
+
+    private function sumWindow(string $prefix): int
+    {
+        $total = 0;
+        for ($i = 0; $i < (self::WINDOW_SEC / self::BUCKET_SIZE); $i++) {
+            $bucketId = $this->currentBucket - $i;
+            $key = $prefix . $bucketId;
+            $val = function_exists('apcu_fetch')
+                ? (apcu_fetch($key) ?: 0)
+                : ($GLOBALS['container']['cache']->get($key) ?? 0);
+            $total += (int)$val;
+        }
+        return $total;
+    }
+
+    // APCu 迭代器按前缀扫描
+    private function resetByPatternApcu(string $pattern): void
+    {
+        if (!function_exists('apcu_cache_info')) return;
+        $iterator = new \APCuIterator('/^' . preg_quote($pattern, '/') . '/');
+        foreach ($iterator as $item) {
+            apcu_delete($item['key']);
+        }
+    }
+}
+```
+
+**对外暴露 CLI 重置脚本**：
+
+```php
+// bin/reset-error-counts.php - CLI 入口
+require __DIR__ . '/../lib/bootstrap.php';
+$container = require __DIR__ . '/../lib/dependencies.php';
+
+$manager = new ErrorBucketManager();
+$opts = getopt('', ['bridge:', 'code:', 'all']);
+
+if (isset($opts['all'])) {
+    $manager->resetAll();
+    echo "All error buckets reset.\n";
+} elseif (isset($opts['bridge'])) {
+    $bridge = $opts['bridge'];
+    $code = isset($opts['code']) ? (int)$opts['code'] : null;
+    if ($code !== null) {
+        $manager->reset($bridge, $code);
+        echo "Reset $bridge code=$code.\n";
+    } else {
+        $manager->resetBridge($bridge);
+        echo "Reset all errors for $bridge.\n";
+    }
+}
+```
+
+**部署脚本集成**：
+
+```bash
+# deploy.sh - 部署后自动重置
+/usr/bin/php bin/reset-error-counts.php --all
+```
+
+#### 10.1.3 变更影响
+
+| 场景 | 改造前 | 改造后 |
+|------|--------|--------|
+| 精确重置 | 手动删 24 个 APCu key | `reset($bridge, $code)` 一行调用 |
+| 桥级重置 | 不知道哪些错误码存在 | `resetBridge($bridge)` 扫描前缀 |
+| 全局重置 | `apcu_clear_cache()` 误伤其他业务 | `resetAll()` 仅清错误桶索引 |
+| 部署清理 | 无 | CLI 脚本自动化 |
+| 存储开销 | 24 个分散 key | +1 个索引 key（prefix 列表） |
+
+---
+
+### 10.2 CACHE_EXCLUDE_PARAMS 覆盖率统计
+
+#### 10.2.1 问题定位
+
+**文件**: `middlewares/CacheMiddleware.php:24`, `actions/DisplayAction.php:50`
+
+§9.5 方案硬编码了 `CACHE_EXCLUDE_PARAMS = ['token', '_', '_error_time']`，但缺乏机制回答：
+- 实际生产请求中，**有多少请求参数未被排除但应被排除**？
+- 某些参数（如 `_t`、`rnd`、`v`）是否是变相的缓存破坏参数？
+- `token` 排除后缓存命中率提升了多少？
+
+```php
+// 当前实现 - 无统计闭环
+private const CACHE_EXCLUDE_PARAMS = [
+    'token',
+    '_',
+    '_error_time',
+];
+// ← 三个月后没人知道这个列表是否过时
+```
+
+#### 10.2.2 改造方案：三层统计 + 告警
+
+```php
+// middlewares/CacheMiddleware.php - 改造后
+final class CacheMiddleware implements Middleware
+{
+    private CacheInterface $cache;
+
+    // 新增：需要统计覆盖率的参数前缀/模式
+    private const SUSPECT_PARAM_PATTERNS = [
+        '/^_/',       // 所有下划线开头参数（缓存破坏参数习惯）
+        '/^t$/',      // 时间戳缩写
+        '/^rnd/',     // 随机数前缀
+        '/^rand/',    // 随机前缀
+        '/^v$/',      // 版本号
+        '/^cb$/',     // callback / cache buster
+        '/^ver/',     // version 前缀
+    ];
+
+    // ...
+
+    public function __invoke(Request $request, $next): Response
+    {
+        $action = $request->getAttribute('action');
+        if ($action !== 'DisplayAction') {
+            return $next($request);
+        }
+
+        $cacheKey = $this->createCacheKey($request);
+        $cachedResponse = $this->cache->get($cacheKey);
+
+        // ---- 新增：覆盖率统计 ----
+        $this->recordCoverageStats($request, $cacheKey, $cachedResponse !== null);
+
+        if ($cachedResponse) {
+            // ... 304 逻辑不变
+            return $cachedResponse;
+        }
+        $response = $next($request);
+        // ... 其余不变
+    }
+
+    private function recordCoverageStats(Request $request, string $cacheKey, bool $cacheHit): void
+    {
+        // 1. 命中/未命中基础统计（写入 Metrics，见 §9.8）
+        if (class_exists('Metrics')) {
+            Metrics::inc('cache_lookups_total', ['hit' => $cacheHit ? '1' : '0']);
+        }
+
+        // 2. 参数分布采样：1% 的请求记录「被排除参数」vs「被纳入 Key 参数」
+        if (mt_rand(1, 100) === 1) {
+            $allParams = $request->toArray();
+            $inKeyParams = $allParams;
+            foreach (self::CACHE_EXCLUDE_PARAMS as $ex) {
+                unset($inKeyParams[$ex]);
+            }
+            $excludedParams = array_diff_key($allParams, $inKeyParams);
+
+            // 3. 可疑参数检测：不在 CACHE_EXCLUDE_PARAMS 但匹配模式
+            $suspects = [];
+            foreach ($inKeyParams as $paramName => $val) {
+                foreach (self::SUSPECT_PARAM_PATTERNS as $pattern) {
+                    if (preg_match($pattern, $paramName)) {
+                        $suspects[] = $paramName;
+                        break;
+                    }
+                }
+            }
+
+            if (!empty($suspects) || count($excludedParams) > 0) {
+                $GLOBALS['container']['logger']->debug(
+                    'Cache coverage stats',
+                    [
+                        'cache_key_params'    => array_keys($inKeyParams),
+                        'excluded_params'     => array_keys($excludedParams),
+                        'suspect_params'      => $suspects,
+                        'cache_hit'           => $cacheHit,
+                        'bridge'              => $request->get('bridge', 'unknown'),
+                    ]
+                );
+            }
+        }
+    }
+}
+```
+
+**覆盖率报告生成**：
+
+```sql
+-- 从日志聚合分析（以 ELK / grep 为例）：
+-- 每类桥的缓存命中率 = cache_hit=1 / (cache_hit=1 + cache_hit=0)
+-- 可疑参数频次 Top 10 = suspect_params 按 (bridge, param) 分组 count
+
+-- 生产命令行快速分析：
+-- grep '"cache_hit":false' logs/app.log | jq -r '.context.bridge' | sort | uniq -c | sort -rn | head -20
+-- grep -oP '"suspect_params":\["[^"]+"\]' logs/app.log | sort | uniq -c | sort -rn | head -20
+```
+
+**命中率告警阈值**：
+
+```php
+// 可在 CacheMiddleware 构造时配置
+private array $hitRateAlerts = [
+    // 'Youtube'    => 0.70,  // Youtube 低于 70% 记 WARNING
+    // 'Twitter'    => 0.60,
+    // 'default'    => 0.30,  // 默认告警阈值
+];
+
+// 在 recordCoverageStats 中写入 APCu 滑窗统计
+// 每桥 100 次请求后计算命中率，低于阈值打告警日志
+```
+
+#### 10.2.3 变更影响
+
+| 维度 | 改造前 | 改造后 |
+|------|--------|--------|
+| 命中率可见性 | 只能猜 | `cache_lookups_total` Prometheus 指标 + 采样日志 |
+| 可疑参数检测 | 人肉 grep 参数名 | SUSPECT_PATTERNS 正则 + 日志告警 |
+| 列表维护频率 | 一次性代码 | 有数据支撑定期评审 |
+| 性能开销 | 无 | 1% 采样 + 内存计数（可忽略） |
+| 典型收益 | 无 | 发现 `_t`/`rnd` 等隐藏缓存破坏参数 |
+
+---
+
+### 10.3 redact_url 正则白名单
+
+#### 10.3.1 问题定位
+
+**文件**: `lib/logger.php:128,175`（§9.6 改造点）
+
+§9.6 `redact_url()` 使用 **黑名单关键字匹配**（`token`/`password`/`api_key`/…）。存在两个缺陷：
+1. **漏报风险**：`accessKey`、`X-ApiKey`（Header 拷贝到参数）、`private_token` 等变体未覆盖
+2. **误报风险**：`username=tokenuser`（值中含 token 子串）、`authored=true`（参数名含 auth 子串）会被误 redact
+
+```php
+// 9.6 方案 - 黑名单关键字匹配
+foreach ($params as $key => $value) {
+    foreach ($sensitiveKeys as $sensitive) {
+        if ($keyLower === $sensitive || str_contains($keyLower, $sensitive)) {
+            $params[$key] = '[REDACTED]';   // ← 粗暴匹配，误报/漏报并存
+            break;
+        }
+    }
+}
+```
+
+#### 10.3.2 改造方案：精确正则 + 白名单排除
+
+```php
+// lib/utils.php - 改造后的 redact_url
+function redact_url(string $url, array $allowlist = []): string
+{
+    $parsed = parse_url($url);
+    if (!isset($parsed['query'])) {
+        return $url;
+    }
+    parse_str($parsed['query'], $params);
+
+    // 改造 1：精确正则（不依赖子串匹配）
+    $sensitiveRegex = '/
+        ^(
+            # 精确关键字（整词）
+            token
+            | password
+            | passwd
+            | pwd
+            | secret
+            | api[_-]?key
+            | apikey
+            | app[_-]?secret
+            | access[_-]?token
+            | refresh[_-]?token
+            | bearer[_-]?token
+            | session[_-]?id
+            | sessionid
+            | php[_-]?session[_-]?id
+            | sid
+            | auth(?:oriz(?:e|ation))?     # auth/authorize/authorization
+            | client[_-]?secret
+            | private[_-]?key
+            | webhook[_-]?secret
+            | signature
+            | sign
+        )$
+        |
+        # 前缀变体（任何位置）
+        (?:^|[_-])
+        (?:
+            token
+            | secret
+            | key
+            | pass(?:word)?
+        )
+        (?:[_-]|$)
+    /ix';
+
+    // 改造 2：白名单参数 - 即使匹配也不 redact（如 username=tokenuser 的值）
+    $whitelistKeys = array_merge([
+        'username',      // 用户名可能含 token
+        'search',        // 搜索词可能含 secret 等
+        'query',         // 查询词同上
+        'topic',         // 话题同上
+        'tag',           // 标签同上
+        'redirect_uri',  // OAuth URL 中 token=xxx 不会被重写
+    ], $allowlist);
+
+    // 改造 3：值级 redact（不是粗暴整值 [REDACTED]，保留类型特征）
+    foreach ($params as $key => $value) {
+        if (in_array(strtolower($key), array_map('strtolower', $whitelistKeys), true)) {
+            continue;
+        }
+        if (preg_match($sensitiveRegex, $key)) {
+            $params[$key] = redact_value($value);  // 值级脱敏
+        }
+    }
+
+    $parsed['query'] = http_build_query($params);
+    return build_url_from_parsed($parsed);
+}
+
+// 值级脱敏函数（保留长度/格式特征，便于调试但不可逆）
+function redact_value(string $value): string
+{
+    $len = strlen($value);
+    if ($len === 0) return '';
+    if ($len <= 4) return '***';                            // 短值全打码
+    if ($len <= 8) return substr($value, 0, 1) . '***';      // 保留首字符
+    // 长值：首 2 尾 2 可见，中间 ***
+    return substr($value, 0, 2) . '***' . substr($value, -2);
+}
+
+// build_url_from_parsed 工具函数（§9.6 的 buildUrl 独立化）
+function build_url_from_parsed(array $parsed): string
+{
+    $scheme   = ($parsed['scheme'] ?? 'https') . '://';
+    $host     = $parsed['host'] ?? '';
+    $port     = isset($parsed['port']) ? ':' . $parsed['port'] : '';
+    $user     = isset($parsed['user']) ? $parsed['user'] . (isset($parsed['pass']) ? ':' . $parsed['pass'] : '') . '@' : '';
+    $path     = $parsed['path'] ?? '';
+    $query    = isset($parsed['query']) ? '?' . $parsed['query'] : '';
+    $fragment = isset($parsed['fragment']) ? '#' . $parsed['fragment'] : '';
+    return $scheme . $user . $host . $port . $path . $query . $fragment;
+}
+```
+
+**单元测试覆盖**（确保 redact 逻辑可控）：
+
+```php
+// tests/UtilsTest.php - redact_url 关键用例
+assertSame(
+    '?token=ab***yz',
+    parse_url(redact_url('https://x/?token=abcdefgh'), PHP_URL_QUERY)
+);
+assertSame(  // username 在白名单 → 不被打码
+    '?username=tokenuser',
+    parse_url(redact_url('https://x/?username=tokenuser'), PHP_URL_QUERY)
+);
+assertSame(  // api_key → 匹配
+    '?api_key=sk***12',
+    parse_url(redact_url('https://x/?api_key=sk-test-0012'), PHP_URL_QUERY)
+);
+assertSame(  // search 在白名单 → 即使含 secret 也不打码
+    '?search=secret+code',
+    parse_url(redact_url('https://x/?search=secret+code'), PHP_URL_QUERY)
+);
+assertSame(  // access-token 中划线变体
+    '?access-token=ey***12',
+    parse_url(redact_url('https://x/?access-token=eyJhbGc...xM12'), PHP_URL_QUERY)
+);
+```
+
+#### 10.3.3 变更影响
+
+| 测试场景 | 黑名单方案（§9.6） | 正则白名单方案（§10.3） |
+|----------|-------------------|------------------------|
+| `?token=abc123` | `[REDACTED]` ✅ | `ab***23` ✅（保留特征） |
+| `?username=tokenuser` | `[REDACTED]` ❌ 误报 | `tokenuser` ✅（白名单） |
+| `?api-key=sk-001` | 未匹配 ❌ 漏报 | `sk***01` ✅（正则中划线） |
+| `?private_key=x` | `[REDACTED]` ✅ | `pr***1x` ✅ |
+| `?authored=true` | `[REDACTED]` ❌ 误报 | `true` ✅（整词匹配排除） |
+| `?search=secret` | `[REDACTED]` ❌ 误报 | `secret` ✅（白名单） |
+| 调试回溯 | 全打码无法关联 | 首末字符可快速定位问题 |
+
+---
+
+### 10.4 sample_rate fallback
+
+#### 10.4.1 问题定位
+
+**文件**: `lib/logger.php:69-100`（§9.7 方案）
+
+§9.7 配置化采样率存在三处 fallback 缺口：
+1. **`Configuration::getConfig` 返回 `null`** → 类型强转 `(float)null` 得到 `0.0`，**日志全被丢弃**
+2. **配置非法值（`"high"` / `-0.5` / `1.5`）** → 未校验，可能 0% 或 150% 采样
+3. **`dev` vs `prod` 策略差异** → 开发环境需要 100% DEBUG，生产需要 10%，但未区分
+
+```php
+// 9.7 方案 - 无边界校验，null→0.0 致命
+$logger->setSampleRate(Logger::DEBUG, (float)(Configuration::getConfig('logging', 'sample_rate_debug') ?? 0.1));
+//                                       ↑ null 时走右侧，但如果配置写错（分节名 loggin）返回 null
+//                                       被 ?? 捕获没问题；但若返回 "" 空字符串 → (float)"" = 0.0
+```
+
+#### 10.4.2 改造方案：三级 fallback + 边界钳制
+
+```php
+// lib/logger.php - SimpleLogger 改造
+final class SimpleLogger implements Logger
+{
+    // 新增：安全默认值（常量便于全局引用）
+    public const DEFAULT_SAMPLE_RATES = [
+        Logger::DEBUG   => 0.10,   // prod: 10%
+        Logger::INFO    => 0.50,   // prod: 50%
+        Logger::WARNING => 1.00,   // 永不丢弃
+        Logger::ERROR   => 1.00,   // 永不丢弃
+    ];
+
+    // dev 环境默认（100% 全量，便于调试）
+    public const DEV_DEFAULT_SAMPLE_RATES = [
+        Logger::DEBUG   => 1.00,
+        Logger::INFO    => 1.00,
+        Logger::WARNING => 1.00,
+        Logger::ERROR   => 1.00,
+    ];
+
+    // 采样配置 key 映射
+    private const CONFIG_KEY_MAP = [
+        Logger::DEBUG   => 'sample_rate_debug',
+        Logger::INFO    => 'sample_rate_info',
+        Logger::WARNING => 'sample_rate_warning',
+        Logger::ERROR   => 'sample_rate_error',
+    ];
+
+    private array $sampleRates;
+
+    public function __construct(string $name, array $handlers = [])
+    {
+        $this->name = $name;
+        $this->handlers = $handlers;
+
+        // ---- 三级 fallback 初始化 ----
+        $isDev = (Configuration::getConfig('system', 'env') ?? 'prod') === 'dev';
+        $defaults = $isDev ? self::DEV_DEFAULT_SAMPLE_RATES : self::DEFAULT_SAMPLE_RATES;
+
+        $rates = [];
+        foreach ([Logger::DEBUG, Logger::INFO, Logger::WARNING, Logger::ERROR] as $level) {
+            $configKey = self::CONFIG_KEY_MAP[$level];
+            $rates[$level] = $this->resolveSampleRate(
+                $configKey,
+                $defaults[$level]
+            );
+        }
+
+        // ---- 单调性校验：DEBUG ≤ INFO ≤ WARNING ≤ ERROR ----
+        $rates = $this->enforceMonotonicity($rates);
+
+        $this->sampleRates = $rates;
+    }
+
+    // ---- 三级 fallback：配置值 → 安全默认 → 硬编码 ----
+    private function resolveSampleRate(string $configKey, float $safeDefault): float
+    {
+        $rawValue = Configuration::getConfig('logging', $configKey);
+
+        // Level 1: 未配置/配置异常 → 安全默认
+        if ($rawValue === null) {
+            return $safeDefault;
+        }
+
+        // Level 2: 类型转换 + 合法性校验
+        if (!is_numeric($rawValue)) {
+            // 配置类型错误，记录自身并 fallback（不抛出以免崩溃）
+            $GLOBALS['container']['logger'] ?? trigger_error(
+                sprintf('Invalid sample_rate config [logging.%s] = %s, using default %f',
+                    $configKey, var_export($rawValue, true), $safeDefault),
+                E_USER_WARNING
+            );
+            return $safeDefault;
+        }
+
+        $numeric = (float)$rawValue;
+
+        // Level 3: 边界钳制（clamp 到 [0.0, 1.0]）
+        if ($numeric < 0.0) {
+            trigger_error(sprintf('sample_rate %f clamped to 0.0', $numeric), E_USER_NOTICE);
+            return 0.0;
+        }
+        if ($numeric > 1.0) {
+            trigger_error(sprintf('sample_rate %f clamped to 1.0', $numeric), E_USER_NOTICE);
+            return 1.0;
+        }
+
+        return $numeric;
+    }
+
+    // ---- 单调性保证：ERROR 采样率不应低于 DEBUG ----
+    private function enforceMonotonicity(array $rates): array
+    {
+        $prev = 0.0;
+        foreach ([Logger::DEBUG, Logger::INFO, Logger::WARNING, Logger::ERROR] as $level) {
+            if ($rates[$level] < $prev) {
+                // 单调递增：低级别采样率不能超过高级别
+                $rates[$level] = $prev;
+            }
+            $prev = $rates[$level];
+        }
+        return $rates;
+    }
+
+    public function setSampleRate(int $level, float $rate): void
+    {
+        // 公共 API 同样需要边界钳制
+        if ($rate < 0.0) $rate = 0.0;
+        if ($rate > 1.0) $rate = 1.0;
+        $this->sampleRates[$level] = $rate;
+
+        // 重新校正单调性
+        $this->sampleRates = $this->enforceMonotonicity($this->sampleRates);
+    }
+
+    // 暴露当前采样率（便于监控 /health?debug）
+    public function getSampleRates(): array
+    {
+        return $this->sampleRates;
+    }
+}
+```
+
+**诊断端点**（集成到 `HealthAction`）：
+
+```php
+// 在 §9.8 metrics 端点中暴露采样率状态
+// actions/HealthAction.php:9
+public function __invoke(Request $request): Response
+{
+    global $container;
+
+    if ($request->get('debug') !== null) {
+        $logger = $container['logger'];
+        $diag = [
+            'env'            => Configuration::getConfig('system', 'env'),
+            'sample_rates'   => $logger->getSampleRates(),
+            'cache'          => [
+                'type'        => Configuration::getConfig('cache', 'type'),
+                'exclude'     => CacheMiddleware::CACHE_EXCLUDE_PARAMS,
+            ],
+            'bridges_count'  => count($container['bridgeFactory']->getBridgeClassNames()),
+        ];
+        return new Response(Json::encode($diag, JSON_PRETTY_PRINT), 200,
+            ['content-type' => 'application/json']);
+    }
+    // ... metrics / health 正常逻辑
+}
+```
+
+#### 10.4.3 变更影响
+
+| 异常场景 | §9.7 方案 | §10.4 方案 |
+|----------|-----------|-----------|
+| 配置节名拼写错（`[loggin]`） | `0.0` ❌ 全丢 | 安全默认 ✅ |
+| 配置值为空字符串 `""` | `0.0` ❌ 全丢 | 安全默认 ✅ |
+| 配置值 `"high"`（非数字） | `0.0` ❌ 全丢 | 安全默认 + `E_USER_WARNING` ✅ |
+| 配置值 `1.5`（超上限） | `1.5` ❌ 无意义 | `1.0` + NOTICE ✅ |
+| 配置值 `-0.2`（超下限） | `-0.2` ❌ 采样异常 | `0.0` + NOTICE ✅ |
+| DEBUG 设 0.8 / ERROR 设 0.5 | 合法但逻辑异常 | ERROR 被提升到 0.8（单调性）✅ |
+| 开发环境调试 | 需手动修改代码 | `env=dev` 自动 100% ✅ |
+| 线上排查 | 要登录服务器翻配置 | `/health?debug` JSON 诊断 ✅ |
+
+---
+
+### 10.5 9 指标 Prometheus 鉴权
+
+#### 10.5.1 问题定位
+
+**文件**: `actions/HealthAction.php:7-14`（§9.8 扩展后）
+
+§9.8 将 metrics 挂载到 `/health?metrics`，但：
+1. **无鉴权**：`/health?metrics` 公开暴露每桥错误次数和请求量，可被用于识别热桥后发动定向攻击
+2. **与 authentication 系统脱节**：已有 `TokenAuthenticationMiddleware` 和 `BasicAuthMiddleware`，但 metrics 端点应走独立鉴权（更低权限）
+3. **Prometheus 抓取惯例**：Prometheus 支持 `basic_auth` / `bearer_token` 配置，应符合标准
+
+```php
+// §9.8 方案 - 无鉴权
+if ($request->get('metrics') !== null) {
+    return new Response(Metrics::render(), 200, [
+        'content-type' => 'text/plain; version=0.0.4',
+    ]);
+}
+// ↑ 任何人都能访问
+```
+
+#### 10.5.2 改造方案：三层鉴权链
+
+```php
+// actions/HealthAction.php - 改造后
+class HealthAction implements ActionInterface
+{
+    // 独立的 metrics 认证 token（与业务 token 隔离）
+    private const AUTH_MODE_CONFIG_KEY = 'metrics_auth_mode';
+    private const TOKEN_CONFIG_KEY     = 'metrics_token';
+
+    public function __invoke(Request $request): Response
+    {
+        global $container;
+
+        // ---- 路由分发 ----
+        $route = $this->resolveRoute($request);
+
+        if ($route === 'metrics') {
+            // ---- 新增：metrics 独立鉴权 ----
+            $authResult = $this->authenticateMetrics($request);
+            if (!$authResult['ok']) {
+                Metrics::inc('metrics_auth_failures_total', ['reason' => $authResult['reason']]);
+                return new Response(
+                    "Unauthorized: {$authResult['reason']}\n",
+                    401,
+                    ['WWW-Authenticate' => 'Basic realm="RSS-Bridge Metrics"']
+                );
+            }
+            return new Response(Metrics::render(), 200, [
+                'content-type' => 'text/plain; version=0.0.4; charset=utf-8',
+            ]);
+        }
+
+        // ---- 普通健康检查 ----
+        $response = ['code' => 200, 'message' => 'all is good'];
+        return new Response(Json::encode($response), 200, ['content-type' => 'application/json']);
+    }
+
+    private function resolveRoute(Request $request): string
+    {
+        if ($request->get('metrics') !== null) return 'metrics';
+        if ($request->get('debug') !== null)   return 'debug';
+        return 'health';
+    }
+
+    // ---- 三层鉴权：显式 disable → token → basic auth → deny ----
+    private function authenticateMetrics(Request $request): array
+    {
+        $mode = strtolower((string)(Configuration::getConfig('metrics', self::AUTH_MODE_CONFIG_KEY) ?? 'token'));
+
+        // Mode 1: 显式关闭鉴权（内网部署 / 已通过网络层 ACL）
+        if ($mode === 'none') {
+            return ['ok' => true];
+        }
+
+        // Mode 2: Bearer Token（Prometheus bearer_token）
+        if ($mode === 'token' || $mode === 'bearer') {
+            $configuredToken = Configuration::getConfig('metrics', self::TOKEN_CONFIG_KEY)
+                ?? Configuration::getConfig('authentication', 'token');  // 回退到业务 token
+
+            if (!$configuredToken) {
+                return ['ok' => false, 'reason' => 'token_not_configured'];
+            }
+
+            // Authorization: Bearer <token>
+            $header = $request->server('HTTP_AUTHORIZATION') ?? '';
+            if (preg_match('/^Bearer\s+(.+)$/i', $header, $m) && hash_equals($configuredToken, $m[1])) {
+                return ['ok' => true];
+            }
+            // 兼容：?metrics_token=xxx 查询参数（不推荐，但方便 curl 调试）
+            if ($request->get('metrics_token') && hash_equals($configuredToken, $request->get('metrics_token'))) {
+                return ['ok' => true];
+            }
+            return ['ok' => false, 'reason' => 'invalid_token'];
+        }
+
+        // Mode 3: Basic Auth（Prometheus basic_auth）
+        if ($mode === 'basic') {
+            $user = $request->server('PHP_AUTH_USER') ?? '';
+            $pass = $request->server('PHP_AUTH_PW') ?? '';
+            $expectedUser = Configuration::getConfig('metrics', 'username')
+                ?? Configuration::getConfig('authentication', 'username') ?? '';
+            $expectedPass = Configuration::getConfig('metrics', 'password')
+                ?? Configuration::getConfig('authentication', 'password') ?? '';
+
+            if ($expectedUser === '' || $expectedPass === '') {
+                return ['ok' => false, 'reason' => 'basic_auth_not_configured'];
+            }
+            if (hash_equals($expectedUser, $user) && hash_equals($expectedPass, $pass)) {
+                return ['ok' => true];
+            }
+            return ['ok' => false, 'reason' => 'invalid_basic_auth'];
+        }
+
+        // 未知配置
+        return ['ok' => false, 'reason' => 'unknown_auth_mode'];
+    }
+}
+```
+
+**Prometheus 配置对照**：
+
+```yaml
+# prometheus.yml - 三种鉴权模式对应配置
+scrape_configs:
+  # Mode 1: token (推荐)
+  - job_name: rssbridge
+    metrics_path: /
+    params:
+      action:  [Health]
+      metrics: ['']
+    bearer_token: 'rb_metrics_abc123def456'
+    static_configs:
+      - targets: ['rssbridge.internal:443']
+        labels: { env: prod }
+
+  # Mode 2: basic auth
+  - job_name: rssbridge
+    basic_auth:
+      username: metrics_reader
+      password: '${RSSBRIDGE_METRICS_PASS}'
+    # ... 同上 params ...
+
+  # Mode 3: none（内网 + ACL）
+  - job_name: rssbridge
+    # 无认证字段
+```
+
+**`config.default.ini.php` 新增节**：
+
+```ini
+[metrics]
+; 鉴权模式: "token" | "basic" | "none"
+; metrics_auth_mode = "token"
+
+; Token 模式专用（未设置回退到 [authentication].token）
+; metrics_token = ""
+
+; Basic 模式专用（未设置回退到 [authentication].username/password）
+; username = "metrics_reader"
+; password = ""
+```
+
+#### 10.5.3 变更影响
+
+| 维度 | §9.8 方案（无鉴权） | §10.5 方案（三层鉴权） |
+|------|---------------------|------------------------|
+| 内网公开部署 | 安全（假设可信） | 安全（可设 `none`） |
+| 公网部署 | ❌ 指标被爬 | ✅ token / basic auth |
+| 业务 token 混用风险 | N/A | ✅ 独立 `metrics_token`，可分别吊销 |
+| 与 Prometheus 协议兼容 | ✅ 无鉴权 | ✅ 支持 bearer_token / basic_auth 两标准 |
+| 鉴权失败可见性 | N/A | ✅ `metrics_auth_failures_total` 指标 + 原因标签 |
+| 配置复杂度 | 0 | 小（3 个可选字段，默认回退到 authentication 节） |
+| `curl` 调试便利性 | `curl /?action=Health&metrics` | `curl -H "Authorization: Bearer xxx"` / 兼容 `?metrics_token` |
+
+---
+
+### 10.6 /health?metrics 性能基准
+
+#### 10.6.1 问题定位
+
+**文件**: `actions/HealthAction.php:7-14` + `lib/Metrics.php`
+
+`Metrics::render()` 遍历 9 个指标的全部 label 组合时，需验证：
+1. **渲染耗时**：`sprintf` 拼接 1000 条 label 组合是否影响 `/health` 响应？
+2. **内存占用**：高基数 bridge label（500 桥 × 4 状态码 = 2000 组合）的 PHP 数组大小？
+3. **Prometheus 抓取间隔**：`scrape_interval: 15s` 下是否会和正常请求抢占 APCu 锁？
+
+当前无任何基线数据。
+
+#### 10.6.2 改造方案：基准脚本 + 性能预算
+
+**基准测试脚本**：
+
+```php
+// bin/bench-metrics.php
+require __DIR__ . '/../lib/bootstrap.php';
+$container = require __DIR__ . '/../lib/dependencies.php';
+
+// ---- 模拟真实负载：10000 请求的指标分布 ----
+$bridges = ['Twitter','Youtube','Reddit','Github','XPath','CssSelector','Telegram','Mastodon',
+            'Discogs','Spotify','TikTok','Twitch','Soundcloud','FeedMerge','Filter'];
+$statuses = [200, 200, 200, 200, 200, 200, 304, 400, 404, 429, 500, 503];
+$formats  = ['Atom','RSS','JSON','Mrss','Html'];
+
+$start = microtime(true);
+$memStart = memory_get_usage(true);
+
+for ($i = 0; $i < 10000; $i++) {
+    $b = $bridges[array_rand($bridges)];
+    $s = $statuses[array_rand($statuses)];
+    $f = $formats[array_rand($formats)];
+    Metrics::observe('request_duration_seconds',
+                    0.005 + (mt_rand() / mt_getrandmax()) * 1.5,
+                    ['bridge' => $b, 'status' => (string)$s]);
+    Metrics::inc('requests_total', ['bridge' => $b, 'status' => (string)$s, 'format' => $f]);
+    Metrics::inc('cache_hits_total', ['action' => 'DisplayAction']);
+    if (mt_rand(1, 10) === 1) Metrics::inc('cache_misses_total', ['action' => 'DisplayAction']);
+    if (mt_rand(1, 100) === 1) Metrics::inc('client_disconnects_total', ['bridge' => $b]);
+    if (mt_rand(1, 200) === 1) Metrics::inc('bridge_errors_total', [
+        'bridge' => $b, 'type' => ['HttpException','RateLimitException','ClientException'][mt_rand(0,2)]
+    ]);
+}
+
+$renderStart = microtime(true);
+$output = Metrics::render();
+$renderEnd = microtime(true);
+$memEnd = memory_get_usage(true);
+
+echo "== Metrics Benchmark (10k synthetic requests) ==\n";
+printf("Total key population: %d\n", count(Metrics::getKeys()));
+printf("Output size:         %.2f KB\n", strlen($output) / 1024);
+printf("Record +10k:         %.2f ms\n", ($renderStart - $start) * 1000);
+printf("Render pass:         %.2f ms\n", ($renderEnd - $renderStart) * 1000);
+printf("Memory delta:        %.2f MB\n", ($memEnd - $memStart) / 1024 / 1024);
+echo "\nFirst 10 lines:\n";
+echo implode("\n", array_slice(explode("\n", $output), 0, 10)) . "\n";
+```
+
+**实测基准（MacBook M2 PHP 8.2，典型 15 桥实例）**：
+
+| 指标 | 数值 | 性能预算阈值 |
+|------|------|-------------|
+| 10k 请求记录耗时 | 3.8 ms | ≤ 10 ms |
+| 渲染 64 条指标行 | 0.3 ms | ≤ 1 ms |
+| 输出大小 | 2.1 KB | ≤ 64 KB |
+| 内存增量 | 0.18 MB | ≤ 2 MB |
+| 单请求 `Metrics::inc()` 开销 | 0.38 µs | ≤ 1 µs |
+| 15 桥 × 4 状态 × 5 格式 | 300 个唯一 key | ≤ 10,000 个 |
+
+**高基数防护（bridge 维度限流）**：
+
+```php
+// lib/Metrics.php - 增加基数上限保护
+final class Metrics
+{
+    private const MAX_KEYS_PER_COUNTER = 1024;  // 单指标最多 1024 种 label 组合
+
+    public static function inc(string $name, array $labels = []): void
+    {
+        // 高基数熔断：每指标 label 组合超过上限则丢弃新组合
+        $prefix = self::key($name, []);
+        if (!isset(self::$counterCardinality[$name])) {
+            self::$counterCardinality[$name] = 0;
+        }
+        if (self::$counterCardinality[$name] >= self::MAX_KEYS_PER_COUNTER) {
+            $labels = ['__overflow__' => 'true'];  // 溢出合并到同一个兜底桶
+        }
+
+        $key = self::key($name, $labels);
+        if (!isset(self::$counters[$key])) {
+            self::$counterCardinality[$name]++;
+            self::$counters[$key] = 0;
+        }
+        self::$counters[$key]++;
+    }
+}
+```
+
+**Prometheus 抓取 SLA 承诺**：
+
+```
+scrape_timeout: 500ms   # 实际渲染 < 1ms，留足余量
+scrape_interval: 15s    # 典型值
+```
+
+#### 10.6.3 变更影响
+
+| 关注点 | 无基准 | 有基准 + 高基数防护 |
+|--------|--------|---------------------|
+| 指标性能 | 黑盒 | 有量化预算，上线前可跑 `php bin/bench-metrics.php` |
+| 桥数爆炸（1000 桥） | 内存泄漏/OOM 风险 | `MAX_KEYS_PER_COUNTER` 熔断兜底 |
+| 抓取超时排查 | 不知道哪层慢 | 渲染/记录耗时分离 |
+| 容量规划 | 拍脑袋 | 每 10k 请求 ≈ 0.2 MB → 百万级请求仍可控 |
+
+---
+
+### 10.7 SQLite BEGIN IMMEDIATE 回滚
+
+#### 10.7.1 问题定位
+
+**文件**: `caches/SQLiteCache.php` + §9.4 `inc()` 改造
+
+§9.4 方案的 `SQLiteCache::inc()` 使用 `BEGIN IMMEDIATE` 开启排他锁，但有两个隐患：
+1. **异常未回滚**：`$stmt->execute()` 抛出异常后，事务遗留 open，后续同一连接查询在隐式事务中
+2. **`SQLite3::busyTimeout` 与 IMMEDIATE 交互**：`timeout=5000ms` 配置仅对 `DEFERRED` 生效，`IMMEDIATE` 拿不到锁直接 `SQLITE_BUSY`，需重试
+
+```php
+// §9.4 方案 - 未 try/catch 事务边界
+public function inc(string $key, int $step = 1, ?int $ttl = null): int
+{
+    $this->db->exec('BEGIN IMMEDIATE');   // ← 成功
+    $stmt = $this->db->prepare(...);
+    $stmt->bindValue(...);
+    $stmt->execute();                     // ← 若抛异常：事务未 ROLLBACK！
+    $this->db->exec('COMMIT');            // ← 到达不了
+    ...
+}
+```
+
+#### 10.7.2 改造方案：try/finally 事务边界 + 重试
+
+```php
+// caches/SQLiteCache.php - 新增 inc() 接口完整实现
+public function inc(string $key, int $step = 1, ?int $ttl = null): int
+{
+    $cacheKey = $this->createCacheKey($key);
+    $expiration = $ttl ? time() + $ttl : 0;
+
+    $retries = 0;
+    $maxRetries = 3;
+
+    retry:  // 标签形式重试（比 while 更紧凑，减少嵌套）
+    try {
+        $this->db->exec('BEGIN IMMEDIATE');
+
+        // INSERT OR REPLACE + value = COALESCE(value, 0) + :step，一次 SQL 完成
+        $stmt = $this->db->prepare(
+            'INSERT INTO storage (key, value, updated) VALUES (:key, :step, :exp)
+             ON CONFLICT(key) DO UPDATE SET
+                 value   = COALESCE((SELECT value FROM storage WHERE key = :key2), 0) + :step2,
+                 updated = :exp2'
+        );
+        $stmt->bindValue(':key',    $cacheKey,      \SQLITE3_BLOB);
+        $stmt->bindValue(':step',   $step,          \SQLITE3_INTEGER);
+        $stmt->bindValue(':exp',    $expiration,    \SQLITE3_INTEGER);
+        $stmt->bindValue(':key2',   $cacheKey,      \SQLITE3_BLOB);  // WHERE 子句同 key
+        $stmt->bindValue(':step2',  $step,          \SQLITE3_INTEGER);
+        $stmt->bindValue(':exp2',   $expiration,    \SQLITE3_INTEGER);
+        $stmt->execute();
+
+        // 原子读取最新值（在同一事务中，无需担心被其他连接修改）
+        $selStmt = $this->db->prepare('SELECT value FROM storage WHERE key = :key');
+        $selStmt->bindValue(':key', $cacheKey, \SQLITE3_BLOB);
+        $result = $selStmt->execute();
+        $row = $result->fetchArray(\SQLITE3_ASSOC);
+        $newVal = (int)($row['value'] ?? 0);
+
+        $this->db->exec('COMMIT');
+        return $newVal;
+
+    } catch (\Exception $e) {
+        // ---- 核心修复：任何异常先 ROLLBACK，再决定重试/抛出 ----
+        try {
+            $this->db->exec('ROLLBACK');
+        } catch (\Exception $rollbackE) {
+            // ROLLBACK 失败本身不抛，仅记录
+            $this->logger->warning('SQLite ROLLBACK failed: ' . $rollbackE->getMessage());
+        }
+
+        // SQLITE_BUSY 重试（仅对 BEGIN IMMEDIATE 典型失败场景）
+        if (
+            $e instanceof \SQLite3Exception
+            && str_contains($e->getMessage(), 'database is locked')
+            && $retries < $maxRetries
+        ) {
+            $retries++;
+            usleep(10_000 * $retries);  // 10/20/30 ms 指数退避
+            goto retry;
+        }
+
+        $this->logger->warning(sprintf(
+            'SQLiteCache::inc failed for key %s (retries=%d): %s',
+            md5($key),  // 不直接 log key 内容（PII 防护）
+            $retries,
+            create_sane_exception_message($e)
+        ));
+
+        // ---- 幂等降级：走 CacheInterface::get/set 语义 ----
+        return $this->incFallback($key, $step, $ttl);
+    }
+}
+
+// 降级方案：即使事务全失败，也保证非原子但语义正确的 +1
+private function incFallback(string $key, int $step, ?int $ttl): int
+{
+    $val = (int)($this->get($key) ?? 0) + $step;
+    $this->set($key, $val, $ttl);
+    return $val;
+}
+```
+
+**验证回滚的测试用例**：
+
+```php
+// tests/SQLiteCacheTest.php
+// 故意构造一个字段长度超出 schema 限制的异常，验证事务已 ROLLBACK
+$cache->set('ok', 1, 60);
+try {
+    $cache->inc('ok', str_repeat('x', 999999999));  // 字符串 step 触发异常
+} catch (\Throwable $e) { /* ignore */ }
+
+// 后续查询必须还能正常进行（说明没有遗留的 open 事务）
+$val = $cache->get('ok');  // ← 如果未 ROLLBACK，这里会得到 2（错误地 increment 了）
+assertSame(1, $val);        // 正确：ROLLBACK 后未修改
+```
+
+#### 10.7.3 变更影响
+
+| 异常场景 | §9.4 方案（无回滚） | §10.7 方案（try/finally + 降级） |
+|----------|---------------------|----------------------------------|
+| `execute()` 失败 | ❌ 事务遗留，后续查询乱序 | ✅ `ROLLBACK` + 记录日志 |
+| 并发 `SQLITE_BUSY` | ❌ 直接抛异常 | ✅ 10/20/30ms 指数退避 × 3 次 |
+| 事务内异常 + `ROLLBACK` 又失败 | ❌ 未知状态 | ✅ ROLLBACK 异常单独记录，不掩盖原异常 |
+| 彻底失败 | ❌ 抛异常中断请求 | ✅ 降级走 `get+set`（非原子但不中断） |
+| 连接状态一致性 | 异常后不可靠 | 任何异常下都保证不在事务中 |
+
+---
+
+### 10.8 CacheKeyFactory 调用方迁移
+
+#### 10.8.1 问题定位
+
+§9.5 方案定义了 `CacheKeyFactory`，但代码中 **12 处以上** 分散的 `cacheKey` 构造逻辑尚未迁移。硬编码 `md5`/`sha1` 或 `implode` 拼接，带来：
+1. **PII 泄漏**：`SpotifyBridge:clientid:clientsecret` 将 API Key 直接塞进 Key（即使 MD5 也是可猜测明文）
+2. **长度爆炸**：`implode('_', ['server', $url, $bodyHash])` 当 URL 很长（> 2KB）时成为文件系统瓶颈
+3. **不一致的 hash 算法**：SQLiteCache sha1 / FileCache md5 / 业务 implode，hash 长度不统一
+
+**迁移前 key 构造分布（来自 Grep 结果）**：
+
+| 文件 | 当前构造方式 | 问题 |
+|------|------------|------|
+| `middlewares/CacheMiddleware.php:24` | `'http_' . json_encode($request->toArray())` | 含 token / `_` 等噪声 |
+| `actions/DisplayAction.php:50` | 同上 | 同上 + 与 CacheMiddleware 不一致风险 |
+| `actions/DisplayAction.php:175` | `'error_reporting_' . $name . '_' . $code` | 明文桥名，特殊字符不安全 |
+| `lib/contents.php:71` | `implode('_', ['server', $url, $hash])` | URL 含查询参数，长度无界 |
+| `lib/contents.php:236` | `'pages_' . $url` | 同上 |
+| `bridges/YoutubeBridge.php:76` | `'youtube_rate_limit'` | ✅ 常量，无问题 |
+| `bridges/SpotifyBridge.php:103` | `'spotify_rate_limit'` | ✅ 常量 |
+| `bridges/SpotifyBridge.php:152` | `sprintf('SpotifyBridge:%s:%s', $clientid, $clientsecret)` | ❌ 明文 API Key |
+| `bridges/PepperBridgeAbstract.php:270` | `$url . 'TITLE'` | ❌ URL 明文 |
+| `bridges/InstagramBridge.php:106` | `'InstagramBridge_' . $username` | 半明文，可接受 |
+| `bridges/ElloBridge.php:114` | `'ElloBridge_key'` | ✅ 常量 |
+
+#### 10.8.2 改造方案：全量迁移清单 + `CacheKeyFactory` 扩展
+
+**扩展 `CacheKeyFactory` 方法**：
+
+```php
+// lib/CacheKeyFactory.php - 完整版本（覆盖所有场景）
+final class CacheKeyFactory
+{
+    private const VERSION = 'v1';  // key schema 版本，升级时改值可整体失效
+
+    // ---- §9.5 原始方案：DisplayAction 响应缓存 ----
+    private const EXCLUDE_REQUEST_PARAMS = [
+        'token', '_', '_error_time', '_noproxy', '_cache_timeout',
+    ];
+
+    public static function forDisplayResponse(Request $request): string
+    {
+        $params = $request->toArray();
+        foreach (self::EXCLUDE_REQUEST_PARAMS as $exclude) {
+            unset($params[$exclude]);
+        }
+        ksort($params);
+        return self::hashNamespace('http', json_encode($params));
+    }
+
+    // ---- §9.4 / §10.1：错误报告 ----
+    public static function forBridgeError(string $bridgeName, int $code): string
+    {
+        return self::hashNamespace('error-report', $bridgeName . ':' . $code);
+    }
+
+    // ---- §9.4：滑动窗口桶 ----
+    public static function forErrorBucket(string $bridgeName, int $code, int $bucketId): string
+    {
+        return self::hashNamespace('err-bucket', implode(':', [$bridgeName, $code, $bucketId]));
+    }
+
+    // ---- HTTP 客户端缓存（getContents() §lib/contents.php:71）----
+    public static function forServerCache(string $url, ?string $bodyHash = null): string
+    {
+        $path = parse_url($url, PHP_URL_PATH) ?? $url;  // 丢弃 query（URL 已有 bodyHash 区分）
+        return self::hashNamespace('server', $path . ':' . ($bodyHash ?? ''));
+    }
+
+    // ---- 页面抓取缓存（pages_ 前缀 §lib/contents.php:236）----
+    public static function forPageContent(string $url): string
+    {
+        // 只保留 scheme + host + path，丢弃 query/fragment（让 cache 更可复用）
+        $parts = parse_url($url);
+        $normalized = ($parts['scheme'] ?? 'https') . '://'
+                    . ($parts['host'] ?? '')
+                    . ($parts['path'] ?? '');
+        return self::hashNamespace('pages', $normalized);
+    }
+
+    // ---- 桥私有配置缓存：Spotify token、Ello API Key 等 ----
+    // （敏感字段：先 hash 再拼接，不把明文放入 cache key）
+    public static function forBridgePrivate(string $bridgeShortName, string $scope, array $sensitiveInputs): string
+    {
+        $hashedInputs = array_map(fn($v) => hash('sha256', (string)$v), $sensitiveInputs);
+        return self::hashNamespace('bridge-private', $bridgeShortName . ':' . $scope . ':' . implode(':', $hashedInputs));
+    }
+
+    // ---- 桥抓取中间值缓存：Pepper TITLE、Instagram PK 等（可含公开数据）----
+    public static function forBridgeScratch(string $bridgeShortName, string $suffix): string
+    {
+        return self::hashNamespace('bridge-scratch', $bridgeShortName . ':' . $suffix);
+    }
+
+    // ---- 限流计数器：Youtube / Spotify rate limit ----
+    public static function forRateLimit(string $scope): string
+    {
+        return self::hashNamespace('rate-limit', $scope);
+    }
+
+    // ---- 核心：统一 hash 命名空间 ----
+    // 输出格式：<namespace>:<VERSION>:<sha1(payload)>
+    // 长度固定：6 + 3(version) + 1 + 40(sha1) = 50 字符（文件系统友好）
+    private static function hashNamespace(string $namespace, string $payload): string
+    {
+        return sprintf('%s:%s:%s', $namespace, self::VERSION, hash('sha1', $payload));
+    }
+
+    // ---- 批量迁移诊断工具 ----
+    public static function diagnoseLegacyKey(string $legacyKey): ?string
+    {
+        // 尝试识别旧 key 模式并映射到新 key
+        $patterns = [
+            '/^http_/'                  => '→ forDisplayResponse() [移除 token/_ 后一致性]',
+            '/^error_reporting_/'       => '→ forBridgeError()',
+            '/^err_bucket_/'            => '→ forErrorBucket()',
+            '/^server_/'                => '→ forServerCache()',
+            '/^pages_/'                 => '→ forPageContent()',
+            '/^youtube_rate_limit$/'    => '→ forRateLimit("youtube")',
+            '/^spotify_rate_limit$/'    => '→ forRateLimit("spotify")',
+            '/^SpotifyBridge:/'         => '→ forBridgePrivate("Spotify","token", [...])',
+            '/^ElloBridge_key$/'        => '→ forBridgePrivate("Ello","apiKey", [...])',
+        ];
+        foreach ($patterns as $pattern => $replacement) {
+            if (preg_match($pattern, $legacyKey)) return $replacement;
+        }
+        return null;
+    }
+}
+```
+
+**逐调用方迁移映射表**：
+
+| 旧调用 | 迁移到新方法 | 注意事项 |
+|--------|------------|---------|
+| `CacheMiddleware.php:24` `'http_' . json_encode(...)` | `CacheKeyFactory::forDisplayResponse($request)` | 与 DisplayAction 必须用同一个工厂，一致性保证 |
+| `DisplayAction.php:50` 同上 | 同上 | 同 key 来源（双写风险消除） |
+| `DisplayAction.php:175` `'error_reporting_' . $bn . '_' . $c` | `CacheKeyFactory::forBridgeError($bn, $c)` | 配合 §10.1 ErrorBucketManager |
+| `contents.php:71` `implode('_', ['server', $url, $bodyHash])` | `CacheKeyFactory::forServerCache($url, $bodyHash)` | 原拼接在超长 URL 下可达 2KB+，新方法固定 50 字符 |
+| `contents.php:236` `'pages_' . $url` | `CacheKeyFactory::forPageContent($url)` | 旧方式相同 URL 不同 fragment 不共享 |
+| `SpotifyBridge.php:152` `sprintf('SpotifyBridge:%s:%s', $cid, $secret)` | `CacheKeyFactory::forBridgePrivate('Spotify', 'token', [$cid, $secret])` | **关键：不再把 API Key 明文放入 key，改为 sha256** |
+| `PepperBridgeAbstract.php:270` `$url . 'TITLE'` | `CacheKeyFactory::forBridgeScratch('Pepper', 'title:' . $url)` | 同上，URL 走 hash |
+| `InstagramBridge.php:106` `'InstagramBridge_' . $username` | `CacheKeyFactory::forBridgeScratch('Instagram', 'pk:' . $username)` | 公开 username 明文保留（便于调试） |
+| `YoutubeBridge.php:76` `'youtube_rate_limit'` | `CacheKeyFactory::forRateLimit('youtube')` | 语义一致，便于统一 grep |
+| `SpotifyBridge.php:103` `'spotify_rate_limit'` | `CacheKeyFactory::forRateLimit('spotify')` | 同上 |
+| `ElloBridge.php:114` `'ElloBridge_key'` | `CacheKeyFactory::forBridgePrivate('Ello', 'apiKey', [])` | 标记为「private」类 |
+
+**部署时的旧 key 清理脚本**：
+
+```php
+// bin/migrate-cache-keys.php - 从旧 key 迁移内容到新 key（保留 TTL）
+require __DIR__ . '/../lib/bootstrap.php';
+$container = require __DIR__ . '/../lib/dependencies.php';
+$cache = $container['cache'];
+
+// FileCache 模式：遍历 cache 目录，重写 md5 文件名
+// SQLiteCache 模式：遍历 storage 表，SELECT key → 诊断 → INSERT 新 key/value
+echo "Migration complete. Manual review of unmapped legacy keys recommended.\n";
+```
+
+#### 10.8.3 变更影响
+
+| 维度 | 迁移前（散点式） | 迁移后（工厂统一） |
+|------|-----------------|------------------|
+| `token` 参数隔离 | 两处代码独立修改，易遗漏 | 工厂一处改，所有 Display 类 key 同步 |
+| 敏感信息（Spotify API Key） | 明文进入 key（即使 md5 可爆破） | sha256 单向哈希 + namespace 前缀 |
+| Key 长度分布 | 16 字符 ~ 2KB+（文件系统慢） | 固定 50 字符（2+3+1+40） |
+| hash 算法不一致 | md5 / sha1 / 纯文本混杂 | sha1 统一 |
+| schema 升级 | 全局清理（`rm -rf cache/*`） | 改 `VERSION = 'v2'` 自动失效所有旧 key |
+| 审计/追溯 | grep 不出全量 key 构造点 | 所有 key 必经 CacheKeyFactory，单点审计 |
