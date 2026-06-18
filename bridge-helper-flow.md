@@ -223,6 +223,157 @@ function backgroundToImg($htmlContent)
 4. 移除整个标签块
 ```
 
+### 2.4 Invalid HTML 下的 DOMDocument 容错路径
+
+RSS-Bridge 采用双层解析器架构应对互联网上广泛存在的不规范 HTML：`simple_html_dom`（默认）和 `DOMDocument`（XPathAbstract 使用）。
+
+#### 2.4.1 容错路径总览
+
+```
+Invalid HTML 输入
+     ↓
+┌─────────────────────────────────────────────────────┐
+│  路径 1: simple_html_dom + forceTagsClosed          │
+│  ├─ 自动闭合未闭合标签                               │
+│  ├─ 预解析噪音移除（<script>, <style>, <!-- -->）    │
+│  └─ 字符集规范化                                    │
+├─────────────────────────────────────────────────────┤
+│  路径 2: DOMDocument + libxml 错误抑制              │
+│  ├─ libxml_use_internal_errors(true)                │
+│  ├─ loadHTML() 自动修复模式                         │
+│  ├─ libxml_clear_errors()                           │
+│  └─ libxml_use_internal_errors(false)               │
+└─────────────────────────────────────────────────────┘
+     ↓
+可用的 DOM 对象
+```
+
+#### 2.4.2 simple_html_dom 的 `forceTagsClosed` 机制
+
+**位置**: `lib/simplehtmldom/simple_html_dom.php:1488-1492`
+
+```php
+// Forcing tags to be closed implies that we don't trust the html, but
+// it can lead to parsing errors if we SHOULD trust the html.
+if (!$forceTagsClosed) {
+    $this->optional_closing_array = array();
+}
+```
+
+**`optional_closing_array` 预定义标签** (`simple_html_dom.php`):
+```php
+// 这些标签在 HTML 规范中允许不闭合
+protected $optional_closing_array = [
+    'li' => 1, 'dt' => 1, 'dd' => 1, 'p' => 1,
+    'rt' => 1, 'rp' => 1, 'optgroup' => 1, 'option' => 1,
+    'colgroup' => 1, 'thead' => 1, 'tfoot' => 1,
+    'tr' => 1, 'th' => 1, 'td' => 1,
+];
+```
+
+**`forceTagsClosed = true` 时的行为**:
+- 清空 `optional_closing_array`，强制所有标签必须闭合
+- 解析器遇到未闭合标签时会自动插入闭合标签
+- 适用场景：混乱的 HTML（论坛、博客、新闻网站）
+
+**`forceTagsClosed = false` 时的行为**:
+- 保留 HTML 规范中的可选闭合标签
+- 解析更准确但对不规范 HTML 容忍度低
+- 适用场景：规范的 HTML（API 响应、结构化数据）
+
+**预解析噪音移除阶段** (`simple_html_dom.php:1517-1544`):
+```php
+// strip out <script> tags
+$this->remove_noise("'<\s*script[^>]*[^/]>(.*?)<\s*/\s*script\s*>'is");
+$this->remove_noise("'<\s*script\s*>(.*?)<\s*/\s*script\s*>'is");
+// strip out cdata
+$this->remove_noise("'<!\[CDATA\[(.*?)\]\]>'is", true);
+// strip out comments
+$this->remove_noise("'<!--(.*?)-->'is");
+// strip out <style> tags
+$this->remove_noise("'<\s*style[^>]*[^/]>(.*?)<\s*/\s*style\s*>'is");
+// strip out preformatted tags
+$this->remove_noise("'<\s*(?:code)[^>]*>(.*?)<\s*/\s*(?:code)\s*>'is");
+// strip out server side scripts
+$this->remove_noise("'(<\?)(.*?)(\?>)'s", true);
+```
+
+> **注意**: `remove_noise()` 在 `simple_html_dom` 内部完成，`sanitize()` 是更高层次的安全清洗，两者是互补关系而非重复。
+
+#### 2.4.3 DOMDocument + libxml 错误抑制（XPathAbstract 路径）
+
+**位置**: `lib/XPathAbstract.php:404-408`
+
+```php
+public function collectData()
+{
+    $this->feedUri = $this->getParam('url');
+
+    $webPageHtml = new \DOMDocument();
+    libxml_use_internal_errors(true);      // 1. 开启错误抑制
+    $webPageHtml->loadHTML($this->provideWebsiteContent());  // 2. 加载（自动修复）
+    libxml_clear_errors();                 // 3. 清除错误记录
+    libxml_use_internal_errors(false);     // 4. 恢复错误报告
+
+    // fix relative links
+    defaultLinkTo($webPageHtml, $webPageHtml->baseURI ?? $this->feedUri);
+
+    $xpath = new \DOMXPath($webPageHtml);
+    // ... 后续 XPath 查询
+}
+```
+
+**loadHTML() 自动修复能力** (libxml 内置):
+1. 自动添加缺失的 `<html>`, `<head>`, `<body>` 标签
+2. 自动闭合未闭合的标签（如 `<p>`, `<li>`, `<td>`）
+3. 自动转义非法字符
+4. 尝试修复嵌套错误（如 `<div><p></div></p>` → `<div><p></p></div>`）
+
+**同类模式**:
+- `FeedParser.php:18-21` - XML 解析时的错误抑制
+- `bridges/LWNprevBridge.php:58-61` - 独立 Bridge 的 DOMDocument 使用
+
+#### 2.4.4 两种解析器的兼容层
+
+**位置**: `lib/html.php:259-270`
+
+```php
+// Use long method names for compatibility with simple_html_dom and DOMDocument
+
+// Work around bug in simple_html_dom->getElementsByTagName
+if ($dom instanceof simple_html_dom) {
+    $findByTag = function ($name) use ($dom) {
+        return $dom->getElementsByTagName($name, null);  // simple_html_dom 需要第二个参数
+    };
+} else {
+    $findByTag = function ($name) use ($dom) {
+        return $dom->getElementsByTagName($name);         // DOMDocument 标准签名
+    };
+}
+```
+
+**兼容处理边界**:
+| 特性 | simple_html_dom | DOMDocument |
+|------|-----------------|-------------|
+| `getElementsByTagName($name)` | 需要第二个参数 `null` | 标准单参数 |
+| `outertext` 属性 | 支持，返回 HTML 字符串 | 不支持，需用 `saveHTML()` |
+| `find()` CSS 选择器 | 原生支持 | 需用 DOMXPath |
+| `getAttribute('src')` | 支持 | 支持（标准方法） |
+| `setAttribute('src', $val)` | 支持 | 支持（标准方法） |
+
+#### 2.4.5 容错失效场景与边界
+
+| 场景 | simple_html_dom 行为 | DOMDocument 行为 | 可能后果 |
+|------|---------------------|------------------|----------|
+| 标签深度嵌套 > 1000 | 栈溢出，解析失败 | libxml 限制，截断 | 内容丢失 |
+| 自闭合标签写错（`<div />`） | 可能错误解析 | 自动修复 | 结构错乱 |
+| 未闭合引号（`<a href="url>`） | 属性解析错误 | 自动修复 | 链接失效 |
+| 二进制字符嵌入 | `stripRN` 可能处理不完全 | 忽略或转义 | 解析中断 |
+| `</body></html>` 缺失 | 自动补全 | 自动补全 | 正常 |
+| `<` 字符未转义在文本中 | 可能误识别为标签开始 | 自动转义 | 内容截断 |
+
+---
+
 ### 2.3 实际应用示例（WordPressBridge）
 
 **位置**: `bridges/WordPressBridge.php:37-111`
@@ -683,6 +834,216 @@ if ($cachedResponse) {
 4. **年份推断**: 处理不带年份的日期时，需要正确判断是今年还是去年
 5. **数据类型**: FeedItem 中 `timestamp` 字段应为 Unix 时间戳（整数）
 
+### 4.5 跨时区与夏令时的时间处理代码挂载点
+
+RSS-Bridge 的时间处理采用分层挂载设计，从系统入口到具体 Bridge 形成完整的时区处理链。
+
+#### 4.5.1 时区挂载点总览
+
+```
+系统启动入口
+     ↓ 挂载点 1: index.php:61
+date_default_timezone_set(Configuration::getConfig('system', 'timezone'))
+     ↓ 挂载点 2: Configuration::verifyInstallation()
+时区合法性校验（timezone_identifiers_list 白名单）
+     ↓
+┌─────────────────────────────────────────────────────┐
+│  挂载点 3: FeedParser 内部 strtotime()              │
+│  使用全局时区解析 Feed 中的 <updated>, <pubDate>     │
+├─────────────────────────────────────────────────────┤
+│  挂载点 4: Bridge 自定义时间处理                     │
+│  ├─ TestFaktaBridge: DateTimeZone('Europe/Stockholm')│
+│  ├─ MastodonBridge: setTimezone(new DateTimeZone('GMT')) │
+│  ├─ VkBridge: 手动年份/月份推断 + date() 默认时区    │
+│  └─ XenForoBridge: 直接使用 data-time Unix 时间戳    │
+├─────────────────────────────────────────────────────┤
+│  挂载点 5: getContents() 缓存时间处理                │
+│  ├─ Last-Modified 头解析 → DateTimeImmutable        │
+│  └─ If-Modified-Since 协商缓存 → strtotime()        │
+└─────────────────────────────────────────────────────┘
+     ↓
+FeedItem['timestamp'] (Unix 时间戳，无时区概念)
+```
+
+#### 4.5.2 挂载点 1: 系统时区入口
+
+**位置**: `index.php:61`
+
+```php
+date_default_timezone_set(Configuration::getConfig('system', 'timezone'));
+```
+
+**作用**: 设置 PHP 运行时全局时区，影响所有 `strtotime()`, `date()`, `new DateTime()` 等函数的默认行为。
+
+**默认值**: `config.default.ini.php:32` → `timezone = "UTC"`
+
+#### 4.5.3 挂载点 2: 时区合法性校验
+
+**位置**: `lib/Configuration.php:92-97`
+
+```php
+if (
+    !is_string(self::getConfig('system', 'timezone'))
+    || !in_array(self::getConfig('system', 'timezone'), timezone_identifiers_list(DateTimeZone::ALL_WITH_BC))
+) {
+    self::throwConfigError('system', 'timezone');
+}
+```
+
+**白名单机制**: 使用 `timezone_identifiers_list(DateTimeZone::ALL_WITH_BC)` 获取 PHP 支持的所有时区标识符（包括历史时区），确保配置的时区合法。
+
+**可配置方式**:
+- 配置文件: `config.ini.php` 中 `[system] timezone = "Asia/Shanghai"`
+- 环境变量: `RSSBRIDGE_system_timezone=Europe/Berlin`
+- 默认值: `UTC`
+
+#### 4.5.4 挂载点 3: FeedParser 隐式时区使用
+
+**位置**: `lib/FeedParser.php:98, 203, 242`
+
+```php
+// Atom
+$item['timestamp'] = strtotime((string)$feedItem->updated);
+
+// RSS 2.0
+$item['timestamp'] = strtotime((string) $item['timestamp']);
+
+// RDF
+$item['timestamp'] = strtotime((string)$dc->date);
+```
+
+**关键特性**:
+- `strtotime()` 会自动识别时间字符串中的时区信息（如 `+0000`, `Z`, `Europe/London`）
+- 如果时间字符串无时区信息，使用 `date_default_timezone_set()` 设置的全局时区
+- 标准 Feed 格式（Atom/RSS）通常包含时区偏移，因此解析结果是准确的
+
+#### 4.5.5 挂载点 4: Bridge 级自定义时区处理
+
+**模式 A: 明确指定源时区**
+
+**位置**: `bridges/TestFaktaBridge.php:44-47`
+
+```php
+$dateValue = DateTime::createFromFormat(
+    'd M, Y',
+    trim($dateString),
+    new DateTimeZone('Europe/Stockholm')  // 源数据时区
+);
+```
+
+**模式 B: 输出时强制转换时区**
+
+**位置**: `bridges/MastodonBridge.php:256-259`
+
+```php
+$d = new DateTime();
+$d->setTimezone(new DateTimeZone('GMT'));  // 强制 GMT 时区
+$date = $d->format('D, d M Y H:i:s e');
+```
+
+**模式 C: 未知时区的保守处理**
+
+多个 Bridge 采用此模式 (`XenForoBridge.php:372`, `NasestrechaBridge.php:88`, `JustETFBridge.php:124`):
+
+```php
+/**
+ * We don't know the timezone, so just assume +00:00 (or whatever
+ * DateTime chooses)
+ */
+```
+
+**模式 D: 相对时间的时区依赖**
+
+**位置**: `bridges/VkBridge.php:490-504`
+
+```php
+// 处理 "12:34" (今天/昨天的时间)
+if ($date['day'] && !$date['month']) {
+    // date() 使用全局时区获取当前日期
+    $strdate = date('d-m-Y') . ' ' . $strdate;
+}
+// 处理 "5 мар" (今年的日期，需判断是否跨年)
+elseif ($date['month'] && !$date['year']) {
+    // 如果当前月份 < 帖子月份，说明是去年
+    if (intval(date('m')) < $date['month']) {
+        $strdate = $strdate . ' ' . (date('Y') - 1);
+    } else {
+        $strdate = $strdate . ' ' . date('Y');
+    }
+}
+```
+
+> **风险点**: `date('m')` 和 `date('Y')` 依赖全局时区。如果网站服务器时区与用户设置的 RSS-Bridge 时区不一致，跨年判断可能出错。
+
+**模式 E: 直接使用 Unix 时间戳（无时区问题）**
+
+**位置**: `bridges/XenForoBridge.php:235-237`
+
+```php
+if ($timestamp = $post->find('abbr.DateTime', 0)) {
+    // <abbr class="DateTime" data-time="1660569120" ...>
+    $item['timestamp'] = $timestamp->getAttribute('data-time');
+}
+```
+
+#### 4.5.6 挂载点 5: 缓存协商中的时间处理
+
+**位置**: `middlewares/CacheMiddleware.php:28-38`
+
+```php
+$ifModifiedSince = $request->server('HTTP_IF_MODIFIED_SINCE');
+$lastModified = $cachedResponse->getHeader('last-modified');
+if ($ifModifiedSince && $lastModified) {
+    $lastModified = new \DateTimeImmutable($lastModified);
+    $lastModifiedTimestamp = $lastModified->getTimestamp();
+    $modifiedSince = strtotime($ifModifiedSince);
+    // 比较时间戳（已转换为 UTC，无时区问题）
+    if ($lastModifiedTimestamp <= $modifiedSince) {
+        return new Response('', 304, ['last-modified' => gmdate('D, d M Y H:i:s ', $lastModifiedTimestamp) . 'GMT']);
+    }
+}
+```
+
+**关键点**:
+- HTTP 日期头 (`Last-Modified`, `If-Modified-Since`) 按 RFC 7231 规定总是 GMT
+- 使用 `gmdate()` 输出时强制 GMT 时区，避免时区问题
+
+#### 4.5.7 夏令时处理边界
+
+**PHP 夏令时自动处理**:
+- `strtotime("2023-03-26 02:30:00", "Europe/London")` - 时钟向前拨 1 小时，这个时间不存在，PHP 会自动调整为 03:30
+- `strtotime("2023-10-29 01:30:00", "Europe/London")` - 时钟向后拨 1 小时，这个时间出现两次，PHP 会取第一个
+
+**夏令时相关 Bug 挂载点**:
+1. **`createFromFormat()` 不带时区** (`WebfailBridge.php:93`):
+   ```php
+   $dt = DateTime::createFromFormat('!d.m.Y', $matches[1]);
+   // '!' 前缀会将时间部分设为 00:00:00
+   // 若当天是夏令时切换日且正好跳过 00:00，会解析失败
+   ```
+
+2. **VkBridge 跨年判断** (`bridges/VkBridge.php:504`):
+   ```php
+   return strtotime($date['day'] . '-' . $date['month'] . '-' . $date['year'] . ' ' . $strdate);
+   // 若拼接出的时间正好在夏令时切换间隙，结果可能偏差 1 小时
+   ```
+
+3. **`format()` 输出时的时区转换**:
+   ```php
+   // 时间戳是 UTC，但输出时会转换为全局时区
+   date('Y-m-d H:i:s', $timestamp);
+   ```
+
+#### 4.5.8 时区与夏令时处理最佳实践
+
+| 场景 | 推荐做法 | 反模式 |
+|------|----------|--------|
+| 解析含时区的时间 | `strtotime()` 自动处理 | 手动截取时区偏移 |
+| 解析已知源时区的时间 | `DateTime::createFromFormat($format, $time, new DateTimeZone($sourceTz))` | 假设源时区 = 全局时区 |
+| 输出 HTTP 头 | `gmdate('D, d M Y H:i:s', $ts) . 'GMT'` | `date()` 输出本地时间 |
+| 相对时间计算 | 使用 `DateTime::modify()` | 手动加减秒数 |
+| 存储时间 | 存 Unix 时间戳（整数） | 存带时区的字符串 |
+
 ---
 
 ## 五、完整数据流示例
@@ -721,35 +1082,335 @@ if ($cachedResponse) {
 
 ---
 
-## 六、关键设计模式总结
+## 六、缓存对解析结果的影响边界
 
-### 6.1 模板方法模式
+RSS-Bridge 采用四层缓存架构，每层缓存都可能影响解析结果，理解各层的边界条件对于调试和优化至关重要。
+
+### 6.1 四层缓存架构总览
+
+```
+用户请求
+     ↓
+┌─────────────────────────────────────────────────────────┐
+│  缓存层 1: CacheMiddleware (HTTP 响应缓存)              │
+│  Key: 'http_' + json_encode($request->toArray())        │
+│  TTL: 5分钟 + 随机抖动(错误响应) / 由 DisplayAction 管理 │
+│  影响: 直接返回完整响应，跳过所有解析逻辑               │
+├─────────────────────────────────────────────────────────┤
+│  缓存层 2: getContents() (HTTP 响应缓存)                │
+│  Key: 'server_' + $url + md5($requestBody)              │
+│  TTL: 10天 (86400 * 10)                                 │
+│  影响: 影响 HTML 原始内容，进而影响所有下游解析         │
+├─────────────────────────────────────────────────────────┤
+│  缓存层 3: getSimpleHTMLDOMCached() (页面内容缓存)      │
+│  Key: 'pages_' + $url                                   │
+│  TTL: 默认 24小时 (86400)，可自定义                    │
+│  影响: DOM 解析结果缓存，跳过 HTTP 请求和 str_get_html() │
+├─────────────────────────────────────────────────────────┤
+│  缓存层 4: BridgeAbstract::saveCacheValue() (自定义缓存)│
+│  Key: $bridgeShortName + '_' + $key                     │
+│  TTL: 默认 1天 (86400)，可自定义                        │
+│  影响: 由具体 Bridge 控制，如 Twitter API token 等      │
+└─────────────────────────────────────────────────────────┘
+     ↓
+解析结果输出
+```
+
+### 6.2 缓存层 1: CacheMiddleware - HTTP 响应缓存
+
+**位置**: `middlewares/CacheMiddleware.php:14-64`
+
+```php
+public function __invoke(Request $request, $next): Response
+{
+    $action = $request->getAttribute('action');
+    if ($action !== 'DisplayAction') {
+        return $next($request);  // 只缓存 DisplayAction
+    }
+
+    $cacheKey = 'http_' . json_encode($request->toArray());
+    $cachedResponse = $this->cache->get($cacheKey);
+
+    if ($cachedResponse) {
+        // 304 协商缓存判断
+        $ifModifiedSince = $request->server('HTTP_IF_MODIFIED_SINCE');
+        $lastModified = $cachedResponse->getHeader('last-modified');
+        if ($ifModifiedSince && $lastModified) {
+            $lastModifiedTimestamp = strtotime($lastModified);
+            $modifiedSince = strtotime($ifModifiedSince);
+            if ($lastModifiedTimestamp <= $modifiedSince) {
+                return new Response('', 304, ['last-modified' => gmdate('D, d M Y H:i:s ', $lastModifiedTimestamp) . 'GMT']);
+            }
+        }
+        return $cachedResponse;  // ⚠️ 直接返回缓存，跳过所有解析！
+    }
+
+    $response = $next($request);
+
+    // 错误响应缓存策略
+    if (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+        // 5分钟 + 1~600秒随机抖动，防止缓存击穿
+        $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+    }
+    // 1% 概率触发缓存清理
+    if (rand(1, 100) === 1) {
+        $this->cache->prune();
+    }
+
+    return $response;
+}
+```
+
+**影响边界**:
+- ✅ **缓存命中时**: 完全跳过 Bridge 的 `collectData()`、HTML 解析、路径修正、时间处理等所有逻辑
+- ❌ **缓存未命中时**: 正常执行完整解析流程
+- ⚠️ **缓存键包含**: 完整请求参数（action, bridge, 所有查询参数）
+- ⚠️ **缓存排除**: 非 DisplayAction（如 frontpage, list, detect）不缓存
+
+**解析结果影响场景**:
+| 场景 | 缓存命中行为 | 对用户的影响 |
+|------|-------------|-------------|
+| Bridge 代码已更新但缓存未过期 | 返回旧解析结果 | 用户看到旧内容，最长 5 分钟 |
+| 源网站内容已更新但缓存未过期 | 返回旧解析结果 | 用户看到旧内容，最长取决于各层 TTL |
+| 源网站返回错误被缓存 | 继续返回错误 | 服务暂时不可用，5+分钟 |
+| 请求参数有微小差异（如大小写） | 视为不同缓存键 | 重复解析，浪费资源 |
+
+### 6.3 缓存层 2: getContents() - HTTP 响应缓存
+
+**位置**: `lib/contents.php:36-138`
+
+```php
+function getContents(string $url, ...) {
+    // 缓存键包含请求体哈希，支持 POST 请求
+    $requestBodyHash = isset($curlOptions[CURLOPT_POSTFIELDS]) 
+        ? md5(Json::encode($curlOptions[CURLOPT_POSTFIELDS], false)) 
+        : null;
+    $cacheKey = implode('_', ['server', $url, $requestBodyHash]);
+
+    $cachedResponse = $cache->get($cacheKey);
+    if ($cachedResponse) {
+        // 🔄 协商缓存：附加 If-Modified-Since 和 If-None-Match
+        $lastModified = $cachedResponse->getHeader('last-modified');
+        if ($lastModified) {
+            try {
+                $lastModified = new \DateTimeImmutable(
+                    (is_numeric($lastModified) ? '@' : '') . $lastModified
+                );
+                $config['if_not_modified_since'] = $lastModified->getTimestamp();
+            } catch (Exception $e) { /* 忽略 */ }
+        }
+        $etag = $cachedResponse->getHeader('etag');
+        if ($etag) {
+            $httpHeadersNormalized['if-none-match'] = $etag;
+        }
+    }
+
+    $response = $httpClient->request($url, $config);
+
+    switch ($response->getCode()) {
+        case 200:
+        case 201:
+        case 202:
+            // 除非服务器明确禁止缓存，否则缓存 10 天
+            $cacheControl = $response->getHeader('cache-control');
+            if ($cacheControl) {
+                $directives = explode(',', $cacheControl);
+                $directives = array_map('trim', $directives);
+                if (in_array('no-cache', $directives) || in_array('no-store', $directives)) {
+                    break;  // 不缓存
+                }
+            }
+            $cache->set($cacheKey, $response, 86400 * 10);  // 10 天
+            break;
+        case 304:
+            // Not Modified - 使用缓存的 body
+            $response = $response->withBody($cachedResponse->getBody());
+            break;
+    }
+
+    return $returnFull ? $response : $response->getBody();
+}
+```
+
+**关键机制**:
+1. **协商缓存**: 有缓存时发条件请求，304 时复用缓存体
+2. **缓存键**: `server_ + URL + 请求体哈希`，区分 POST 请求
+3. **TTL**: 10 天，但受 `Cache-Control` 头约束
+4. **服务器 Cache-Control 优先级**: `no-cache` / `no-store` 指令会阻止缓存
+
+**解析结果影响场景**:
+| 场景 | 行为 | 对解析的影响 |
+|------|------|-------------|
+| 源站内容 10 天内更新但未发 304 | 返回缓存内容 | HTML 解析基于旧内容，结果过时 |
+| 源站修复了 HTML 错误但缓存未过期 | 继续使用有问题的 HTML | DOM 解析仍然出错 |
+| 源站返回 304 Not Modified | 使用缓存的 body | 解析结果不变，但节省带宽 |
+| 源站 Cache-Control: no-store | 每次都请求新内容 | 总能获取最新，但性能下降 |
+
+### 6.4 缓存层 3: getSimpleHTMLDOMCached() - 页面内容缓存
+
+**位置**: `lib/contents.php:219-251`
+
+```php
+function getSimpleHTMLDOMCached(
+    $url,
+    $ttl = 86400,  // 默认 24 小时
+    $header = [],
+    ...
+): \simple_html_dom {
+    global $container;
+    $cache = $container['cache'];
+
+    $cacheKey = 'pages_' . $url;
+    $content = $cache->get($cacheKey);
+    if (!$content) {
+        // ⚠️ 缓存未命中时调用 getContents()，这会触发缓存层 2
+        $content = getContents($url, $header ?? [], $opts ?? []);
+        $cache->set($cacheKey, $content, $ttl);
+    }
+    // 🔍 每次都重新解析 DOM！缓存的是原始 HTML 字符串
+    return str_get_html($content, $lowercase, $forceTagsClosed, ...);
+}
+```
+
+**重要特性**:
+- **缓存的是 HTML 字符串，不是 DOM 对象** - 每次调用都会重新 `str_get_html()`
+- **TTL 可自定义** - 不同 Bridge 可根据内容更新频率设置
+- **与缓存层 2 的关系**: 缓存未命中时会调用 `getContents()`，可能命中层 2 缓存
+
+**解析结果影响场景**:
+| 场景 | 行为 | 对解析的影响 |
+|------|------|-------------|
+| `forceTagsClosed` 参数改变 | 用缓存的 HTML 重新解析 | 可能得到不同的 DOM 结构 |
+| simple_html_dom 库升级 | 用缓存的 HTML 重新解析 | 解析结果可能变化 |
+| 相同 URL，不同的解析参数 | 共享缓存，参数各自生效 | TTL 内多次调用，HTML 相同但 DOM 解析方式可不同 |
+| 解析依赖当前时间（如相对日期） | HTML 不变但时间解析变 | 每次调用时间字段可能不同 |
+
+### 6.5 缓存层 4: Bridge 自定义缓存
+
+**位置**: `lib/BridgeAbstract.php:325-333`
+
+```php
+protected function loadCacheValue(string $key, $default = null)
+{
+    return $this->cache->get($this->getShortName() . '_' . $key, $default);
+}
+
+protected function saveCacheValue(string $key, $value, int $ttl = 86400)
+{
+    $this->cache->set($this->getShortName() . '_' . $key, $value, $ttl);
+}
+```
+
+**使用示例**:
+
+```php
+// TwitterClient.php - 缓存 API Token
+$data = $this->cache->get('twitter') ?? [];
+// ...
+$this->cache->set('twitter', $this->data);
+
+// YoutubeBridge.php - 缓存搜索结果
+if ($this->cache->get($cacheKey)) {
+    // 缓存命中，跳过 API 请求
+}
+$this->cache->set($cacheKey, true, 60 * 16);  // 缓存 16 分钟
+```
+
+**解析结果影响场景**:
+- 缓存的 API Token 过期 → 解析失败
+- 缓存的元数据（如分类映射）过时 → 分类信息错误
+- 缓存的增量同步标记 → 漏掉新内容
+
+### 6.6 缓存一致性边界与失效条件
+
+#### 6.6.1 缓存穿透（Cache Miss Storm）
+
+**场景**: 缓存过期瞬间大量请求涌入，都绕过缓存直接请求源站。
+
+**缓解措施**:
+- 随机 TTL 抖动（CacheMiddleware 错误响应 +1~600 秒）
+- 四层缓存架构形成渐变失效（层 1: 5分钟 → 层 3: 24小时 → 层 2: 10天）
+- 1% 概率 `prune()` 主动清理过期缓存
+
+#### 6.6.2 缓存击穿（Hot Key Invalid）
+
+**场景**: 热门 Bridge 的缓存同时失效，导致源站压力骤增。
+
+**代码特征**:
+- 各层 TTL 差异设计（5分钟 vs 24小时 vs 10天）避免同时失效
+- 协商缓存（304 Not Modified）降低回源压力
+
+#### 6.6.3 缓存污染（Cache Poisoning）
+
+**场景**: 源站返回错误或异常内容被缓存。
+
+**风险点**:
+```php
+// getContents() 缓存所有 2xx 响应，包括内容错误的页面
+case 200:
+case 201:
+case 202:
+    $cache->set($cacheKey, $response, 86400 * 10);  // 缓存 10 天！
+    break;
+```
+
+**影响**: 如果源站返回 200 OK 但内容是错误页面（如 Cloudflare 拦截页），会被缓存 10 天。
+
+#### 6.6.4 缓存键冲突边界
+
+**CacheMiddleware 键**: `'http_' + json_encode($request->toArray())`
+- 包含所有查询参数 → 参数顺序不同会生成不同键
+- 参数值大小写敏感 → `?u=user` 和 `?u=User` 是不同键
+
+**getContents 键**: `'server_' + $url + $requestBodyHash`
+- URL 大小写敏感 → 大多数 HTTP 服务器不区分大小写，但这里区分
+- 锚点 (`#section`) 会被包含 → 实际对 HTTP 请求无影响
+
+**getSimpleHTMLDOMCached 键**: `'pages_' + $url`
+- 不包含 header 和 opts 参数 → 相同 URL 不同 header 共享缓存
+
+### 6.7 解析结果可重现性边界
+
+| 条件 | 相同输入是否得到相同输出 | 原因 |
+|------|------------------------|------|
+| 所有缓存都命中 | ✅ 是 | 完全相同的输入，跳过所有可变逻辑 |
+| 缓存层 1 未命中，其他命中 | ⚠️ 大概率是 | 除非解析依赖当前时间或随机数 |
+| 缓存层 3 未命中 | ⚠️ 可能不同 | 重新解析 DOM，`forceTagsClosed` 等参数可能影响 |
+| 所有缓存都未命中 | ❌ 可能不同 | 源站内容可能已变，时间戳基于当前时间 |
+| 解析依赖 `now()` 或 `date()` | ❌ 否 | 每次调用时间不同 |
+| 解析依赖随机数 (`rand()`) | ❌ 否 | 随机值不同 |
+
+---
+
+## 七、关键设计模式总结
+
+### 7.1 模板方法模式
 - `BridgeAbstract::collectData()` 是抽象方法，由子类实现具体采集逻辑
 - `FeedExpander::collectExpandableDatas()` 定义了 Feed 扩展的骨架流程，`parseItem()` 由子类自定义
 
-### 6.2 工具函数门面
+### 7.2 工具函数门面
 `html.php` 中的函数对 simplehtmldom 库进行了封装，提供更高层次的操作：
 - `convertLazyLoading()` 封装了懒加载属性的查找、解析、转换
 - `defaultLinkTo()` 封装了 DOM 遍历和 `urljoin()` 调用
 
-### 6.3 不可变对象
+### 7.3 不可变对象
 `Url` 类使用 `with*()` 方法返回新实例，确保线程安全和可预测性。
 
-### 6.4 防御式编程
+### 7.4 防御式编程
 - 多层参数校验 (`ParameterValidator`, `Url::validate()`)
 - 类型检查和容错处理 (`is_string()`, `is_object()`, `??` 运算符)
 - 输入净化 (`sanitize()`, `stripWithDelimiters()`)
 
-### 6.5 缓存策略
+### 7.5 缓存策略
 - 内容缓存: `getSimpleHTMLDOMCached()` TTL 24 小时
 - HTTP 缓存: `getContents()` 支持 `Last-Modified` / `ETag` 协商缓存
 - 服务器缓存: 不同 URL 分开缓存，缓存键包含请求体哈希
 
 ---
 
-## 七、代码优化建议
+## 八、代码优化建议
 
-### 7.1 `defaultLinkTo()` 可扩展支持 srcset
+### 8.1 `defaultLinkTo()` 可扩展支持 srcset
 
 当前只处理 `src` 和 `href`，可增加 `srcset` 处理：
 
@@ -773,7 +1434,7 @@ foreach ($findByTag('img, source') as $element) {
 }
 ```
 
-### 7.2 时间解析统一封装
+### 8.2 时间解析统一封装
 
 可在 `utils.php` 中增加统一的时间解析函数：
 
@@ -794,7 +1455,7 @@ function parse_timestamp($dateString, $format = null): ?int
 }
 ```
 
-### 7.3 HTML 处理链式调用
+### 8.3 HTML 处理链式调用
 
 可考虑提供流式 API 提高可读性：
 
@@ -812,9 +1473,27 @@ $article = HtmlProcessor::from($article)
     ->get();
 ```
 
+### 8.4 缓存污染防护
+
+针对 getContents() 缓存 10 天可能导致的污染问题，建议增加内容校验：
+
+```php
+// 在缓存前增加内容合法性检查
+case 200:
+case 201:
+case 202:
+    // 检查是否为有效 HTML（非错误页）
+    if (strlen($response->getBody()) > 1024  // 内容足够长
+        && !str_contains($response->getBody(), 'error') // 非错误页
+        && !str_contains($response->getBody(), 'blocked')) { // 非拦截页
+        $cache->set($cacheKey, $response, 86400 * 10);
+    }
+    break;
+```
+
 ---
 
-## 八、参考文件索引
+## 九、参考文件索引
 
 | 功能 | 文件 | 关键行号 |
 |------|------|----------|
@@ -827,3 +1506,12 @@ $article = HtmlProcessor::from($article)
 | 内容获取 | `lib/contents.php` | 1-251 |
 | Feed 解析器 | `lib/FeedParser.php` | 时间相关行 98,202,242 |
 | WordPressBridge 示例 | `bridges/WordPressBridge.php` | 1-129 |
+| simple_html_dom 解析器 | `lib/simplehtmldom/simple_html_dom.php` | forceTagsClosed 1488-1492, 预解析 1517-1544 |
+| DOMDocument 容错 | `lib/XPathAbstract.php` | libxml 404-408 |
+| 缓存中间件 | `middlewares/CacheMiddleware.php` | 1-64 |
+| 时区配置入口 | `index.php` | date_default_timezone_set 61 |
+| 时区合法性校验 | `lib/Configuration.php` | 92-97 |
+| 时区处理示例 | `bridges/TestFaktaBridge.php` | DateTimeZone 44-47 |
+| 时区处理示例 | `bridges/VkBridge.php` | 相对时间 490-504 |
+| 时区处理示例 | `bridges/XenForoBridge.php` | data-time 235-237, 时区注释 372 |
+| 默认配置 | `config.default.ini.php` | timezone 32 |
