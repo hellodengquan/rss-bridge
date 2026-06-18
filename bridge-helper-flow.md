@@ -580,6 +580,222 @@ defined('MAX_FILE_SIZE') || define('MAX_FILE_SIZE', 600000);  // 600 KB
    - 解析结果缓存（`getSimpleHTMLDOMCached`）
    - 避免重复解析相同内容
 
+### 2.6 Stream-Based (Chunked) 解析的代码挂载点
+
+RSS-Bridge 在 HTTP 传输层支持 chunked transfer encoding，但在解析层采用"完整接收→整体解析"的两步模型，没有真正的流式解析器。
+
+#### 2.6.1 数据流架构总览
+
+```
+远端服务器 (可能使用 Transfer-Encoding: chunked)
+     ↓
+[cURL 层] CurlHttpClient::request()
+     ├─ CURLOPT_HEADERFUNCTION  ← 逐块接收响应头
+     ├─ CURLOPT_PROGRESSFUNCTION ← 逐块监控下载进度/大小
+     └─ CURLOPT_RETURNTRANSFER   ← 完整 body 存入内存字符串
+     ↓
+[内存] 完整 HTML/XML 字符串
+     ↓
+[解析层] 整体解析 (非流式)
+     ├─ str_get_html()         ← simple_html_dom: 一次性 DOM 树构建
+     ├─ simplexml_load_string() ← SimpleXML: 一次性对象树构建
+     ├─ DOMDocument::loadHTML() ← DOMDocument: 一次性 DOM 树构建
+     └─ json_decode()          ← JSON: 一次性数组/对象构建
+     ↓
+可用的解析结果
+```
+
+**关键结论**: chunked encoding 只在传输阶段由 cURL 处理，解析层始终接收完整字符串。
+
+#### 2.6.2 传输层流式处理挂载点
+
+**挂载点 1: `CURLOPT_HEADERFUNCTION` - 响应头逐块回调**
+
+**位置**: `lib/http.php:146-168`
+
+```php
+$responseStatusLines = [];
+$responseHeaders = [];
+curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $rawHeader) use (&$responseHeaders, &$responseStatusLines) {
+    $len = strlen($rawHeader);
+    if ($rawHeader === "\r\n") {
+        // 空行 = header 结束标记，直接跳过
+        return $len;
+    }
+    if (preg_match('#^HTTP/(2|1.1|1.0)#', $rawHeader)) {
+        // 状态行 (可能有多条，如 100 Continue 之后是 200 OK)
+        $responseStatusLines[] = trim($rawHeader);
+        return $len;
+    }
+    $header = explode(':', $rawHeader);
+    if (count($header) === 1) {
+        return $len;
+    }
+    $name = mb_strtolower(trim($header[0]));
+    $value = trim(implode(':', array_slice($header, 1)));
+    if (!isset($responseHeaders[$name])) {
+        $responseHeaders[$name] = [];
+    }
+    $responseHeaders[$name][] = $value;
+    return $len;  // ⚠️ 必须返回读取的字节数，否则 cURL 会中止传输
+});
+```
+
+**处理特征**:
+- cURL 每收到一行 header 就调用一次回调
+- 重定向时会收到多组 header（先 302，再 200）
+- `Transfer-Encoding: chunked` 在此阶段已被 cURL 解码，回调收到的是完整 header 行
+- 返回值错误（非 `$len`）会导致传输立即中断
+
+**挂载点 2: `CURLOPT_PROGRESSFUNCTION` - 下载进度回调**
+
+**位置**: `lib/http.php:122-131`
+
+```php
+if ($config['max_filesize']) {
+    curl_setopt($ch, CURLOPT_MAXFILESIZE, $config['max_filesize']);
+    curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+    curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($ch, $downloadSize, $downloaded, $uploadSize, $uploaded) use ($config) {
+        // 回调被 cURL 频繁调用（每个 chunk 至少一次）
+        if ($downloaded > $config['max_filesize']) {
+            // 返回非零值 → cURL 立即中止下载
+            return -1;
+        }
+        return 0;
+    });
+}
+```
+
+**双保险机制**:
+1. **`CURLOPT_MAXFILESIZE`**: 仅检查 `Content-Length` 头，对 chunked 响应无效（无 Content-Length）
+2. **进度回调**: 检查实际已下载字节数，对 chunked 响应也有效
+
+**chunked 传输下的行为**:
+- `$downloadSize` 在 chunked 模式下通常为 0（未知总大小）
+- `$downloaded` 实时更新为已接收的字节数
+- 超过限制时返回 `-1`，cURL 返回 `CURLE_ABORTED_BY_CALLBACK` 错误
+
+#### 2.6.3 传输重试机制（透明容错）
+
+**位置**: `lib/http.php:170-192`
+
+```php
+// This retry logic is a bit hard to understand, but it works
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        // 网络调用成功，跳出循环
+        break;
+    }
+    if ($tries <= $config['retries']) {  // 默认 retries = 2
+        // 失败，重试（不重新创建 cURL handle）
+        continue;
+    }
+    // 达到最大重试次数，抛出异常
+    $curl_error = curl_error($ch);
+    $curl_errno = curl_errno($ch);
+    throw new HttpException(sprintf(
+        'cURL error %s: %s (%s) for %s',
+        $curl_error,
+        $curl_errno,
+        'https://curl.haxx.se/libcurl/c/libcurl-errors.html',
+        $url
+    ));
+}
+```
+
+**重试触发条件**（`curl_exec() === false`）:
+- 网络超时
+- DNS 解析失败
+- TCP 连接断开
+- chunked 传输中连接中断
+- SSL 握手失败
+- 进度回调返回非零（主动中止不算失败，因为 body 已接收部分）
+
+**重试不触发条件**:
+- HTTP 4xx / 5xx 状态码（此时 `curl_exec()` 返回 body，不是 `false`）
+- `max_filesize` 通过 `Content-Length` 头拒绝（请求根本没发出去）
+
+#### 2.6.4 解析层：无流式解析的设计权衡
+
+**所有解析器均为整体加载**：
+
+| 解析器 | 入口函数 | 是否流式 | 内存行为 |
+|--------|----------|---------|----------|
+| simple_html_dom | `str_get_html($html)` | ❌ 否 | 完整 DOM 树驻留内存 |
+| SimpleXML | `simplexml_load_string($xml)` | ❌ 否 | 对象树代理，底层 libxml 节点 |
+| DOMDocument | `loadHTML($html)` | ❌ 否 | 完整 DOM 树，libxml 管理 |
+| JSON | `json_decode($json)` | ❌ 否 | 完整数组/对象树 |
+
+**为何不使用流式解析器**：
+1. **RSS-Bridge 处理规模**: 文章列表页通常 < 1MB，详情页 < 5MB，整体加载无压力
+2. **`MAX_FILE_SIZE` 限制**: simple_html_dom 默认 600KB 上限，防止超大文档
+3. **`http.max_filesize` 配置**: 传输层硬限制，超限即中止
+4. **解析 API 便捷性**: DOM 树可任意 `find()` 查询，流式解析需要手动维护状态机
+
+**替代的流式处理方案**:
+- `XMLReader` (PHP 扩展) - 真正的流式 XML 解析，但 RSS-Bridge 未使用
+- `fopen()` + stream wrappers - 用于 MIME 类型检测等小文件处理
+
+#### 2.6.5 MIME 类型检测的逐行流式处理
+
+**位置**: `lib/utils.php:183-217`
+
+```php
+// 读取 /etc/mime.types 时使用 fgets() 逐行处理，避免一次性加载大文件
+if (file_exists('/etc/mime.types')) {
+    $file = fopen('/etc/mime.types', 'r');
+    while (($line = fgets($file)) !== false) {
+        $line = trim(preg_replace('/#.*/', '', $line));
+        if (!$line) {
+            continue;
+        }
+        $parts = preg_split('/\s+/', $line);
+        if (count($parts) > 1) {
+            $type = array_shift($parts);
+            foreach ($parts as $part) {
+                $typeMaps[$part] = $type;
+            }
+        }
+    }
+    fclose($file);
+}
+```
+
+**这是项目中少数真正使用流式读取的场景**，但目的是读取系统配置文件而非网络响应。
+
+#### 2.6.6 Chunked Transfer Encoding 的完整处理链
+
+```
+服务器发送 chunked 响应:
+HTTP/1.1 200 OK
+Transfer-Encoding: chunked
+Content-Type: text/html
+
+5\r\n        ← chunk 1: 5 字节
+Hello\r\n
+6\r\n        ← chunk 2: 6 字节
+World!\r\n
+0\r\n        ← 结束 chunk
+\r\n
+
+     ↓ cURL 自动解码 (CURLOPT_RETURNTRANSFER)
+     ↓ HeaderFunction 被调用 4 次 (HTTP/1.1, Transfer-Encoding, Content-Type, 空行)
+     ↓ ProgressFunction 被调用 N 次 (每个 chunk 更新 $downloaded)
+
+存储到 $body 变量: "HelloWorld!"  (已去除 chunk size 和 \r\n)
+     ↓
+FeedParser / simple_html_dom / json_decode 整体解析
+```
+
+**cURL 自动处理的协议细节**:
+- Chunk size 解析和去除
+- `\r\n` 分隔符去除
+- 最后 zero-size chunk 识别
+- gzip/deflate 解压（`CURLOPT_ENCODING = ''` 自动协商）
+
 ---
 
 ## 三、路径修正工作流程
@@ -1753,6 +1969,302 @@ T=1.7: 请求 C 收到响应，覆盖缓存
 | 防止缓存击穿 | 加锁或预热缓存 | 完全依赖自动过期 |
 | 多上下文 Bridge | 缓存键包含 context | 只使用固定 key 名称 |
 
+### 6.9 Bridge 失败时的 Fallback 内容代码路径
+
+RSS-Bridge 构建了从传输层到应用层的多层 fallback 体系，确保在各种失败场景下尽可能返回有意义的内容而非空白页面。
+
+#### 6.9.1 Fallback 层级总览
+
+```
+HTTP 请求发起
+     ↓
+┌─────────────────────────────────────────────────────┐
+│  层级 1: cURL 重试 (lib/http.php:170-192)           │
+│  网络失败自动重试 2 次                               │
+├─────────────────────────────────────────────────────┤
+│  层级 2: 源数据 URL/格式 fallback                    │
+│  ├─ WordPressBridge: /feed/atom/ 失败 → /?feed=atom │
+│  ├─ FeedExpander: XML 解析异常 → 抛出异常           │
+│  └─ YoutubeBridge: API 方式失败 → try/catch         │
+├─────────────────────────────────────────────────────┤
+│  层级 3: CSS 选择器链 fallback                       │
+│  ├─ ?? 运算符链式降级 (5+ 个常见选择器依次尝试)      │
+│  ├─ 多级嵌套属性访问 ?? null                        │
+│  └─ find($selector, 0) ?? null → 异常处理           │
+├─────────────────────────────────────────────────────┤
+│  层级 4: FeedMergeBridge 单条失败跳过                │
+│  catch HttpException → continue 下一条 feed         │
+├─────────────────────────────────────────────────────┤
+│  层级 5: DisplayAction 全局异常处理                  │
+│  ├─ ClientException → 只记录 debug 日志             │
+│  ├─ RateLimitException → 返回 429 错误页             │
+│  ├─ HttpException 429/503 → 立即返回错误页           │
+│  ├─ 其他异常 → 记录 error 日志                      │
+│  └─ error.output = 'feed' → 渲染错误为 feed item    │
+├─────────────────────────────────────────────────────┤
+│  层级 6: ExceptionMiddleware 兜底                    │
+│  Throwable → 渲染 500 错误页模板                     │
+└─────────────────────────────────────────────────────┘
+     ↓
+最终响应 (正常内容 / 错误 feed item / 错误 HTML 页)
+```
+
+#### 6.9.2 层级 1: cURL 传输层自动重试
+
+**位置**: `lib/http.php:170-192`
+
+```php
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        break;  // 成功，跳出
+    }
+    if ($tries <= $config['retries']) {  // 默认 retries = 2
+        continue;  // 失败，重试
+    }
+    // 2 次重试全部失败，抛出异常
+    throw new HttpException(sprintf('cURL error %s: %s ...', $curl_error, $curl_errno));
+}
+```
+
+**重试触发场景**:
+- 网络超时、DNS 失败、TCP 断开、SSL 失败等连接层错误
+- chunked 传输中途连接断开
+
+**不重试场景**:
+- HTTP 4xx/5xx（`curl_exec()` 返回 body，不是 `false`）
+- `max_filesize` 超限被 `Content-Length` 头拦截
+
+#### 6.9.3 层级 2: 源数据 URL/格式 Fallback
+
+**模式 A: 备用 Feed URL**
+
+**位置**: `bridges/WordPressBridge.php:30-34`
+
+```php
+try {
+    $this->collectExpandableDatas($this->getURI() . '/feed/atom/', $limit);
+} catch (Exception $e) {
+    // 标准 Atom Feed 路径失败，尝试查询参数形式
+    $this->collectExpandableDatas($this->getURI() . '/?feed=atom', $limit);
+}
+```
+
+**模式 B: Cloudflare 识别与特殊异常**
+
+**位置**: `lib/http.php:23-35`
+
+```php
+public static function fromResponse(Response $response, string $url): HttpException
+{
+    $message = sprintf('%s resulted in %s %s', $url, $response->getCode(), $response->getStatusLine());
+    if (CloudFlareException::isCloudFlareResponse($response)) {
+        // 识别出 Cloudflare 拦截页，抛专用子类
+        return new CloudFlareException($message, $response->getCode(), $response);
+    }
+    return new HttpException(trim($message), $response->getCode(), $response);
+}
+```
+
+**Cloudflare 检测特征** (`lib/http.php:40-55`):
+- `<title>Just a moment...`
+- `<title>Please Wait...`
+- `<title>Attention Required!`
+- `<title>Access denied</title>`
+- 匹配到即标记为 `CloudFlareException`，上层可针对性处理
+
+**模式 C: XML 预处理降级**
+
+**位置**: `lib/FeedExpander.php:61-70`
+
+```php
+protected function prepareXml(string $xmlString): string
+{
+    $problematicStrings = [
+        '&nbsp;',   // XML 中不是合法实体
+        '&raquo;',
+        '&rsquo;',
+    ];
+    return str_replace($problematicStrings, '', $xmlString);
+}
+```
+
+> 这是一种"移除而不是修复"的降级策略：宁可丢失一些 HTML 实体字符，也要保证 XML 能被解析。
+
+#### 6.9.4 层级 3: CSS 选择器链 Fallback
+
+**模式 A: `??` 运算符链式降级**
+
+**位置**: `bridges/WordPressBridge.php:43-61`
+
+```php
+$article = null;
+switch (true) {
+    case !empty($this->getInput('content-selector')):
+        $article = $dom->find($this->getInput('content-selector'), 0);
+        break;
+    case !is_null($dom->find('[itemprop=articleBody]', 0)):
+        $article = $dom->find('[itemprop=articleBody]', 0);
+        break;
+    case !is_null($dom->find('.article-content', 0)):
+        $article = $dom->find('.article-content', 0);
+        break;
+    case !is_null($dom->find('article', 0)):
+        $article = $dom->find('article', 0);
+        break;
+    // ... 共 6 级降级
+}
+```
+
+**位置**: `bridges/YoutubeBridge.php:463-467`
+
+```php
+// JSON 属性访问多级 fallback
+$title = $wrapper->title->runs[0]->text
+      ?? $wrapper->title->accessibility->accessibilityData->label
+      ?? null;
+
+$publishedTimeText = $wrapper->publishedTimeText->simpleText
+                  ?? $wrapper->videoInfo->runs[2]->text
+                  ?? null;
+```
+
+**模式 B: `or throw` 断言式失败**
+
+**位置**: `bridges/XenForoBridge.php:130,142,169,255`
+
+```php
+$titleBar = $postsBar->find('.titleBar', 0)
+    or throwServerException('Error finding title bar!');
+```
+
+这利用了 PHP 的短路求值：`find()` 返回 `null` 时触发 `or` 后面的 `throwServerException()`。
+
+#### 6.9.5 层级 4: FeedMergeBridge 单条失败跳过
+
+**位置**: `bridges/FeedMergeBridge.php:62-87`
+
+```php
+foreach ($feeds as $feed) {
+    if (count($feeds) > 1) {
+        try {
+            $this->collectExpandableDatas($feed, 10);
+        } catch (HttpException $e) {
+            // ⭐ 单条 feed 失败不影响其他，静默跳过
+            continue;
+        }
+    } else {
+        $this->collectExpandableDatas($feed, 10);
+    }
+}
+```
+
+**设计意图**: 多 feed 合并时局部容错，整体可用性优先。
+
+#### 6.9.6 层级 5: DisplayAction 全局异常处理
+
+**位置**: `actions/DisplayAction.php:73-124`
+
+```php
+try {
+    $bridge->loadConfiguration();
+    $bridge->setInput($input);
+    $bridge->collectData();
+    $items = $bridge->getItems();
+} catch (\Throwable $e) {
+    // 异常分类处理
+    if ($e instanceof ClientException) {
+        $this->logger->debug(...);          // 用户输入错误：只记 debug
+    } elseif ($e instanceof RateLimitException) {
+        return new Response(..., 429);      // 限流：返回 429
+    } elseif ($e instanceof HttpException) {
+        if (in_array($e->getCode(), [429, 503])) {
+            return new Response(..., $e->getCode());  // 服务不可用：立即返回
+        }
+        // 其他 HTTP 错误（404 等）：正常走错误报告流程
+    } else {
+        $this->logger->error(...);          // 未知错误：记 error 日志
+    }
+
+    // 错误报告频率限制
+    $errorCount = $this->logBridgeError($bridge->getName(), $e->getCode());
+    if ($errorCount >= $reportLimit) {
+        // 超过阈值，根据配置返回不同形式的错误
+        if ($errorOutput === 'feed') {
+            // ⭐ Fallback 内容：把异常渲染成一个 feed item
+            $items = [$this->createFeedItemFromException($e, $bridge)];
+        } elseif ($errorOutput === 'http') {
+            return new Response(render(...), 500);  // 返回 HTML 错误页
+        } elseif ($errorOutput === 'none') {
+            // 静默：产生一个空 feed
+        }
+    }
+}
+```
+
+**错误 feed item 构造** (`DisplayAction.php:146-170`):
+```php
+private function createFeedItemFromException($e, $bridge): array
+{
+    // 每 24 小时一个唯一标识符，避免 feed 阅读器识别为重复条目
+    $uniqueIdentifier = urlencode((int)(time() / 86400));
+    $title = sprintf('Bridge returned error %s! (%s)', $e->getCode(), $uniqueIdentifier);
+    $item['title'] = $title;
+    $item['uri'] = get_current_url();
+    $item['timestamp'] = time();
+    $item['uid'] = $bridge->getName() . '_' . $uniqueIdentifier;
+
+    // 内容包含：异常栈 + GitHub 搜索链接 + Issue 创建链接 + 维护者
+    $content = render_template('bridge-error.html.php', [
+        'error' => render_template('exception.html.php', ['e' => $e]),
+        'searchUrl' => self::createGithubSearchUrl($bridge),
+        'issueUrl' => self::createGithubIssueUrl($bridge, $e),
+        'maintainer' => $bridge->getMaintainer(),
+    ]);
+    $item['content'] = $content;
+    return $item;
+}
+```
+
+**三种错误输出模式**:
+| `error.output` 配置 | 行为 | 适用场景 |
+|---------------------|------|----------|
+| `feed` | 异常渲染为 feed item，HTTP 200 | RSS 阅读器友好，用户能看到错误信息 |
+| `http` | 返回 500 HTML 错误页 | 浏览器访问，用户能看到完整栈跟踪 |
+| `none` | 返回空 feed（HTTP 200） | 静默失败，不打扰用户 |
+
+#### 6.9.7 层级 6: ExceptionMiddleware 兜底
+
+**位置**: `middlewares/ExceptionMiddleware.php:14-23`
+
+```php
+public function __invoke(Request $request, $next): Response
+{
+    try {
+        return $next($request);
+    } catch (\Throwable $e) {
+        $this->logger->error('Exception in ExceptionMiddleware', ['e' => $e]);
+        // 所有未被 DisplayAction 捕获的异常都在这里兜底
+        return new Response(render(__DIR__ . '/../templates/exception.html.php', ['e' => $e]), 500);
+    }
+}
+```
+
+**触发场景**: DisplayAction 之外的 Action（FrontpageAction、ListAction、DetectAction 等）抛出的异常。
+
+#### 6.9.8 Fallback 策略的设计权衡
+
+| 策略 | 优点 | 缺点 | 适用场景 |
+|------|------|------|----------|
+| 自动重试 | 对瞬时网络抖动透明 | 增加延迟，可能放大源站压力 | cURL 传输层 |
+| URL 降级 | 兼容不同源站配置 | 可能试错浪费资源 | WordPress 等多路径 Feed |
+| 选择器链降级 | 兼容网站模板改版 | 可能选到错误内容，静默产生脏数据 | CSS 选择器定位文章 |
+| 单条失败跳过 | 整体可用性优先 | 用户可能丢失部分内容而不自知 | FeedMergeBridge |
+| 错误转 Feed Item | RSS 阅读器友好，有 GitHub 链接 | 非 RSS 格式输出场景无效 | `error.output = 'feed'` |
+| 错误转 HTTP 500 页 | 调试信息完整 | RSS 阅读器可能忽略 | 浏览器访问 + 开发模式 |
+
 ---
 
 ## 七、关键设计模式总结
@@ -1887,9 +2399,16 @@ case 202:
 | 时区处理示例 | `bridges/TestFaktaBridge.php` | DateTimeZone 44-47 |
 | 时区处理示例 | `bridges/VkBridge.php` | 相对时间 490-504 |
 | 时区处理示例 | `bridges/XenForoBridge.php` | data-time 235-237, 时区注释 372 |
-| FeedMerge 多 Feed 合并 | `bridges/FeedMergeBridge.php` | 循环解析 62-87 |
+| FeedMerge 多 Feed 合并 | `bridges/FeedMergeBridge.php` | 循环解析 62-87, 单条失败跳过 62-87 |
 | URL 自动检测 | `actions/DetectAction.php` | 遍历 Bridge 25-45 |
 | 缓存键冲突示例 | `bridges/YoutubeBridge.php` | rate_limit 全局缓存 76-84 |
 | 缓存键冲突示例 | `bridges/SpotifyBridge.php` | clientid 缓存键 152-154 |
 | 缓存键冲突示例 | `lib/TwitterClient.php` | 全局 twitter 缓存 15,274 |
-| 默认配置 | `config.default.ini.php` | timezone 32, max_filesize |
+| HTTP 客户端与流式处理 | `lib/http.php` | CurlHttpClient 63-198, 头部回调 146-168, 进度回调 122-131, 重试 170-192 |
+| Cloudflare 识别 | `lib/http.php` | CloudFlareException 38-56 |
+| DisplayAction 全局异常处理 | `actions/DisplayAction.php` | createResponse 69-144, 错误 Feed Item 146-170, 错误计数 172-191 |
+| ExceptionMiddleware 兜底 | `middlewares/ExceptionMiddleware.php` | 1-24 |
+| MIME 类型流式读取 | `lib/utils.php` | fgets 逐行 183-217 |
+| 选择器链 Fallback 示例 | `bridges/YoutubeBridge.php` | JSON ?? 链 463-467 |
+| 选择器链 Fallback 示例 | `bridges/XenForoBridge.php` | or throw 130,142,169,255 |
+| 默认配置 | `config.default.ini.php` | timezone 32, max_filesize, error output |
