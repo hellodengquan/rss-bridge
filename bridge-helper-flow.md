@@ -413,6 +413,173 @@ protected function parseItem(array $item)
 }
 ```
 
+### 2.5 大文档下三种解析器的内存占用对比
+
+RSS-Bridge 在不同场景使用三种 XML/HTML 解析器，它们的内存模型和占用差异巨大，在处理大文档时需要特别关注。
+
+#### 2.5.1 三种解析器内存模型对比
+
+| 解析器 | 使用场景 | 实现语言 | 内存模型 | 内存效率 |
+|--------|----------|----------|----------|----------|
+| **SimpleXML** | FeedParser 解析 RSS/Atom Feed | C（PHP 扩展） | 整个文档加载到内存，形成对象树 | ⭐⭐⭐⭐⭐ 最高 |
+| **DOMDocument** | XPathAbstract 解析 HTML | C（libxml） | 整个文档加载到内存，DOM 树 | ⭐⭐⭐⭐ 高 |
+| **simple_html_dom** | 大部分 Bridge 解析 HTML | 纯 PHP | 节点数组 + 循环引用 + 文本复制 | ⭐⭐ 低 |
+
+#### 2.5.2 simple_html_dom 内存结构深度分析
+
+**位置**: `lib/simplehtmldom/simple_html_dom.php:130-164`
+
+```php
+class simple_html_dom_node
+{
+    public $nodetype = HDOM_TYPE_TEXT;    // 节点类型
+    public $tag = 'text';                  // 标签名
+    public $attr = array();                // 属性数组
+    public $children = array();            // 直接子节点数组
+    public $nodes = array();               // 所有子节点（含文本节点）
+    public $parent = null;                 // 父节点引用（循环引用！）
+    public $_ = array();                   // 位置信息数组（BEGIN, END, TEXT 等 8 个）
+    public $tag_start = 0;                 // 标签起始位置
+    private $dom = null;                   // DOM 根引用
+}
+```
+
+**内存开销构成**：
+1. **节点对象本身**: 每个 `simple_html_dom_node` 对象约 1-2KB 基础开销
+2. **`$_` 数组**: 存储 8 个位置索引（BEGIN, END, QUOTE, SPACE, TEXT, INNER, OUTER, ENDSPACE）
+3. **`children` + `nodes` 数组**: 子节点引用，造成重复存储
+4. **循环引用**: `parent` <-> `children` 形成引用环，GC 无法自动回收
+5. **文本复制**: `innertext()`, `outertext()` 等方法通过字符串截取生成新字符串
+
+**文档级内存结构** (`simple_html_dom` 类):
+```php
+class simple_html_dom
+{
+    public $nodes = array();      // 所有节点的平面数组（引用所有节点）
+    public $doc = '';             // 原始 HTML 文档字符串
+    public $noise = array();      // 被移除的噪音（script/style/comment 等）
+    // ...
+}
+```
+
+**内存放大系数**: 对于普通 HTML 文档，simple_html_dom 的内存占用约为原始 HTML 大小的 **8-15 倍**。
+
+#### 2.5.3 SimpleXML 内存结构分析
+
+**位置**: `lib/FeedParser.php:19`
+
+```php
+$xml = simplexml_load_string(trim($xmlString));
+```
+
+**内存特性**:
+- **C 级实现**: SimpleXML 是 PHP 扩展，底层用 C 实现，内存效率接近原生 C 代码
+- **按需加载**: 属性和子节点在首次访问时才创建 PHP 对象代理
+- **引用计数**: 多个 SimpleXMLElement 对象共享底层 libxml 节点
+- **无循环引用**: 父子关系通过内部指针管理，不形成 PHP 层面的循环引用
+
+**内存放大系数**: 约为原始 XML 大小的 **1.5-3 倍**。
+
+#### 2.5.4 DOMDocument 内存结构分析
+
+**位置**: `lib/XPathAbstract.php:404-406`
+
+```php
+$webPageHtml = new \DOMDocument();
+libxml_use_internal_errors(true);
+$webPageHtml->loadHTML($this->provideWebsiteContent());
+```
+
+**内存特性**:
+- **libxml 原生 DOM**: 底层由 libxml2 C 库实现，内存效率高
+- **DOM 树结构**: 完整的 W3C DOM 实现，节点类型丰富
+- **PHP 代理对象**: `DOMNode`, `DOMElement` 等是对底层 C 节点的 PHP 包装
+- **XPath 查询高效**: 底层原生 XPath 引擎，查询速度快
+
+**内存放大系数**: 约为原始 HTML 大小的 **2-4 倍**。
+
+#### 2.5.5 内存泄漏与释放机制
+
+**simple_html_dom 的内存泄漏问题**:
+
+**位置**: `lib/simplehtmldom/simple_html_dom.php:1598-1620`
+
+```php
+// This add next line is documented in the sourceforge repository.
+// 2977248 as a fix for ongoing memory leaks that occur even with the
+// use of clear.
+if (isset($this->children)) {
+    foreach ($this->children as $n) {
+        $n->clear();
+        $n = null;
+    }
+}
+
+if (isset($this->parent)) {
+    $this->parent->clear();
+    unset($this->parent);  // 手动断开循环引用
+}
+
+if (isset($this->root)) {
+    $this->root->clear();
+    unset($this->root);
+}
+
+unset($this->doc);
+unset($this->noise);
+```
+
+**问题根源**:
+1. **循环引用**: `parent` 指向父节点，`children` 包含子节点 → 形成引用环
+2. **PHP GC 延迟**: 循环引用需要 PHP 周期收集器运行才能回收，有延迟
+3. **clear() 不彻底**: SourceForge #2977248 号 bug 显示即使调用 `clear()` 仍有内存泄漏
+
+**RSS-Bridge 中的内存风险点**:
+
+| 场景 | 代码位置 | 风险等级 | 说明 |
+|------|----------|----------|------|
+| FeedExpander 批量解析 | `lib/FeedExpander.php:36-42` | 中 | 循环解析每个 item，SimpleXML 对象循环结束后自动释放 |
+| getSimpleHTMLDOMCached 大页面 | `lib/contents.php:219-251` | 高 | 大页面 DOM 对象可能占用数十 MB |
+| FeedMergeBridge 多 Feed 合并 | `bridges/FeedMergeBridge.php:62-87` | 中 | 连续调用 collectExpandableDatas，上一个 Feed 的 DOM 在下一次调用前未释放 |
+| convertLazyLoading 遍历所有 img | `lib/html.php:362-424` | 中 | 遍历 DOM 树可能创建大量临时对象 |
+
+#### 2.5.6 MAX_FILE_SIZE 限制
+
+**位置**: `lib/simplehtmldom/simple_html_dom.php:45`
+
+```php
+defined('MAX_FILE_SIZE') || define('MAX_FILE_SIZE', 600000);  // 600 KB
+```
+
+**作用**:
+- `file_get_html()` 等函数使用此常量限制最大文件大小
+- 防止超大文档导致内存耗尽
+- RSS-Bridge 中主要通过 `getContents()` 层面的 `max_filesize` 配置控制
+
+**配置位置**: `config.default.ini.php` → `http.max_filesize`
+
+#### 2.5.7 内存优化建议
+
+1. **及时释放 DOM 对象**:
+   ```php
+   $dom = getSimpleHTMLDOMCached($url);
+   $content = $dom->find('.article', 0)->innertext;
+   $dom->clear();  // 手动释放
+   unset($dom);
+   ```
+
+2. **优先使用 SimpleXML 处理 XML**:
+   - Feed 解析用 SimpleXML，不用 simple_html_dom
+   - 结构化数据优先用 JSON + `json_decode()`，内存效率最高
+
+3. **大文档分页处理**:
+   - 不要一次性加载整个大文档
+   - 能用 API 接口就不用爬取完整 HTML
+
+4. **利用缓存减少解析次数**:
+   - 解析结果缓存（`getSimpleHTMLDOMCached`）
+   - 避免重复解析相同内容
+
 ---
 
 ## 三、路径修正工作流程
@@ -1380,6 +1547,212 @@ case 202:
 | 解析依赖 `now()` 或 `date()` | ❌ 否 | 每次调用时间不同 |
 | 解析依赖随机数 (`rand()`) | ❌ 否 | 随机值不同 |
 
+### 6.8 Multi-Bridge 执行时的缓存键冲突分析
+
+RSS-Bridge 中存在多种多 Bridge 执行场景，不同场景下缓存键冲突的风险和影响各不相同。
+
+#### 6.8.1 Multi-Bridge 执行场景总览
+
+| 场景 | 执行方式 | 并发/顺序 | 缓存冲突风险 |
+|------|----------|----------|-------------|
+| **FeedMergeBridge** | 单进程内顺序执行 1-10 个 Feed | 顺序 | ⚠️ 中 |
+| **DetectAction** | 遍历所有 Bridge 检测 URL 匹配 | 顺序 | ✅ 低 |
+| **批量请求** | 用户发起多次独立请求 | 并发（多进程） | ⚠️ 中 |
+| **同一 Bridge 多上下文** | 单 Bridge 多个 context 参数 | 同一进程内 | ❌ 高 |
+
+#### 6.8.2 FeedMergeBridge 缓存键冲突路径
+
+**位置**: `bridges/FeedMergeBridge.php:62-87`
+
+```php
+foreach ($feeds as $feed) {
+    if (count($feeds) > 1) {
+        try {
+            $this->collectExpandableDatas($feed, 10);
+        } catch (HttpException $e) {
+            // 容错：单个 feed 失败不影响整体
+            continue;
+        }
+    } else {
+        $this->collectExpandableDatas($feed, 10);
+    }
+}
+```
+
+**执行流程**:
+```
+FeedMergeBridge::collectData()
+     ↓
+循环 10 个 feed URL
+     ↓
+collectExpandableDatas(feed_url, 10)
+     ↓ 每层都可能命中缓存
+getContents(feed_url)         → 缓存键: server_ + feed_url
+     ↓
+FeedParser::parseFeed()       → SimpleXML 对象，无缓存
+     ↓
+parseItem($item)              → 具体 Bridge 自定义逻辑
+     ↓ 若 Bridge 内部抓取详情页
+getSimpleHTMLDOMCached(item_url) → 缓存键: pages_ + item_url
+     ↓
+$this->items[] = $item        → 累加到同一数组
+```
+
+**缓存冲突分析**:
+
+| 缓存层 | 是否冲突 | 原因 | 影响 |
+|--------|---------|------|------|
+| **CacheMiddleware** | 不冲突 | FeedMerge 是单个请求，只有一个缓存键 | 无 |
+| **getContents** | 不冲突 | 不同 feed 有不同 URL → 不同缓存键 | 无 |
+| **getSimpleHTMLDOMCached** | ⚠️ 可能冲突 | 不同 feed 可能有相同的文章 URL（转载） | 共享缓存，节省资源 |
+| **Bridge 自定义缓存** | ⚠️ 可能冲突 | 缓存键包含 `getShortName()`，但同一 Bridge 相同 key 会冲突 | 不同 feed 共享同一份缓存数据 |
+
+**隐藏风险点**: `FeedMergeBridge` 本身继承自 `FeedExpander`，如果合并的是两个 WordPressBridge 的 feed，那在 parseItem 时... 等等，不对，FeedMergeBridge 直接用 FeedExpander 的 parseItem（默认返回原 item），不会触发 WordPressBridge 的 parseItem。
+
+**真实风险**: 如果两个 feed 中包含相同的文章 URL，`getSimpleHTMLDOMCached` 会共享缓存。这通常是好事，但如果两个 feed 的文章内容虽然 URL 相同但实际内容不同（如 A/B 测试），就会出现内容不一致。
+
+#### 6.8.3 DetectAction 遍历所有 Bridge
+
+**位置**: `actions/DetectAction.php:25-45`
+
+```php
+foreach ($this->bridgeFactory->getBridgeClassNames() as $bridgeClassName) {
+    if (!$this->bridgeFactory->isEnabled($bridgeClassName)) {
+        continue;
+    }
+
+    $bridge = $this->bridgeFactory->create($bridgeClassName);
+    $bridgeParams = $bridge->detectParameters($url);
+
+    if (!$bridgeParams) {
+        continue;
+    }
+    // 找到第一个匹配的就重定向
+    $query = ['action' => 'display', 'bridge' => $bridgeClassName, 'format' => $format];
+    $query = array_merge($query, $bridgeParams);
+    return new Response('', 301, ['location' => '?' . http_build_query($query)]);
+}
+```
+
+**缓存冲突分析**:
+- **CacheMiddleware**: DetectAction 不走 DisplayAction 缓存（`$action !== 'DisplayAction'` 时跳过）
+- **getContents**: 大多数 `detectParameters()` 实现不发起 HTTP 请求，只做 URL 正则匹配 → 无缓存
+- **结论**: 缓存冲突风险极低
+
+#### 6.8.4 同一 Bridge 多上下文的缓存键冲突
+
+**位置**: `lib/BridgeAbstract.php:145, 325-333`
+
+```php
+// 输入参数处理
+unset($input['context']);  // context 从参数中移除
+
+// 自定义缓存键
+protected function loadCacheValue(string $key, $default = null)
+{
+    return $this->cache->get($this->getShortName() . '_' . $key, $default);
+}
+
+protected function saveCacheValue(string $key, $value, int $ttl = 86400)
+{
+    $this->cache->set($this->getShortName() . '_' . $key, $value, $ttl);
+}
+```
+
+**风险点**:
+- `saveCacheValue()` 的缓存键只包含 `getShortName()` + `$key`，**不包含 context**
+- 如果同一 Bridge 有多个 context，且使用相同的 key 保存缓存，会发生**缓存互相覆盖**
+
+**实际案例**: `PepperBridgeAbstract.php:270-277`
+
+```php
+$cacheKey = $this->getInput('url') . 'TITLE';  // ⚠️ 用 URL 做缓存键，不包含 context
+$title = $this->loadCacheValue($cacheKey);
+// ...
+$this->saveCacheValue($cacheKey, $title, 86400 * 15);
+```
+
+> **注意**: PepperBridgeAbstract 用 `getInput('url')` 做 key 的一部分，实际上避免了 context 冲突。但如果 Bridge 只用固定字符串做 key，就会有问题。
+
+#### 6.8.5 多进程并发请求的缓存键冲突
+
+**场景**: 多个用户同时请求同一个 Bridge，或同一个用户刷新页面
+
+**四层缓存的并发行为**:
+
+| 缓存层 | 并发安全性 | 冲突表现 |
+|--------|-----------|----------|
+| **CacheMiddleware** | 安全 | 相同请求得到相同缓存，无冲突 |
+| **getContents** | 基本安全 | 缓存击穿：缓存失效瞬间大量请求穿透到源站 |
+| **getSimpleHTMLDOMCached** | 基本安全 | 同上，缓存击穿问题 |
+| **Bridge 自定义缓存** | ⚠️ 视实现而定 | 如果 saveCacheValue 非原子操作，可能出现竞态条件 |
+
+**缓存击穿路径** (`getContents` 为例):
+```
+T=0: 缓存键 server_example.com 即将过期
+T=0.1: 请求 A 到达，缓存 miss → 发起 HTTP 请求
+T=0.2: 请求 B 到达，缓存 miss → 发起 HTTP 请求
+T=0.3: 请求 C 到达，缓存 miss → 发起 HTTP 请求
+...
+T=1.5: 请求 A 收到响应，写入缓存
+T=1.6: 请求 B 收到响应，覆盖缓存
+T=1.7: 请求 C 收到响应，覆盖缓存
+```
+
+**结果**: 缓存失效瞬间，N 个并发请求会穿透到源站，造成瞬时压力。
+
+#### 6.8.6 缓存键冲突的真实 Bug 挂载点
+
+1. **getSimpleHTMLDOMCached 相同 URL 不同 Header**
+
+   **位置**: `lib/contents.php:236`
+   ```php
+   $cacheKey = 'pages_' . $url;  // ⚠️ 只包含 URL，不包含 header
+   ```
+   **场景**: 同一 URL 用不同的 `Accept` header 请求（如 HTML vs JSON）
+   **后果**: 第一个请求缓存了 HTML，第二个请求会拿到 HTML 而不是期望的 JSON
+
+2. **SpotifyBridge 用 clientid 做缓存键**
+
+   **位置**: `bridges/SpotifyBridge.php:152-154`
+   ```php
+   $cacheKey = sprintf('SpotifyBridge:%s:%s', $this->getInput('clientid'), $this->getInput('clientsecret'));
+   $token = $this->cache->get($cacheKey);
+   ```
+   **问题**: clientsecret 不应出现在缓存键中（安全考虑），且缓存键可能过长
+
+3. **YoutubeBridge rate_limit 缓存**
+
+   **位置**: `bridges/YoutubeBridge.php:76-84`
+   ```php
+   $cacheKey = 'youtube_rate_limit';  // ⚠️ 全局共享，不分用户/IP
+   if ($this->cache->get($cacheKey)) {
+       // 触发限流
+   }
+   $this->cache->set($cacheKey, true, 60 * 16);
+   ```
+   **问题**: 一个用户触发限流后，所有用户都被限流
+
+4. **TwitterClient 缓存键全局共享**
+
+   **位置**: `lib/TwitterClient.php:15, 274`
+   ```php
+   $data = $this->cache->get('twitter') ?? [];  // ⚠️ 所有用户共享
+   // ...
+   $this->cache->set('twitter', $this->data);
+   ```
+   **问题**: guest token 全局共享，一个 token 失效影响所有用户
+
+#### 6.8.7 缓存键设计最佳实践
+
+| 场景 | 推荐做法 | 反模式 |
+|------|----------|--------|
+| 按用户隔离的数据 | 缓存键包含用户标识 | 全局共享一个缓存键 |
+| 不同参数不同结果 | 缓存键包含所有影响结果的参数 | 只包含部分参数 |
+| 敏感信息 | 不出现在缓存键中 | 把 token/secret 放键里 |
+| 防止缓存击穿 | 加锁或预热缓存 | 完全依赖自动过期 |
+| 多上下文 Bridge | 缓存键包含 context | 只使用固定 key 名称 |
+
 ---
 
 ## 七、关键设计模式总结
@@ -1504,9 +1877,9 @@ case 202:
 | URL 封装类 | `lib/url.php` | 14-151 |
 | 工具函数 | `lib/utils.php` | 1-283 |
 | 内容获取 | `lib/contents.php` | 1-251 |
-| Feed 解析器 | `lib/FeedParser.php` | 时间相关行 98,202,242 |
+| Feed 解析器 | `lib/FeedParser.php` | SimpleXML 19, 时间 98/202/242 |
 | WordPressBridge 示例 | `bridges/WordPressBridge.php` | 1-129 |
-| simple_html_dom 解析器 | `lib/simplehtmldom/simple_html_dom.php` | forceTagsClosed 1488-1492, 预解析 1517-1544 |
+| simple_html_dom 解析器 | `lib/simplehtmldom/simple_html_dom.php` | 节点结构 130-164, clear() 1598-1620, MAX_FILE_SIZE 45 |
 | DOMDocument 容错 | `lib/XPathAbstract.php` | libxml 404-408 |
 | 缓存中间件 | `middlewares/CacheMiddleware.php` | 1-64 |
 | 时区配置入口 | `index.php` | date_default_timezone_set 61 |
@@ -1514,4 +1887,9 @@ case 202:
 | 时区处理示例 | `bridges/TestFaktaBridge.php` | DateTimeZone 44-47 |
 | 时区处理示例 | `bridges/VkBridge.php` | 相对时间 490-504 |
 | 时区处理示例 | `bridges/XenForoBridge.php` | data-time 235-237, 时区注释 372 |
-| 默认配置 | `config.default.ini.php` | timezone 32 |
+| FeedMerge 多 Feed 合并 | `bridges/FeedMergeBridge.php` | 循环解析 62-87 |
+| URL 自动检测 | `actions/DetectAction.php` | 遍历 Bridge 25-45 |
+| 缓存键冲突示例 | `bridges/YoutubeBridge.php` | rate_limit 全局缓存 76-84 |
+| 缓存键冲突示例 | `bridges/SpotifyBridge.php` | clientid 缓存键 152-154 |
+| 缓存键冲突示例 | `lib/TwitterClient.php` | 全局 twitter 缓存 15,274 |
+| 默认配置 | `config.default.ini.php` | timezone 32, max_filesize |
