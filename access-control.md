@@ -392,6 +392,126 @@ public function toArray(): array
 
 ---
 
+### 7.3 场景三：紧急下线 bridge 的代码入口与缓存清除
+
+**问题**：紧急处理下线 bridge 的时间点在代码中对应哪个入口？是否存在手动清除 400 错误缓存的接口？若没有，需等待多长 TTL？
+
+#### 7.3.1 紧急下线 bridge 的代码入口
+
+紧急下线 bridge 的操作是通过**修改配置**实现的，没有独立的"紧急下线"代码入口。生效路径如下：
+
+```
+管理员操作（三种等价方式）:
+  ① 修改 config.ini.php 中 [system] 下的 enabled_bridges，移除目标 bridge
+  ② 编辑 whitelist.txt，移除目标 bridge 行或改写内容
+  ③ 修改环境变量 RSSBRIDGE_system_enabled_bridges
+
+↓ 下次 HTTP 请求时自动生效
+
+配置加载入口:
+  → index.php:14  require lib/config.php
+  → lib/config.php:13  Configuration::loadConfiguration($config, getenv())
+  → lib/Configuration.php:46-53  读取 whitelist.txt（如果存在）
+  → lib/Configuration.php:55-81  读取 RSSBRIDGE_* 环境变量覆盖
+
+↓
+
+BridgeFactory 构造时读取白名单:
+  → lib/dependencies.php:35-37  Container 注册 bridge_factory
+  → lib/BridgeFactory.php:25-42  __construct 中根据 enabled_bridges 构建白名单
+  → lib/BridgeFactory.php:49-51  isEnabled() 判断
+
+↓
+
+各 Action 拦截:
+  actions/DisplayAction.php:36-38    ← 核心拦截点，返回 400
+  actions/FrontpageAction.php:30-36  ← 不渲染卡片
+  actions/ListAction.php:22-24       ← status 变为 inactive
+```
+
+**生效时机**：从管理员保存配置文件起，**第一个未被缓存命中的新请求**即可生效。
+
+#### 7.3.2 手动清除缓存接口：不存在
+
+**代码层面的全面排查结论**：
+
+| 排查范围 | 结果 |
+|---------|------|
+| `actions/` 目录下 7 个 Action | 无任何 CacheClearAction、PurgeAction 等管理类 Action |
+| 全代码库搜索 `->clear()`、`->delete(` 调用 | 仅 `tests/CacheTest.php` 中测试代码调用，无生产代码 |
+| README.md 提到的 `bin/cache-clear` | 项目中不存在该文件（可能是文档遗留或规划中功能） |
+| docker-entrypoint.sh | 无缓存清除逻辑 |
+| CacheInterface 接口能力 | 有 `clear()`、`delete()`、`prune()` 三个方法，但**无任何 Action 暴露这些能力** |
+
+**结论：不存在通过 HTTP 请求手动清除缓存的接口。**
+
+#### 7.3.3 被动清除路径：1% 概率的 prune
+
+唯一的被动清除机制在 `middlewares/CacheMiddleware.php:56-60`：
+
+```php
+// For 1% of requests, prune cache
+if (rand(1, 100) === 1) {
+    // This might be resource intensive!
+    $this->cache->prune();
+}
+```
+
+`prune()` 的具体行为（各缓存实现一致）：
+- **FileCache** (`caches/FileCache.php:88-113`)：遍历所有缓存文件，删除 `expiration <= time()` 的文件
+- **SQLiteCache** (`caches/SQLiteCache.php:112-124`)：执行 `DELETE FROM storage WHERE updated > 0 AND updated <= now()`
+- **MemcachedCache** (`caches/MemcachedCache.php:63-66`)：空实现，Memcached 自身管理过期
+- **ArrayCache** (`caches/ArrayCache.php:49-58`)：遍历内存数组删除过期项
+
+**注意**：`prune()` **只删除已过期的缓存项**，不会主动删除未过期的 400 错误缓存。即使触发了 1% 概率的 prune，TTL 未到的 400 缓存依然存在。
+
+#### 7.3.4 400 错误缓存 TTL 精确值
+
+**TTL 计算代码**在 `middlewares/CacheMiddleware.php:48-50`：
+
+```php
+} elseif (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+    // Cache these responses for about ~10 mins on average
+    $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+}
+```
+
+**精确分析**：
+
+| 参数 | 计算 | 值 |
+|------|------|-----|
+| 基础值 | `60 * 5` | 300 秒（5 分钟） |
+| 随机增量 | `rand(1, 60 * 10)` | 1 ~ 600 秒（1 秒 ~ 10 分钟） |
+| **最小 TTL** | 300 + 1 | **301 秒（5 分 1 秒）** |
+| **最大 TTL** | 300 + 600 | **900 秒（15 分钟）** |
+| **平均 TTL** | 300 + 300.5 | **约 600.5 秒（10 分钟）** |
+
+使用随机 TTL 的设计意图：避免"缓存雪崩"——防止大量缓存同时过期导致后端瞬间压力飙升。
+
+#### 7.3.5 紧急下线后等待时间表
+
+管理员执行紧急下线（从 enabled_bridges 中移除某 bridge）后，不同场景下的实际生效时间：
+
+| 场景 | 实际生效时间 | 说明 |
+|------|-------------|------|
+| 该 bridge URL **从未被访问过** | **即时**（下一个请求） | 无缓存，直接进入 DisplayAction:36 的 isEnabled 检查 |
+| 该 bridge URL **之前访问成功（200 缓存）** | 需等待 bridge 自身的 `getCacheTimeout()`（通常几分钟到几小时） | 200 缓存 TTL 由各 bridge 决定，不受 5~15 分钟限制 |
+| 该 bridge URL **之前访问失败（400 缓存，最常见）** | **301 秒 ~ 900 秒（5 分 1 秒 ~ 15 分钟）** | 由 CacheMiddleware 随机 TTL 决定 |
+| 恰好触发了 1% 概率的 prune | 不加速 | prune 只删已过期项，未过期的 400 缓存仍保留 |
+
+#### 7.3.6 运维侧手动清缓存的替代方案
+
+由于系统没有暴露清缓存接口，管理员如需立即生效，需**直接操作存储层**：
+
+| 缓存类型 | 手动清除方法 |
+|---------|-------------|
+| **FileCache**（默认） | 删除 `cache/` 目录下所有 `*.cache` 文件，或仅删除 md5  hash 匹配的目标文件 |
+| **SQLiteCache** | 执行 `DELETE FROM storage WHERE key LIKE '%bridge_name%'` 或清空整个表 |
+| **MemcachedCache** | 执行 `flush_all` 命令清空全部，或按 sha1(key) 删除单项 |
+| **ArrayCache**（dev 环境） | 无需操作，每个请求后进程销毁，缓存不跨请求 |
+
+---
+
 ## 五、协作场景完整示例
 
 ### 场景 A：标准私用部署（Token + 全量 Bridge）
@@ -483,6 +603,13 @@ public function toArray(): array
 | Basic Auth 中间件 | `middlewares/BasicAuthMiddleware.php` | 10-37 |
 | CacheMiddleware 缓存命中检查 | `middlewares/CacheMiddleware.php` | 23-41 |
 | CacheMiddleware 错误缓存策略 | `middlewares/CacheMiddleware.php` | 46-54 |
+| CacheMiddleware 1% 概率 prune | `middlewares/CacheMiddleware.php` | 56-60 |
+| 400 错误 TTL 精确计算 | `middlewares/CacheMiddleware.php` | 48-50 |
+| CacheInterface 接口定义 | `lib/CacheInterface.php` | 3-14 |
+| FileCache prune 实现 | `caches/FileCache.php` | 88-113 |
+| SQLiteCache prune 实现 | `caches/SQLiteCache.php` | 112-124 |
+| FileCache 缓存文件名（md5） | `caches/FileCache.php` | 116-118 |
+| SQLiteCache 缓存 key（sha1） | `caches/SQLiteCache.php` | 131-134 |
 | 配置加载入口 | `index.php` | 13-14 |
 | 配置加载执行 | `lib/config.php` | 13 |
 | Container 单例缓存 | `lib/Container.php` | 8, 21-24 |
