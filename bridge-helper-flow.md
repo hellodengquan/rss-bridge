@@ -2265,6 +2265,550 @@ public function __invoke(Request $request, $next): Response
 | 错误转 Feed Item | RSS 阅读器友好，有 GitHub 链接 | 非 RSS 格式输出场景无效 | `error.output = 'feed'` |
 | 错误转 HTTP 500 页 | 调试信息完整 | RSS 阅读器可能忽略 | 浏览器访问 + 开发模式 |
 
+### 6.10 速率限制与重试退避配置的代码挂载点
+
+RSS-Bridge 构建了从传输层到应用层的完整速率限制体系，每种机制针对不同的失败场景。
+
+#### 6.10.1 速率限制体系总览
+
+```
+HTTP 请求发起
+     ↓
+┌─────────────────────────────────────────────────────────┐
+│  层级 1: cURL 自动重试（无退避，立即重试）              │
+│  配置: [http] retries = 1 (默认)                        │
+│  位置: lib/http.php:170-192                              │
+├─────────────────────────────────────────────────────────┤
+│  层级 2: Bridge 级自定义退避重试                         │
+│  ├─ TikTokBridge: usleep(100000) 0.1秒 × 3次            │
+│  └─ ... (其他 Bridge 各自实现)                          │
+├─────────────────────────────────────────────────────────┤
+│  层级 3: 速率限制异常抛出                               │
+│  ├─ 检测到 429 响应 → throwRateLimitException()         │
+│  ├─ 检测到 403 封禁 → 缓存标记 + 抛 RateLimitException  │
+│  └─ 检测到专用限流页 → 抛 RateLimitException            │
+├─────────────────────────────────────────────────────────┤
+│  层级 4: 应用级速率限制缓存                             │
+│  ├─ YoutubeBridge: youtube_rate_limit 缓存 16分钟       │
+│  ├─ RedditBridge: reddit_rate_limit / reddit_forbidden  │
+│  ├─ SpotifyBridge: spotify_rate_limit (使用 Retry-After)│
+│  ├─ Vk2Bridge: vk2_rate_limit                           │
+│  └─ 缓存命中 → 直接抛 RateLimitException                 │
+├─────────────────────────────────────────────────────────┤
+│  层级 5: CacheMiddleware 错误响应缓存                   │
+│  429/503 等错误响应缓存 5分钟 + 随机抖动                 │
+├─────────────────────────────────────────────────────────┤
+│  层级 6: CACHE_TIMEOUT 主动限流                         │
+│  配置: const CACHE_TIMEOUT = 3600 (1小时，默认)         │
+│  作用: 控制输出缓存时间，间接限制请求频率                │
+└─────────────────────────────────────────────────────────┘
+     ↓
+对用户的响应 (正常内容 / 429 Too Many Requests)
+```
+
+#### 6.10.2 层级 1: cURL 自动重试（无退避）
+
+**位置**: `lib/http.php:170-192`
+
+```php
+$defaultConfig = [
+    'retries' => 2,  // 注意：实际循环逻辑是 1 + retries 次
+    // ...
+];
+
+// 实际执行逻辑
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        break;
+    }
+    if ($tries <= $config['retries']) {
+        continue;  // ⚠️ 立即重试，无任何退避延迟！
+    }
+    throw new HttpException(...);
+}
+```
+
+**关键特性**:
+- **无退避**：失败后立即重试，无任何延迟
+- **重试次数**：配置 `retries = 1` → 实际尝试 2 次（1次初始 + 1次重试）
+- **仅触发场景**：连接层错误（超时、DNS 失败、TCP 断开等），HTTP 4xx/5xx 不触发
+- **风险**：对源站瞬时故障无退避，可能加剧源站压力
+
+**默认配置**: `config.default.ini.php:49` → `retries = 1`
+
+#### 6.10.3 层级 2: Bridge 级自定义退避重试
+
+**模式 A: 固定延迟重试**
+
+**位置**: `bridges/TikTokBridge.php:46-59`
+
+```php
+// Sometimes the API fails to return data for a second, so try a few times
+$attempts = 0;
+do {
+    try {
+        $json = getContents('https://www.tiktok.com/oembed?url=' . $url);
+    } catch (HttpException $e) {
+        $attempts++;
+        usleep(100000);  // ⏱️ 0.1秒固定延迟
+        continue;
+    }
+    break;
+} while ($attempts < 3);
+```
+
+**重试策略**:
+- 最大尝试次数: 3次
+- 退避延迟: `usleep(100000)` = 0.1秒（固定）
+- 触发条件: 任何 `HttpException`
+- 失败降级: 3次全部失败后，使用 fallback 构造空 `stdClass` 对象
+
+**模式 B: 指数退避（未在代码中找到实例，为潜在优化点）**
+
+当前所有 Bridge 的重试退避均为**固定延迟**，无**指数退避**（exponential backoff）实现。
+
+#### 6.10.4 层级 3: 速率限制异常检测与抛出
+
+**异常类层级**:
+```
+\Exception
+    ├── HttpException (lib/http.php:13)
+    │   └── CloudFlareException (lib/http.php:38)
+    ├── RateLimitException (lib/http.php:6)
+    └── ClientException (lib/utils.php)
+```
+
+**辅助函数**: `lib/utils.php:264-266`
+
+```php
+function throwRateLimitException(string $message = '')
+{
+    throw new RateLimitException($message);
+}
+```
+
+**检测模式**:
+
+1. **HTTP 429 响应码检测**
+
+   **位置**: `bridges/YoutubeBridge.php:80-86`
+   ```php
+   try {
+       $this->collectDataInternal();
+   } catch (HttpException $e) {
+       if ($e->getCode() === 429) {
+           $this->cache->set('youtube_rate_limit', true, 60 * 16);  // 缓存16分钟
+           throwRateLimitException();
+       }
+   }
+   ```
+
+2. **HTTP 403 封禁检测**
+
+   **位置**: `bridges/RedditBridge.php:117-138`
+   ```php
+   $forbiddenKey = 'reddit_forbidden';
+   if ($this->cache->get($forbiddenKey)) {
+       throwRateLimitException();
+   }
+
+   $rateLimitKey = 'reddit_rate_limit';
+   if ($this->cache->get($rateLimitKey)) {
+       throwRateLimitException();
+   }
+
+   try {
+       $this->collectDataInternal();
+   } catch (HttpException $e) {
+       if ($e->getCode() === 403) {
+           // 403 = IP 可能被永久封禁，缓存 61 分钟
+           $this->cache->set($forbiddenKey, true, 60 * 61);
+           throwRateLimitException();
+       } elseif ($e->getCode() === 429) {
+           $this->cache->set($rateLimitKey, true, 60 * 61);
+           throwRateLimitException();
+       }
+       throw $e;
+   }
+   ```
+
+3. **专用限流页检测**
+
+   **位置**: `bridges/VkBridge.php:528-529`
+   ```php
+   if (str_contains($uri, '/429.html')) {
+       throwRateLimitException();
+   }
+   ```
+
+4. **Retry-After 头利用**
+
+   **位置**: `bridges/SpotifyBridge.php:103-114`
+   ```php
+   $cacheKey = 'spotify_rate_limit';
+   try {
+       $this->collectDataInternal();
+   } catch (HttpException $e) {
+       if ($e->getCode() === 429) {
+           // 读取 Retry-After 响应头，动态设置缓存时间
+           $retryAfter = $e->response->getHeader('Retry-After') ?? (60 * 5);
+           $this->cache->set($cacheKey, true, $retryAfter);
+           throwRateLimitException(sprintf(
+               'Rate limited by spotify, try again in %s seconds',
+               $retryAfter
+           ));
+       }
+       throw $e;
+   }
+   ```
+
+#### 6.10.5 层级 4: 应用级速率限制缓存
+
+**缓存键与 TTL 对比表**:
+
+| Bridge | 缓存键 | 触发条件 | 缓存 TTL |
+|--------|--------|---------|----------|
+| YoutubeBridge | `youtube_rate_limit` | HTTP 429 | 60 × 16 = 960秒 (16分钟) |
+| RedditBridge | `reddit_rate_limit` | HTTP 429 | 60 × 61 = 3660秒 (61分钟) |
+| RedditBridge | `reddit_forbidden` | HTTP 403 | 60 × 61 = 3660秒 (61分钟) |
+| SpotifyBridge | `spotify_rate_limit` | HTTP 429 | Retry-After 头或 60 × 5 = 300秒 |
+| Vk2Bridge | `vk2_rate_limit` | HTTP 429 | 60秒 (1分钟) |
+
+**⚠️ 已知问题**: 所有缓存键都是**全局共享**的，不区分用户/IP。一个用户触发限流后，所有用户都会被限流。详见第 6.8.6 节。
+
+#### 6.10.6 层级 5: CacheMiddleware 错误响应缓存
+
+**位置**: `middlewares/CacheMiddleware.php:48-54`
+
+```php
+if (in_array($response->getCode(), [400, 403, 404, 429, 500, 503])) {
+    // 缓存错误响应 5分钟 + 1~600秒随机抖动
+    $this->cache->set($cacheKey, $response, 60 * 5 + rand(1, 60 * 10));
+}
+```
+
+**作用**: 防止源站返回的错误响应被频繁刷新，减轻源站和 RSS-Bridge 自身压力。
+
+#### 6.10.7 层级 6: CACHE_TIMEOUT 主动限流
+
+**位置**: `lib/BridgeAbstract.php:18, 114-116`
+
+```php
+const CACHE_TIMEOUT = 3600;  // 默认 1小时
+
+public function getCacheTimeout()
+{
+    return static::CACHE_TIMEOUT;
+}
+```
+
+**各 Bridge 自定义示例**:
+- TikTokBridge: `const CACHE_TIMEOUT = 60 * 60;` // 1小时
+- 大多数 Bridge: 继承默认 3600 秒
+
+**这是一种间接限流**：通过控制输出缓存的 TTL，间接限制 RSS-Bridge 对源站的请求频率。
+
+#### 6.10.8 DisplayAction 中的限流处理
+
+**位置**: `actions/DisplayAction.php:91-101`
+
+```php
+} catch (\Throwable $e) {
+    if ($e instanceof RateLimitException) {
+        $this->logger->debug(...);
+        // 直接返回 429 响应，不进入错误计数流程
+        return new Response(render(...), 429);
+    } elseif ($e instanceof HttpException) {
+        if (in_array($e->getCode(), [429, 503])) {
+            // 429/503 直接返回，不记错误
+            return new Response(render(...), $e->getCode());
+        }
+    }
+}
+```
+
+**用户可见提示**: `templates/exception.html.php:42-43`
+
+```php
+<?php if ($e->getCode() === 429): ?>
+    <h2>429 Too Many Requests</h2>
+```
+
+#### 6.10.9 速率限制优化建议
+
+1. **增加指数退避**: 在 cURL 重试中增加指数退避延迟
+   ```php
+   if ($tries <= $config['retries']) {
+       usleep(100000 * (1 << ($tries - 1)));  // 0.1s, 0.2s, 0.4s...
+       continue;
+   }
+   ```
+
+2. **按用户隔离限流缓存**: 在缓存键中加入用户标识（IP 或 token）
+   ```php
+   $cacheKey = 'youtube_rate_limit_' . md5($_SERVER['REMOTE_ADDR'] ?? '');
+   ```
+
+3. **统一限流封装**: 提供 `checkRateLimit()` 和 `setRateLimit()` 辅助函数
+
+---
+
+### 6.11 User-Agent 与 Cookie 在 Bridge 间的隔离代码核对
+
+RSS-Bridge 采用"全局默认 + Bridge 级自定义"的双层策略管理 HTTP 头部，隔离机制在多个层级实现。
+
+#### 6.11.1 User-Agent 管理体系
+
+```
+配置层: config.ini.php [http] useragent
+     ↓
+getContents() 组装 config
+     ↓
+CurlHttpClient::request()
+     ↓ 分支判断
+┌─────────────────────────────────────────────────┐
+│  curl_version()['ssl_version'] == 'BoringSSL'   │
+│  → 不设置 CURLOPT_USERAGENT                     │
+│  → 依赖 curl-impersonate 模拟 Firefox 指纹      │
+├─────────────────────────────────────────────────┤
+│  否则 (OpenSSL)                                 │
+│  → CURLOPT_USERAGENT = 'Mozilla/5.0 ... Firefox/102.0' │
+└─────────────────────────────────────────────────┘
+     ↓
+若 Bridge 通过 $config['useragent'] 或 CURLOPT_USERAGENT 自定义
+     ↓ 覆盖全局默认
+Bridge 自定义 User-Agent 生效
+```
+
+**默认 User-Agent 设置** (`lib/http.php:69-101`):
+
+```php
+$defaultConfig = [
+    'useragent' => null,
+    // ...
+];
+
+// Snagged from https://github.com/lwthiker/curl-impersonate/blob/main/firefox/curl_ff102
+$defaultHeaders = [
+    'Accept'                    => 'text/html,application/xhtml+xml,application/xml;q=0.9,...',
+    'Accept-Language'           => 'en-US,en;q=0.5',
+    'Upgrade-Insecure-Requests' => '1',
+    'Sec-Fetch-Dest'            => 'document',
+    'Sec-Fetch-Mode'            => 'navigate',
+    'Sec-Fetch-Site'            => 'none',
+    'Sec-Fetch-User'            => '?1',
+    'TE'                        => 'trailers',
+];
+
+if (curl_version()['ssl_version'] == 'BoringSSL') {
+    // curl-impersonate 环境，BoringSSL 提供完整的浏览器指纹模拟
+    $config = array_merge($defaultConfig, $config);
+    // 不单独设置 User-Agent，由 curl-impersonate 自动处理
+} else {
+    // 普通 OpenSSL 环境，使用标准 Firefox UA
+    $defaultConfig['useragent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0';
+    curl_setopt($ch, CURLOPT_HEADER, false);
+    $headers = array_merge($defaultHeaders, $config['headers']);
+    $config = array_merge($defaultConfig, $config);
+    $config['headers'] = $headers;
+}
+
+if ($config['useragent']) {
+    curl_setopt($ch, CURLOPT_USERAGENT, $config['useragent']);
+}
+```
+
+**核心发现**: 全局默认 UA 对所有 Bridge 相同，但 Bridge 可通过以下方式**独立覆盖**：
+
+1. **通过 `getContents()` 的 config 参数**
+   ```php
+   getContents($url, [], ['useragent' => 'MyCustomUA/1.0']);
+   ```
+
+2. **直接设置 `CURLOPT_USERAGENT`**
+   ```php
+   getContents($url, [], [CURLOPT_USERAGENT => 'MyCustomUA/1.0']);
+   ```
+
+3. **通过 `getSimpleHTMLDOMCached()` 透传**
+   ```php
+   getSimpleHTMLDOMCached($url, 86400, [], [CURLOPT_USERAGENT => 'CustomUA']);
+   ```
+
+**隔离性结论**: ✅ **User-Agent 在 Bridge 间是隔离的**。每个 Bridge 的请求可以独立设置，互不影响。
+
+#### 6.11.2 Cookie 管理体系
+
+Cookie 的传递有两条独立路径，均实现了 Bridge 间隔离：
+
+**路径 A: 通过 HTTP Header 传递**
+
+```php
+// 方式 1: 作为 header 字符串
+getContents($url, ['Cookie: key1=value1; key2=value2']);
+
+// 方式 2: 通过 CURLOPT_COOKIE
+getContents($url, [], [CURLOPT_COOKIE => 'key1=value1; key2=value2']);
+
+// 方式 3: 通过 getSimpleHTMLDOMCached 透传
+getSimpleHTMLDOMCached($url, 86400, [], [CURLOPT_COOKIE => 'key=value']);
+```
+
+**路径 B: 通过 Bridge 专属参数传递**
+
+```php
+// 在 const PARAMETERS 中定义 cookie 输入字段
+const PARAMETERS = [[
+    'cookie' => [
+        'name' => 'Cookie',
+        'required' => false,
+    ],
+]];
+
+// 在 collectData 中获取并使用
+$cookie = $this->getInput('cookie');
+getContents($url, ['Cookie: ' . $cookie]);
+```
+
+**实际使用场景分类**:
+
+1. **无 Cookie（大多数 Bridge）** - 不需要登录的公开内容
+   ```
+   WordPressBridge, FeedExpander, etc.
+   → 不设置 Cookie，cURL 自动处理 Set-Cookie 响应
+   ```
+
+2. **静态 Cookie（固定值，所有用户相同）**
+
+   **位置**: `bridges/SlusheBridge.php:102`
+   ```php
+   $opt = ['Cookie: age-verify=1;'];
+   ```
+
+   **位置**: `bridges/GolemBridge.php:56`
+   ```php
+   const HEADERS = ['Cookie: golem_consent20=simple|250101;'];
+   ```
+
+   **位置**: `bridges/ZeitBridge.php:67`
+   ```php
+   'Cookie: zonconsent=' . date('Y-m-d\TH:i:s.v\Z');
+   ```
+
+3. **用户配置 Cookie（每个部署配置一次）**
+
+   **位置**: `bridges/PixivBridge.php:14-15`
+   ```php
+   'cookie' => [
+       'name' => 'PHPSESSID',
+       'exampleValue' => '00000000_hashedsessionidhere',
+   ],
+   ```
+
+   **位置**: `bridges/FurAffinityBridge.php:8-10`
+   ```php
+   aCookie = "your-a-cookie-value-here" ; from cookie "a"
+   bCookie = "your-b-cookie-value-here" ; from cookie "b"
+   ```
+
+4. **用户请求参数 Cookie（每次请求可不同）**
+
+   **位置**: `bridges/CssSelectorComplexBridge.php:149-151`
+   ```php
+   $cookie = $this->getInput('cookie');
+   if ($cookie) {
+       $headers[] = 'Cookie: ' . $cookie;
+   }
+   ```
+
+#### 6.11.3 Cookie 隔离性核对
+
+**关键核对点**:
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| **Bridge 间无共享 Cookie** | ✅ 是 | 每个 Bridge 独立设置自己的 Cookie，互不泄露 |
+| **用户间无共享 Cookie** | ✅ 是 | Cookie 要么硬编码在代码中，要么通过 `getInput()` 从当前请求获取，无跨请求持久化 |
+| **请求间无 Cookie 持久化** | ✅ 是 | 每次请求是独立的 cURL handle，不使用 `CURLOPT_COOKIEJAR` / `CURLOPT_COOKIEFILE` |
+| **Set-Cookie 响应处理** | ⚠️ 部分 | cURL 会自动处理同一请求链中的重定向，但不同 getContents() 调用之间不保留 |
+| **缓存键包含 Cookie** | ❌ 否 | 缓存键只包含 URL 和请求体哈希，不包含 Cookie，可能导致缓存污染 |
+
+**⚠️ 缓存污染风险**:
+
+**位置**: `lib/contents.php:71`
+```php
+$cacheKey = implode('_', ['server',  $url, $requestBodyHash]);
+```
+
+**问题**: 缓存键不包含 Cookie/Header。如果同一 URL 被不同用户用不同 Cookie 请求，后请求的用户可能拿到前一个用户缓存的内容。
+
+**风险示例**:
+1. 用户 A 用登录 Cookie 请求 `/premium/article/123`，获得完整内容，被缓存
+2. 用户 B 无 Cookie 请求同一 URL，命中缓存，拿到了用户 A 的完整内容（本应只能看到预览）
+
+**已发现的 Bridge 示例**:
+- ScribbleHubBridge: `CURLOPT_COOKIE => 'toc_show=999'` - 但缓存键不包含 Cookie
+- PixivBridge: `CURLOPT_COOKIE => 'PHPSESSID=' . $cookie_str` - 登录态可能泄露
+
+#### 6.11.4 Cookie 响应处理与持久化
+
+**当前行为**：
+- RSS-Bridge **不使用** `CURLOPT_COOKIEJAR` 和 `CURLOPT_COOKIEFILE`
+- 每个 `getContents()` 调用创建独立的 cURL handle
+- 单次请求内的重定向会自动携带 Set-Cookie
+- 跨 `getContents()` 调用的 Cookie 不会保留
+
+**Bridge 手动处理 Set-Cookie 的唯一案例**:
+
+**位置**: `bridges/PepperBridgeAbstract.php:202`
+```php
+$cookies = array_map(fn($c): string => explode(';', $c)[0], $setCookieHeaders);
+```
+
+PepperBridgeAbstract 手动提取响应中的 Set-Cookie 头，用于后续请求。这是项目中唯一手动处理响应 Cookie 的代码。
+
+#### 6.11.5 配置与自定义优先级
+
+| 设置方式 | 优先级 | 影响范围 |
+|---------|--------|---------|
+| `[http] useragent` 全局配置 | ⭐ | 所有未自定义的 Bridge |
+| `[http] timeout` 全局配置 | ⭐ | 所有请求 |
+| `[http] retries` 全局配置 | ⭐ | 所有请求 |
+| `getContents()` $config['useragent'] | ⭐⭐⭐ | 单次请求 |
+| `CURLOPT_USERAGENT` 手动设置 | ⭐⭐⭐⭐ | 单次请求（覆盖 `useragent` 配置） |
+| `CURLOPT_COOKIE` 手动设置 | ⭐⭐⭐ | 单次请求 |
+| `Cookie:` Header 手动设置 | ⭐⭐⭐ | 单次请求 |
+| `CURLOPT_COOKIEJAR` / `CURLOPT_COOKIEFILE` | ❌ 未使用 | - |
+
+#### 6.11.6 隔离性总结与建议
+
+**User-Agent**: ✅ **完全隔离**
+- 全局默认对所有 Bridge 相同，但每个 Bridge 可独立覆盖
+- curl-impersonate 环境提供完整浏览器指纹模拟
+
+**Cookie**: ⚠️ **逻辑隔离但有缓存风险**
+- ✅ Bridge 间 Cookie 互不泄露
+- ✅ 用户间 Cookie 互不泄露
+- ✅ 请求间无 Cookie 持久化
+- ❌ 缓存键不包含 Cookie，可能导致不同用户拿到相同缓存
+
+**建议**:
+1. **缓存键包含 Cookie 哈希**（敏感场景）:
+   ```php
+   // 在生成缓存键时加入 Cookie 哈希
+   $cookieHash = isset($curlOptions[CURLOPT_COOKIE]) ? md5($curlOptions[CURLOPT_COOKIE]) : '';
+   $cacheKey = implode('_', ['server',  $url, $requestBodyHash, $cookieHash]);
+   ```
+
+2. **对需要登录的 Bridge 禁用缓存**:
+   ```php
+   // 在 Bridge 中直接调用 getContents() 而非 getSimpleHTMLDOMCached()
+   $html = str_get_html(getContents($url, ['Cookie: ' . $cookie]));
+   ```
+
 ---
 
 ## 七、关键设计模式总结
@@ -2411,4 +2955,14 @@ case 202:
 | MIME 类型流式读取 | `lib/utils.php` | fgets 逐行 183-217 |
 | 选择器链 Fallback 示例 | `bridges/YoutubeBridge.php` | JSON ?? 链 463-467 |
 | 选择器链 Fallback 示例 | `bridges/XenForoBridge.php` | or throw 130,142,169,255 |
-| 默认配置 | `config.default.ini.php` | timezone 32, max_filesize, error output |
+| 速率限制异常类 | `lib/http.php` | RateLimitException 6, throwRateLimitException utils:264-266 |
+| 速率限制缓存示例 | `bridges/YoutubeBridge.php` | 429 检测 + 16分钟缓存 76-86 |
+| 速率限制缓存示例 | `bridges/RedditBridge.php` | 403/429 双检测 + 61分钟缓存 115-138 |
+| 速率限制缓存示例 | `bridges/SpotifyBridge.php` | Retry-After 头利用 103-114 |
+| 自定义退避重试示例 | `bridges/TikTokBridge.php` | usleep(100000) × 3次 46-59 |
+| User-Agent 与 Header 默认配置 | `lib/http.php` | curl-impersonate BoringSSL 检测 69-101, Firefox UA 96 |
+| Cookie 使用示例 | `bridges/ScribbleHubBridge.php` | CURLOPT_COOKIE toc_show=999 157 |
+| Cookie 使用示例 | `bridges/PixivBridge.php` | PHPSESSID 配置 14-15 |
+| Cookie 使用示例 | `bridges/CssSelectorComplexBridge.php` | 用户参数 Cookie 149-151 |
+| Cookie Set-Cookie 手动处理 | `bridges/PepperBridgeAbstract.php` | 响应 Cookie 提取 202 |
+| 默认配置 | `config.default.ini.php` | retries 49, useragent 52-55, max_filesize 58, timezone 32, error output |
