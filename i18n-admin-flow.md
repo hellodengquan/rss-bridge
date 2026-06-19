@@ -502,7 +502,568 @@ $bridge->collectData();                    // Step 3: 桥接逻辑采集数据
 
 ---
 
-## 七、扩展：若要实现真正的 i18n
+## 七、桥接页面运行时多语言切换的代码路径
+
+### 7.1 核心结论：项目没有框架级的多语言切换
+
+RSS-Bridge **整体框架层完全没有实现 UI 语言切换机制**。具体证据：
+
+| 检查点 | 代码位置 | 实际情况 |
+|-------|---------|---------|
+| 语言 GET 参数 | `$_GET['lang']` / `$_GET['locale']` | 全局搜索无匹配 |
+| Cookie 语言记忆 | `$_COOKIE['lang']` | 全局搜索无匹配 |
+| 浏览器语言检测 | `$_SERVER['HTTP_ACCEPT_LANGUAGE']` | 全局搜索无匹配（仅在 curl 请求第三方站点时使用） |
+| PHP 语言设置 | `setlocale()` / `mb_internal_encoding()` | 全局搜索无匹配 |
+| 翻译函数 | `__()` / `t()` / `gettext()` | 全局搜索无匹配 |
+| 模板 lang 属性 | `templates/base.html.php:2` / `templates/html-format.html.php:2` | 硬编码为 `<html lang="en">` |
+| 前端 JS | `static/rss-bridge.js` | 纯搜索和参数填充逻辑，无语言切换代码 |
+
+框架层所有界面文案（如 "Generate feed"、"Email:"、"Find feed by URL" 等）均在模板文件和 `FrontpageAction` 中**直接硬编码为英文**，无任何抽象层。
+
+### 7.2 存在的"多语言"：桥接级别的目标网站语言参数
+
+项目中确实存在大量 `language` 相关代码，但这些不是 UI 语言切换，而是**让终端用户选择"要爬取的目标网站使用哪种语言版本"**，完全是桥接的业务参数。
+
+**典型桥接示例**：
+
+#### 7.2.1 WikipediaBridge — 通过 language 参数选择不同语言维基
+
+**文件**：`bridges/WikipediaBridge.php:13-43, 45-123`
+
+```php
+const PARAMETERS = [ [
+    'language' => [
+        'name' => 'Language',
+        'type' => 'list',
+        'title' => 'Select your language',
+        'values' => [
+            'English' => 'en',
+            'Русский' => 'ru',
+            'Dutch' => 'nl',
+            // ...
+        ]
+    ],
+    // ...
+]];
+
+// collectData() 中根据参数选择解析函数
+$function = 'getContents' . ucfirst(strtolower($this->getInput('language')));
+// en -> getContentsEn(), de -> getContentsDe(), fr -> getContentsFr() ...
+if (!method_exists($this, $function)) {
+    throwServerException('A function to get the contents for your language is missing...');
+}
+$this->$function($html, $subject, $fullArticle);
+```
+
+**用户选择流程图**：
+```
+用户在下拉框选择 "Русский"
+    ↓
+URL 参数: ?action=display&bridge=WikipediaBridge&language=ru
+    ↓
+collectData() 解析
+    ↓
+构造函数名 getContentsRu()
+    ↓
+调用该私有方法，解析 ru.wikipedia.org 的 DOM 结构
+    ↓
+输出俄语内容的 Feed（标题和正文都是俄语原文，非翻译）
+```
+
+> 注意：这里的"语言切换"只是**切换爬取的源站点**（从 en.wikipedia 切到 ru.wikipedia），Feed 内容是目标站点的原文，RSS-Bridge 自身不做任何翻译。
+
+#### 7.2.2 NHKWorldJapanShowBridge — 唯一自带 UI 级多语言的桥接
+
+**文件**：`bridges/NHKWorldJapanShowBridge.php:13-175, 303-315`
+
+这个桥接是全项目中**唯一实现了自身 UI 文案多语言翻译**的桥接。它自实现了一套独立的 i18n 机制，与框架完全无关。
+
+**定义多语言标签**（`bridges/NHKWorldJapanShowBridge.php:64-175`）：
+```php
+protected static $labels = [
+    'length' => [
+        'ar' => 'المدة:',
+        'en' => 'Length:',
+        'zh' => '时长:',
+        'fr' => 'Durée:',
+        // ... 共 17 种语言
+    ],
+    'broadcast' => [ /* ... */ ],
+    'availableuntil' => [ /* ... */ ],
+    'watchdirectly' => [ /* ... */ ],
+    'watchonplayer' => [ /* ... */ ],
+];
+```
+
+**翻译函数**（`bridges/NHKWorldJapanShowBridge.php:303-315`）：
+```php
+protected function getLocaleString($string)
+{
+    $language = $this->getInput('language');
+    // Step 1: 命中请求的语言 → 返回
+    if (isset(self::$labels[$string][$language])) {
+        return self::$labels[$string][$language];
+    }
+    // Step 2: 回退到英语 → 返回
+    if (isset(self::$labels[$string]['en'])) {
+        return self::$labels[$string]['en'];
+    }
+    // Step 3: 连英语都没有 → 空字符串
+    return '';
+}
+```
+
+**渲染中使用**（`bridges/NHKWorldJapanShowBridge.php:263-271`）：
+```php
+$description .= $this->getLocaleString('length') . ' ' . $movielength . '<br>';
+$description .= $this->getLocaleString('broadcast') . ' ' . $broadcastdate . '<br>';
+$description .= $this->getLocaleString('availableuntil') . ' ' . $voddate . '<br>';
+$description .= '<a href="...">' . $this->getLocaleString('watchdirectly') . '</a>';
+```
+
+**语言影响的其他表现**：
+- 日期格式：`en` 语言用 `'F j, Y'`（如 "April 10, 2025"），其他语言用 `'Y-m-d'`（`bridges/NHKWorldJapanShowBridge.php:249-250`）
+- 文本方向：阿拉伯语/波斯语/乌尔都语用 RTL（从右到左），其他用 LTR（`bridges/NHKWorldJapanShowBridge.php:177-179, 251`）
+
+#### 7.2.3 其他桥接的 language 参数模式
+
+其他桥接的 `language` 参数基本都是将语言代码拼接到目标 URL 中，让目标站点返回对应语言内容：
+
+| 桥接 | 参数形式 | URL 拼接方式 |
+|-----|---------|-------------|
+| WhatsAppBlogBridge | `language` | `https://blog.whatsapp.com/?lang=` + code |
+| NovayaGazetaEuropeBridge | `language` | 主页 URL + `?lang=` + code |
+| WebfailBridge | `language` | `https://` + code + `.webfail.com` |
+| NHKWorldJapanShowBridge | `language` | `/nhkworld/` + code + `/shows/...` |
+| SamsungMobileChangelogBridge | 无参数，代码内置 | 在页面中查找 `<option value=EN>` 对应的 URL |
+
+### 7.3 代码路径总览
+
+**完整的运行时路径（以 WikipediaBridge 为例）**：
+
+```
+index.php
+  ↓ lib/bootstrap.php / lib/dependencies.php
+  ↓ RssBridge::main() (lib/RssBridge.php:13-40)
+  ↓ action=Frontpage（首页渲染阶段）
+FrontpageAction::__invoke()
+  ↓ 读取 WikipediaBridge::PARAMETERS
+  ↓ 发现 'language' 字段是 type=list，有 6 个 values
+  ↓ FrontpageAction::renderForm() → 渲染为 <select> 下拉框
+  ↓ templates/frontpage.html.php 输出
+  ↓ 用户在浏览器看到下拉框 "Language"，选择 "Русский" 并提交
+  ↓ 请求 URL: ?action=display&bridge=WikipediaBridge&language=ru&subject=tfa
+  ↓ action=Display（Feed 生成阶段）
+DisplayAction::__invoke()
+  ↓ DisplayAction::createResponse()
+  ↓ $bridge->loadConfiguration()  ← 无 CONFIGURATION，跳过
+  ↓ $bridge->setInput(['language' => 'ru', 'subject' => 'tfa'])
+  ↓ ParameterValidator 校验 → 通过
+  ↓ $bridge->collectData()
+  ↓   getURI() 返回 https://ru.wikipedia.org
+  ↓   $function = 'getContentsRu'
+  ↓   $this->getContentsRu($html, $subject, $fullArticle)
+  ↓   解析俄语维基的 DOM 结构，生成 Feed items
+  ↓ 按 format 参数输出（HTML/Atom/RSS/JSON...）
+```
+
+---
+
+## 八、Admin 后台缓存清理对 i18n 资源的影响与触发条件
+
+### 8.1 核心结论：缓存系统与"i18n 资源"完全无关
+
+RSS-Bridge 没有 Web 管理后台，也没有"清理 i18n 资源缓存"的机制。原因是：
+
+> **项目的"语言资源"（桥接 PARAMETERS、NAME、DESCRIPTION 等）不经过缓存系统，它们是 PHP 类常量，每次请求由 PHP 解释器直接从 PHP 文件加载。**
+
+缓存系统只缓存**运行时抓取的数据**，与"语言资源"（文本元数据）完全隔离。
+
+### 8.2 缓存系统的完整结构
+
+#### 8.2.1 缓存接口与实现
+
+**接口定义**：`lib/CacheInterface.php:3-14`
+```php
+interface CacheInterface
+{
+    public function get(string $key, $default = null);
+    public function set(string $key, $value, ?int $ttl = null): void;
+    public function delete(string $key): void;
+    public function clear(): void;      // 清空全部
+    public function prune(): void;      // 清理过期项
+}
+```
+
+**五种实现对比**：
+
+| 实现类 | 文件 | 存储介质 | `clear()` 实现 | `prune()` 实现 |
+|-------|-----|---------|---------------|---------------|
+| `FileCache` | `caches/FileCache.php` | 本地文件 `cache/*.cache` | `scandir()` 遍历删除所有 `.cache` 文件 | 遍历所有文件，反序列化检查 `expiration <= time()` 则删除 |
+| `SQLiteCache` | `caches/SQLiteCache.php` | SQLite 数据库文件 | `DELETE FROM storage` | `DELETE FROM storage WHERE updated > 0 AND updated <= now` |
+| `MemcachedCache` | `caches/MemcachedCache.php` | Memcached 服务 | `$conn->flush()` | 空实现（Memcached 自带 TTL 自动淘汰） |
+| `ArrayCache` | `caches/ArrayCache.php` | 进程内存数组 | `$this->data = []` | 遍历数组删除过期项 |
+| `NullCache` | `caches/NullCache.php` | 无（纯占位） | 空实现 | 空实现 |
+
+**实例化位置**：`lib/dependencies.php:66-71` → `CacheFactory::create()`（`lib/CacheFactory.php:15-110`）
+
+#### 8.2.2 缓存 Key 命名空间与缓存内容
+
+通过全局搜索 `$cache->set(` 和 `$cacheKey =`，项目中有四类缓存数据：
+
+| Key 前缀 | 设置位置 | 缓存内容 | TTL |
+|---------|---------|---------|-----|
+| `http_` | `middlewares/CacheMiddleware.php:24, 50, 53` | DisplayAction 的完整 `Response` 对象（含 body、headers、status code） | 成功 200：由桥接控制；错误 4xx/5xx：5-15 分钟随机 |
+| `server_` | `lib/contents.php:71, 119` | `getContents()` 抓取的远程 HTTP Response | 固定 10 天（864000 秒），除非响应头含 `no-cache`/`no-store` |
+| `pages_` | `lib/contents.php:236, 240` | `getSimpleHTMLDOMCached()` 抓取的 HTML 字符串 | 默认 1 天（86400 秒），调用方可覆盖 |
+| `error_reporting_` | 桥接内部（未在主路径使用） | 错误上报计数 | - |
+
+**没有任何缓存 Key 存储"翻译字符串"或"语言资源"。**
+
+### 8.3 缓存清理的触发条件
+
+项目没有提供 Admin Web 界面或 CLI 命令来主动清理缓存。缓存清理/失效只有以下四种被动触发方式：
+
+#### 触发方式 1：随机被动清理（1% 概率）
+
+**位置**：`middlewares/CacheMiddleware.php:56-60`
+```php
+// For 1% of requests, prune cache
+if (rand(1, 100) === 1) {
+    // This might be resource intensive!
+    $this->cache->prune();
+}
+```
+- **触发时机**：每次经过 CacheMiddleware 的请求（仅 DisplayAction 会被缓存）
+- **行为**：调用 `prune()` 清理所有已过期的缓存项
+- **对 i18n 的影响**：零。只清理 `http_` 前缀的 Feed Response 缓存
+
+#### 触发方式 2：懒过期（读取时检查）
+
+**位置**：
+- `caches/FileCache.php:40-45`（get 方法）
+- `caches/SQLiteCache.php:64-77`（get 方法）
+- `caches/ArrayCache.php:18-24`（get 方法）
+
+```php
+// FileCache 示例
+$expiration = $item['expiration'] ?? time();
+if ($expiration === 0 || $expiration > time()) {
+    return $item['value'];
+}
+$this->delete($key);   // 读时发现过期，立即删除
+return $default;
+```
+- **触发时机**：读取缓存 Key 时
+- **行为**：若已过期则删除该 Key 并返回默认值
+- **对 i18n 的影响**：零。PARAMETERS 等语言资源不走缓存系统
+
+#### 触发方式 3：Admin 修改 config.ini.php 切换缓存类型
+
+**位置**：`config.default.ini.php:142-170`
+
+```ini
+[cache]
+type = "File"   ; 可改为: File / SQLite / Memcached / Array / Null
+```
+
+- **触发方式**：管理员手动修改 `config.ini.php` 的 `[cache] type` 值
+- **行为**：下次请求时 `CacheFactory::create()` 创建不同的缓存后端实例
+- **实际效果**：相当于"逻辑上清空缓存"（切换到新后端就无法读取旧后端的数据了），但旧后端的物理文件/数据不会被删除
+- **对 i18n 的影响**：零。与语言资源无关
+
+#### 触发方式 4：DEBUG 文件触发切换到 ArrayCache
+
+**位置**：`lib/Configuration.php:36-39`
+
+```php
+if (file_exists(__DIR__ . '/../DEBUG')) {
+    $defaultConfig['system']['env'] = 'dev';
+    $defaultConfig['cache']['type'] = 'array';
+}
+```
+- **触发方式**：管理员在项目根目录创建名为 `DEBUG` 的空文件
+- **行为**：强制使用 `ArrayCache`（进程内内存缓存），每次 PHP 进程结束缓存自动丢失
+- **对 i18n 的影响**：零。但会导致 Feed 内容缓存完全失效，所有请求都重新抓取
+
+### 8.4 缓存 TTL 与语言参数的关系
+
+虽然缓存系统不存储"语言资源"，但**语言参数会参与缓存 Key 的生成**，导致不同语言版本的 Feed 会被分别缓存。
+
+**CacheMiddleware 的 Key 生成**（`middlewares/CacheMiddleware.php:24`）：
+```php
+$cacheKey = 'http_' . json_encode($request->toArray());
+```
+
+由于 `$request->toArray()` 包含全部 GET 参数，如果桥接有 `language` 参数，那么：
+- `http_{bridge=WikipediaBridge,language=en,...}` → 英语版缓存
+- `http_{bridge=WikipediaBridge,language=ru,...}` → 俄语版缓存
+- `http_{bridge=WikipediaBridge,language=de,...}` → 德语版缓存
+
+这些是**互相独立的缓存条目**。清理缓存（比如 prune）时会一起被清理，但这不是"清理 i18n 资源"，只是清理已缓存的各语言 Feed 内容。
+
+---
+
+## 九、语言资源热加载与回退到默认语言的代码机制
+
+### 9.1 热加载机制：依赖 PHP OPCache，无项目级实现
+
+RSS-Bridge 的"语言资源"（桥接类中的 PARAMETERS、NAME、DESCRIPTION 常量）**完全没有项目级的热加载机制**。它们的加载/更新完全依赖 PHP 解释器本身的行为。
+
+#### 9.1.1 正常请求流程中的语言资源加载
+
+```
+浏览器请求 index.php
+    ↓
+PHP-FPM/Apache PHP 模块接收请求
+    ↓
+Zend Engine 编译 PHP 文件为 opcode
+    ├─ 若 OPCache 启用且有缓存且未过期 → 直接用 opcode 缓存
+    └─ 否则 → 重新编译 bridges/*Bridge.php 等所有 PHP 文件
+    ↓
+读取类常量（static::PARAMETERS、static::NAME 等）
+    ↓
+FrontpageAction 渲染为 HTML
+```
+
+**关键点**：
+- 桥接常量是**编译期确定**的，运行时无法修改
+- 修改 `bridges/WikipediaBridge.php` 中的 `PARAMETERS` 后，是否立即生效取决于 OPCache 配置：
+  - `opcache.validate_timestamps=1`（默认）→ 检查文件 mtime，变更后自动重新编译，相当于"热加载"
+  - `opcache.validate_timestamps=0`（生产常用优化）→ 必须重启 PHP-FPM 或调用 `opcache_reset()` 才生效
+- 项目代码中**没有任何地方**调用 `opcache_reset()` 或 `opcache_invalidate()`
+
+#### 9.1.2 热加载的边界：哪些修改可以"热生效"
+
+| 修改内容 | 热加载（OPCache validate_timestamps=1） | 需要重启 |
+|---------|--------------------------------------|---------|
+| 修改桥接类 `const PARAMETERS` 的 name/title/exampleValue | ✅ PHP 重新编译即生效 | ❌ |
+| 修改桥接类 `const NAME` / `DESCRIPTION` | ✅ 同上 | ❌ |
+| 修改 `templates/*.html.php` 模板文案 | ✅ 模板是 `require` 加载，每次重新编译 | ❌ |
+| 修改 `config.default.ini.php` / `config.ini.php` | ✅ `Configuration::loadConfiguration()` 每次请求都重新 parse_ini_file | ❌ |
+| 修改 `static/` 下的 JS/CSS | ✅ 静态文件由 Web 服务器直接服务，不受 PHP OPCache 影响 | ❌ |
+| 修改 `composer.json` / 新增依赖 | ❌ 需重新 `composer dump-autoload` | - |
+| 修改 `spl_autoload_register` 路径配置 | ❌ autoload 映射未更新 | ✅ |
+
+> 管理员若在 `config.ini.php` 中修改了某个桥接的 `[BridgeName]` 配置段，无需重启，下次请求即生效（`Configuration::loadConfiguration()` 在 `lib/config.php:1-13` 中每次请求都重新 `parse_ini_file`）。
+
+### 9.2 CONFIGURATION（管理员配置）的默认值回退
+
+**位置**：`lib/BridgeAbstract.php:119-148` `loadConfiguration()`
+
+```php
+public function loadConfiguration()
+{
+    foreach (static::CONFIGURATION as $optionName => $optionValue) {
+        $section = $this->getShortName();
+        $configurationOption = Configuration::getConfig($section, $optionName);
+
+        if ($configurationOption !== null) {
+            // 优先级 1: config.ini.php 中有对应配置 → 直接使用
+            $this->configuration[$optionName] = $configurationOption;
+        } elseif (isset($optionValue['required']) && $optionValue['required'] === true) {
+            // 优先级 2: required=true 且缺失 → 抛异常，中止请求
+            throw new \Exception(sprintf('Missing configuration option: %s', $optionName));
+        } elseif (isset($optionValue['defaultValue'])) {
+            // 优先级 3: 存在 defaultValue → 使用默认值
+            $this->configuration[$optionName] = $optionValue['defaultValue'];
+        }
+        // 优先级 4: 未设置 required，也无 defaultValue → 不赋值，getOption() 时返回 null
+    }
+}
+```
+
+**完整回退链**：
+```
+config.ini.php [BridgeName] 段中定义了该 key
+    ↓ 存在
+使用该值
+    ↓ 不存在
+CONFIGURATION['required'] === true
+    ↓ 是
+抛 HTTP 500 异常: "Missing configuration option: xxx"
+    ↓ 否
+isset(CONFIGURATION['defaultValue'])
+    ↓ 是
+使用 defaultValue
+    ↓ 否
+$this->configuration[$optionName] 未设置
+    ↓ 调用 getOption($optionName)
+返回 null（BridgeAbstract.php:86-89 中 return $this->configuration[$name] ?? null）
+```
+
+**示例**：以 `bridges/TelegramBridge.php:19-24` 为例
+```php
+const CONFIGURATION = [
+    'max_pages' => [
+        'required'      => false,
+        'defaultValue'  => 1,
+    ],
+];
+```
+若管理员未在 config.ini.php 中设置 `[TelegramBridge] max_pages`，则自动回退为 `1`。
+
+### 9.3 PARAMETERS（用户参数）的 defaultValue 回退
+
+**位置**：`lib/BridgeAbstract.php:181-263` `setInputWithContext()`
+
+用户提交表单时，未填写/未选中的字段按以下规则回退：
+
+#### 9.3.1 四种回退规则
+
+| 参数 type | 用户未提交时的行为 | 代码位置 |
+|----------|-----------------|---------|
+| `checkbox` | 固定回退为 `false` | `lib/BridgeAbstract.php:235-240` |
+| `list` (下拉框) | 优先使用 `defaultValue`；若无则使用 `values` 数组的第一项 | `lib/BridgeAbstract.php:241-248` |
+| `text` / `number` / 其他 | 优先使用 `defaultValue`；若无则不赋值（留空） | `lib/BridgeAbstract.php:217-230` |
+
+**关键代码片段**（`lib/BridgeAbstract.php:215-248`）：
+```php
+if (isset($this->inputs[$context][$name])) {
+    // 用户已提交值 → 跳过回退
+    continue;
+}
+
+switch ($parameter['type'] ?? 'text') {
+    case 'checkbox':
+        // checkbox 未勾选 = false
+        $this->inputs[$context][$name]['value'] = false;
+        break;
+    case 'list':
+        if (!isset($parameter['defaultValue'])) {
+            // 无 defaultValue → 取 values 的第一个
+            $parameter['defaultValue'] = array_values($parameter['values'])[0] ?? '';
+        }
+        // fall-through
+    default:
+        if (isset($parameter['defaultValue'])) {
+            $value = $parameter['defaultValue'];
+            $this->inputs[$context][$name]['value'] = $value;
+        }
+}
+```
+
+#### 9.3.2 global 参数的特殊复制回退
+
+**位置**：`lib/BridgeAbstract.php:250-263`
+
+`global` 上下文的参数会被自动复制到实际查询的上下文。如果用户只填写了某个上下文的参数，`global` 的默认值也会被同步应用：
+
+```php
+// 复制 global 参数到实际 queriedContext
+foreach (static::PARAMETERS['global'] ?? [] as $name => $parameter) {
+    if (!isset($this->inputs[$context][$name])) {
+        if (isset($parameter['defaultValue'])) {
+            $this->inputs[$context][$name]['value'] = $parameter['defaultValue'];
+        } elseif (($parameter['type'] ?? 'text') === 'checkbox') {
+            $this->inputs[$context][$name]['value'] = false;
+        }
+    }
+}
+```
+
+### 9.4 桥接内部级别的语言回退（如 NHKWorldJapanShowBridge）
+
+全项目唯一实现了"语言翻译回退"的代码位于 `bridges/NHKWorldJapanShowBridge.php:303-315`（见 7.2.2 节详述），机制如下：
+
+```
+请求 language = 'zh' (中文)
+    ↓
+查找 $labels['length']['zh']
+    ↓ 存在
+返回 '时长:'
+    ↓ 不存在（比如请求了未支持的小语种）
+查找 $labels['length']['en']
+    ↓ 存在
+返回 'Length:'
+    ↓ 不存在（理论上不会出现，en 是最完整的）
+返回 ''
+```
+
+### 9.5 非语言类的通用 fallback 机制
+
+除了上述语言/配置相关的回退，项目中还有几处通用的 fallback 与"回退到默认"相关：
+
+#### 9.5.1 桥接元数据 fallback
+
+**位置**：`lib/BridgeAbstract.php:62-72`
+```php
+public function getName()
+{
+    // NAME 常量未定义 → 回退到类名（去掉 "Bridge" 后缀）
+    return static::NAME ?? $this->getShortName();
+}
+
+public function getURI()
+{
+    // URI 常量未定义 → 回退到 GitHub 项目地址
+    return static::URI ?? 'https://github.com/RSS-Bridge/rss-bridge/';
+}
+```
+
+#### 9.5.2 Feed 项字段 fallback
+
+**位置**：`formats/HtmlFormat.php:39`、`formats/AtomFormat.php:101-106`、`formats/MrssFormat.php:121-127`
+```php
+// HtmlFormat: 标题为空 → 回退到 '(no title)'
+'title' => $item->getTitle() ?? '(no title)',
+
+// AtomFormat/MrssFormat:
+// - item URI 为空 → 回退到 Feed 级 URI
+// - item ID 为空 → 回退到 title + content 的哈希
+```
+
+#### 9.5.3 缩略图 fallback
+
+**位置**：`lib/html.php:595`
+```php
+$fallbackUri = $thumbnailJpegBaseUri . '/maxresdefault.jpg';
+// YouTube 视频缩略图：尝试多张不同分辨率的图，失败回退到 maxresdefault.jpg
+```
+
+### 9.6 回退机制总览图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       配置/参数回退总览                               │
+├───────────────────────────┬─────────────────────────────────────────┤
+│ CONFIGURATION (管理员端)   │ PARAMETERS (用户端)                      │
+├───────────────────────────┼─────────────────────────────────────────┤
+│ 1. config.ini.php 中定义    │ 1. 用户表单提交值                         │
+│                           │                                         │
+│ 2. required=true 抛异常    │ 2. checkbox → false                     │
+│                           │                                         │
+│ 3. defaultValue           │ 3. list → defaultValue / values[0]      │
+│                           │                                         │
+│ 4. 隐式 null (getOption)   │ 4. text/number → defaultValue / null    │
+│                           │                                         │
+│                           │ 5. global 参数自动复制同步到当前上下文       │
+└───────────────────────────┴─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    语言级回退（仅 NHKWorldJapanShowBridge）           │
+├─────────────────────────────────────────────────────────────────────┤
+│ 1. $labels[$key][$requestedLanguage] 命中                             │
+│                                                                     │
+│ 2. 回退 $labels[$key]['en']                                          │
+│                                                                     │
+│ 3. 回退空字符串 ''                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                      通用元数据 fallback                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ NAME 未定义     → 类名短名称                                           │
+│ URI  未定义     → GitHub 项目地址                                       │
+│ Feed 标题为空   → '(no title)'                                        │
+│ Feed item URI  → Feed 级 URI                                          │
+│ YouTube 缩略图  → maxresdefault.jpg                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十、扩展：若要实现真正的 i18n
 
 当前项目无多语言能力。若需接入 i18n，需在以下位置做改造：
 
