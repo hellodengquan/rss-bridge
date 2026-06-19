@@ -1063,7 +1063,482 @@ $fallbackUri = $thumbnailJpegBaseUri . '/maxresdefault.jpg';
 
 ---
 
-## 十、扩展：若要实现真正的 i18n
+## 十、Admin 后台多用户并发编辑同一 Bridge 配置的冲突处理
+
+### 10.1 核心结论：不存在并发冲突处理机制，因为项目根本没有 Web 后台
+
+经过全量代码扫描，RSS-Bridge **完全没有 Web 管理后台，也没有任何配置写入 API**。所谓"admin 后台"只是通过手动编辑 `config.ini.php` 文件来完成，因此不存在"多用户同时通过 Web 后台编辑同一 bridge 配置"的场景。
+
+**关键证据**：
+- 全局搜索无任何 `saveConfig`、`writeConfig`、`file_put_contents` 写配置文件的代码
+- `Configuration::setConfig()`（`lib/Configuration.php:169-172`）仅为内存内赋值，不持久化到磁盘
+- `actions/` 目录下 7 个 Action（Frontpage/Display/List/Findfeed/Detect/Connectivity/Health）均为只读操作，无任何"保存配置"的接口
+- 无 `flock()`、`mutex`、`semaphore` 等任何并发锁原语的使用
+
+### 10.2 配置的唯一写入方式：管理员手动编辑文件
+
+管理员只能通过以下方式修改配置，完全绕过了 PHP 应用层：
+
+| 修改方式 | 操作方式 | 并发风险 |
+|---------|---------|---------|
+| 修改 `config.ini.php` | SSH / SFTP 编辑文件 | 依赖操作系统文件锁和编辑器本身的冲突检测 |
+| 设置环境变量 `RSSBRIDGE_*` | Docker Compose / `.env` / shell export | 由部署工具控制 |
+| 创建/删除 `DEBUG` 文件 | `touch DEBUG` / `rm DEBUG` | 触发 `env=dev` 和 `cache=array`（见 8.3 触发方式 4）|
+| 创建/编辑 `whitelist.txt` | 写入桥接白名单 | 每行一个桥接类名 |
+
+### 10.3 Configuration 类的写入能力边界
+
+**`setConfig()` 仅为请求级内存写入**（`lib/Configuration.php:169-172`）：
+```php
+public static function setConfig(string $section, string $key, $value): void
+{
+    self::$config[strtolower($section)][strtolower($key)] = $value;
+}
+```
+- `self::$config` 是 `private static` 静态变量，生命周期 = PHP 请求生命周期
+- 每次请求结束后内存自动释放，**不会持久化**
+- 该方法仅在 `loadConfiguration()` 内部调用，用于从 ini 文件和环境变量加载配置
+
+**`loadConfiguration()` 全流程中没有任何磁盘写入**（`lib/Configuration.php:18-156`），所有操作都是读取：
+1. `parse_ini_file(config.default.ini.php)` → 只读
+2. `parse_ini_file(config.ini.php)` → 只读（如果存在）
+3. `file_get_contents(DEBUG)` → 只读（如果存在）
+4. `file_get_contents(whitelist.txt)` → 只读（如果存在）
+5. `getenv()` → 只读环境变量
+
+### 10.4 若真的发生并发编辑：OS 级别的冲突
+
+如果两名管理员同时通过 `vim` / `nano` 编辑同一台服务器上的 `config.ini.php`：
+
+```
+管理员 A: vim config.ini.php  → 修改 [TelegramBridge] max_pages = 5 → :wq
+管理员 B: vim config.ini.php  → 修改 [TelegramBridge] max_pages = 10 → :wq
+                                                              ↓
+                                        后保存者覆盖先保存者的修改（Last Write Wins）
+```
+
+此时的冲突处理完全依赖：
+1. **Vim/Nano 等编辑器自身的 swap file 检测**：编辑器会检测到文件已被修改并警告
+2. **操作系统文件系统**：无内置冲突合并，纯文件级别覆盖
+3. **PHP 端无感知**：下次请求时 `loadConfiguration()` 重新 `parse_ini_file`，读取到最终写入的版本
+
+### 10.5 桥接级 CONFIGURATION 的"热更新"时序
+
+虽然没有 Web 写入，但修改 `config.ini.php` 对桥接 CONFIGURATION 的生效路径是确定的：
+
+```
+T0: 管理员 A 编辑 config.ini.php，写入 [TelegramBridge] max_pages = 5
+T1: 请求 1 到达 index.php
+    → lib/config.php: parse_ini_file(config.ini.php) → 读到 max_pages = 5
+    → Configuration::loadConfiguration() → setConfig('telegrambridge', 'max_pages', 5)
+    → DisplayAction: $bridge->loadConfiguration()
+        → Configuration::getConfig('TelegramBridge', 'max_pages') = 5
+        → 生效
+T2: 管理员 B 编辑 config.ini.php，覆盖写入 max_pages = 10
+T3: 请求 2 到达
+    → 重新 parse_ini_file → 读到 max_pages = 10
+    → 对请求 2 生效。请求 1 的内存值仍为 5（但请求 1 已结束，无影响）
+```
+
+**关键点**：
+- 无缓存，无竞态。每个请求独立从磁盘读取最新 ini 文件
+- `parse_ini_file` 是原子文件读取操作，读取到的要么是旧完整内容要么是新完整内容（取决于 OS 文件系统的写入原子性）
+- 如果管理员在 `parse_ini_file` 执行瞬间写入了一半文件 → PHP 会解析失败并在 `lib/Configuration.php:24-26` 抛异常 `Error parsing ini config`
+
+### 10.6 项目中唯一涉及并发写入的地方：FileCache
+
+全项目中唯一需要考虑并发写入安全的是 `FileCache`，但它**完全没有加锁**：
+
+**`caches/FileCache.php:48-69`**
+```php
+public function set($key, $value, ?int $ttl = null): void
+{
+    $item = [
+        'key'           => $key,
+        'expiration'    => $ttl === null ? 0 : time() + $ttl,
+        'value'         => $value,
+    ];
+    $cacheFile = $this->createCacheFile($key);
+    $bytes = file_put_contents($cacheFile, serialize($item));
+    // 无 flock(LOCK_EX) 保护！
+}
+```
+
+- 未使用 `flock($fp, LOCK_EX)` 进行独占写锁
+- 并发请求写入同一 cache key 时可能产生部分写入的损坏文件
+- 但 FileCache 在 `get()` 时有损坏容错（`caches/FileCache.php:35-38`）：
+  ```php
+  if ($item === false) {
+      $this->logger->warning(sprintf('Failed to unserialize: %s', $cacheFile));
+      $this->delete($key);
+      return $default;
+  }
+  ```
+  → 损坏的缓存文件会被直接删除并当作缓存 miss 处理，不会导致错误
+
+---
+
+## 十一、i18n 资源贡献流程（社区翻译 PR 合入与文件结构）
+
+### 11.1 核心结论：项目没有独立的"语言资源"或翻译系统
+
+RSS-Bridge 不存在 `.po` / `.mo` / `.json` / `.xliff` 等任何语言包文件，也没有专门的 `lang/` 或 `locales/` 目录。所有面向用户的英文文案**直接硬编码在源代码中**，因此不存在传统意义上的"i18n 资源贡献流程"。
+
+### 11.2 项目目录结构：与文案/翻译相关的文件位置
+
+所有硬编码文案的分布（即需要"贡献翻译"时会修改的文件）：
+
+```
+291-rss-bridge/
+├── bridges/                          # ⭐ 每个桥接是独立文件，含大量英文文案
+│   ├── YoutubeBridge.php            #   const NAME/DESCRIPTION
+│   ├── WikipediaBridge.php          #   PARAMETERS[name/title/exampleValue]
+│   ├── NHKWorldJapanShowBridge.php  #   唯一的多语言样例：protected static $labels[...]
+│   └── ... (400+ 桥接文件)
+│
+├── actions/
+│   ├── FrontpageAction.php          # ⭐ 'Disable proxy (%s)' / 'Cache timeout in seconds'
+│   ├── DisplayAction.php            # ⭐ 'Missing bridge name parameter' / 'Bridge not found'
+│   ├── DetectAction.php             #   'You must specify a url'
+│   ├── BasicAuthMiddleware.php      #   'Please authenticate...'
+│   ├── TokenAuthenticationMiddleware.php  # 'Missing token' / 'Invalid token'
+│   ├── MaintenanceMiddleware.php    #   '503 Service Unavailable'
+│   └── SecurityMiddleware.php       #   'Query parameter "..." is not a string.'
+│
+├── templates/
+│   ├── frontpage.html.php           # ⭐ 首页所有文案：'Email:' / 'Find feed by URL'
+│   ├── base.html.php                #   <html lang="en"> 硬编码
+│   ├── error.html.php               #   通用错误页结构
+│   ├── exception.html.php           # ⭐ 大量硬编码错误解释文案
+│   ├── html-format.html.php         #   '← back to rss-bridge' / 'Donate to maintainer'
+│   ├── bridge-error.html.php        #   'Find similar bugs' / 'Create GitHub Issue'
+│   └── token.html.php
+│
+├── lib/
+│   ├── Configuration.php            # ⭐ 'Is not a valid email address' / 'Must be dev or prod'
+│   ├── ParameterValidator.php       #   'Parameter is invalid!' / 'Parameter is not registered!'
+│   └── utils.php                    #   throwClientException / throwServerException 辅助函数
+│
+├── docs/                            # ⭐ 项目文档（全英文 Markdown，独立于 PHP 代码）
+│   └── ...
+│
+└── .github/
+    └── CONTRIBUTING.md              # 贡献指南（仅引用文档链接）
+```
+
+### 11.3 桥接 PARAMETERS 文案的"贡献"流程 = 普通代码 PR
+
+如果社区贡献者需要修改某桥接的 `name` / `title` / `exampleValue`（相当于修改"翻译"），流程与修复 bug 完全相同：
+
+**文件：`.github/CONTRIBUTING.md` + `docs/04_For_Developers/02_Pull_Request_policy.md`**
+
+#### 标准 PR 流程：
+
+```
+贡献者 fork 仓库
+    ↓
+git checkout -b fix/youtube-typo
+    ↓
+编辑 bridges/YoutubeBridge.php：
+    const PARAMETERS = [
+        'By username' => [
+            'u' => [
+-                'name' => 'username',
++                'name' => 'Username or handle',
+-                'exampleValue' => 'LinusTechTips',
++                'exampleValue' => '@LinusTechTips',
+```
+
+#### Commit 命名规范（`docs/04_For_Developers/02_Pull_Request_policy.md:15-17`）：
+
+| 修改对象 | commit message 格式 | 示例 |
+|---------|-------------------|------|
+| 桥接文件 | `[BridgeName] Feature` | `[YoutubeBridge] Fix typo in parameter name` |
+| 其他文件 | `[FileName] Feature` | `[FrontpageAction.php] Add multilingual support` |
+| 跨多文件 | `category: feature` | `bridges: Fix various typos in exampleValue` |
+
+#### CI 校验（`.github/workflows/`）：
+
+```
+提交 PR
+    ↓
+┌─────────────────────────────────────┐
+│ GitHub Actions CI                   │
+│  ├─ tests.yml → phpunit             │  单元测试通过
+│  ├─ lint.yml → phpcs + phpcompatibility │ 代码风格合规
+│  ├─ dockerbuild.yml                 │  Docker 镜像可构建
+│  └─ prhtmlgenerator.yml             │  自动生成 PR 测试页
+└─────────────────────────────────────┘
+    ↓
+维护者 Code Review
+    ↓
+合并（Squash and merge）
+```
+
+### 11.4 真正的"多语言贡献"唯一案例：NHKWorldJapanShowBridge
+
+全项目唯一实现多语言标签的桥接，贡献者添加新语言翻译的流程：
+
+**文件位置**：`bridges/NHKWorldJapanShowBridge.php:64-175`
+
+```php
+protected static $labels = [
+    'length' => [
+        'en' => 'Length:',
+        'zh' => '时长:',
+        // ↓↓↓ 贡献者添加新语言 ↓↓↓
+        'ja' => '長さ:',
+    ],
+    'broadcast' => [
+        'en' => 'Broadcast:',
+        'zh' => '播出:',
+        'ja' => '放送:',
+    ],
+    // ... 同样为每个 label key 添加 ja 翻译
+];
+```
+
+同时如需 RTL（从右到左）语言支持，添加语言代码到：
+```php
+protected static $rtlLanguages = [
+    'ar','fa','ur'
+    // 例如新增希伯来语: ,'he'
+];
+```
+
+### 11.5 CI 中对桥接文案的自动化校验
+
+**测试文件**：`tests/BridgeImplementationTest.php`
+
+```php
+// 校验 PARAMETERS 中 defaultValue 的规范性（非空字符串等）
+if (isset($options['defaultValue'])) {
+    if (is_string($options['defaultValue'])) {
+        $this->assertNotEquals('', $options['defaultValue'], $field . ': empty defaultValue');
+    }
+}
+```
+
+没有对 `name` / `title` 做 i18n 相关校验（因为没有多语言机制）。
+
+### 11.6 文档系统的贡献流程（docs/）
+
+项目文档位于 `docs/` 目录，使用 [Daux.io](https://daux.io/) 静态站点生成器。所有文档为纯英文 Markdown，也无多语言版本。
+
+**贡献方式**：直接编辑 `docs/**/*.md`，提交 PR，CI 中 `documentation.yml` workflow 会自动构建并发布到 GitHub Pages。
+
+---
+
+## 十二、桥接抛出的错误消息国际化路径与缺翻译回退机制
+
+### 12.1 核心结论：错误消息完全无国际化，全部硬编码英文
+
+全项目所有错误消息（exception message、error page text、validation error）均为**英文硬编码**，没有任何翻译抽象层。"缺翻译回退"的概念在本项目中不成立——因为根本就没有"翻译"这一层。
+
+### 12.2 错误消息的抛出与捕获全链路
+
+```
+桥接 collectData() / 参数校验 / 中间件
+    ↓ 抛出
+┌─────────────────────────────────────────────────────┐
+│ 四种异常类型                                          │
+│  1. ClientException        → 400 Bad Request (用户错) │
+│  2. RateLimitException     → 429 Too Many Requests   │
+│  3. HttpException          → 继承自 \Exception         │
+│     └─ CloudFlareException → 特殊子类型                │
+│  4. \Exception (通用)      → 500 Internal Error       │
+└─────────────────────────────────────────────────────┘
+    ↓
+ExceptionMiddleware::__invoke() 捕获 (middlewares/ExceptionMiddleware.php:14-23)
+    ↓
+渲染 templates/exception.html.php → 所有文案硬编码英文
+```
+
+### 12.3 四种异常类型的使用场景
+
+| 异常类 | 抛出函数 | HTTP 状态码 | 日志级别 | 使用场景 |
+|-------|---------|------------|---------|---------|
+| `ClientException` | `throwClientException()` (lib/utils.php:254-257) | 400 | DEBUG | 用户输入错误（参数缺失、格式不对） |
+| `RateLimitException` | `throwRateLimitException()` (lib/utils.php:264-267) | 429 | DEBUG | 目标站点限流 |
+| `HttpException` / `CloudFlareException` | `HttpException::fromResponse()` (lib/http.php:23-35) | 源站返回码 | ERROR | 远程抓取失败（被 CloudFlare 拦截、404 等） |
+| `\Exception` (通用) | `throwServerException()` / `throw new \Exception()` (lib/utils.php:259-262) | 500 | ERROR | 桥接内部逻辑错误（DOM 结构变更、解析失败） |
+
+**典型示例**（来自 `bridges/YoutubeBridge.php:201`）：
+```php
+// 用户没填必填参数 → ClientException (英文硬编码)
+throwClientException("You must either specify either:\n - YouTube username (?u=...)\n - Channel id (?c=...)\n - Playlist id (?p=...)\n - Search (?s=...)");
+```
+
+**典型示例**（来自 `bridges/WikipediaBridge.php:116`）：
+```php
+// 所选语言没有对应的解析函数 → ServerException (英文硬编码，含动态变量)
+throwServerException('A function to get the contents for your language is missing (\'' . $function . '\')!');
+```
+
+### 12.4 DisplayAction 中错误的分类处理
+
+**文件**：`actions/DisplayAction.php:91-123`
+
+DisplayAction 在 `try/catch` 中执行桥接逻辑，对不同异常做差异化处理：
+
+```php
+try {
+    $bridge->loadConfiguration();
+    $bridge->setInput($input);
+    $bridge->collectData();
+} catch (\Throwable $e) {
+    if ($e instanceof ClientException) {
+        // 用户错 → DEBUG 级别日志（低噪声）
+    } elseif ($e instanceof RateLimitException) {
+        // 限流 → 立即返回 429 错误页
+        return new Response(render(...exception.html.php...), 429);
+    } elseif ($e instanceof HttpException) {
+        if (in_array($e->getCode(), [429, 503])) {
+            // 源站限流/不可用 → 立即返回对应状态码错误页
+            return new Response(render(...), $e->getCode());
+        }
+        // 其他 Http 错误（404/403 等）→ 静默，走通用错误处理
+    } else {
+        // 其他所有异常 → ERROR 级别日志 + 记录堆栈
+    }
+
+    // 根据配置决定最终输出方式（[error] output）
+    switch (Configuration::getConfig('error', 'output')) {
+        case 'feed':  // 将错误包装为 Feed Item（默认）
+        case 'http':  // 返回 HTTP 错误页
+        case 'none':  // 静默输出空 Feed
+    }
+}
+```
+
+### 12.5 错误页面模板中的硬编码英文文案
+
+**文件**：`templates/exception.html.php`
+
+这个模板是错误消息最终呈现的地方，所有文案均为英文硬编码，按 HTTP 状态码分支显示：
+
+| 状态码/类型 | 硬编码英文文案 | 代码行号 |
+|-----------|-------------|---------|
+| CloudFlare | `'The website is protected by CloudFlare'` / `'RSS-Bridge tried to fetch a website...'` | L9-16 |
+| 400 | `'400 Bad Request'` / `'This is usually caused by...'` | L19-24 |
+| 403 | `'403 Forbidden'` / `'...refuses to authorize it.'` | L26-32 |
+| 404 | `'404 Page Not Found'` / `'...doesn\'t exists.'` | L34-40 |
+| 429 | `'429 Too Many Requests'` / `'...told us to try again later.'` | L42-48 |
+| 503 | `'503 Service Unavailable'` / `'Common causes are...'` | L50-56 |
+| 其他 code | MDN 链接 `'https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/...'` | L68-71 |
+| code=10 (空 Feed) | `'The rss feed is completely empty'` | L75-80 |
+| code=11 (XML 解析失败) | `'There is something wrong with the rss feed'` | L83-88 |
+| 所有异常通用 | `'Details'` / `'Type:'` / `'Code:'` / `'Message:'` / `'Trace'` / `'Context'` / `'Go back'` | L91-146 |
+
+**关键代码**（`templates/exception.html.php:8-17`，CloudFlare 分支）：
+```php
+<?php if ($e instanceof CloudFlareException): ?>
+    <h2>The website is protected by CloudFlare</h2>
+    <p>
+        RSS-Bridge tried to fetch a website.
+        The fetching was blocked by CloudFlare.
+        CloudFlare is anti-bot software.
+        Its purpose is to block non-humans.
+    </p>
+<?php endif; ?>
+```
+
+### 12.6 参数校验错误消息
+
+**文件**：`lib/ParameterValidator.php:49,54`
+
+```php
+if (is_null($input[$name]) && ...required...) {
+    $errors[] = ['name' => $name, 'reason' => 'Parameter is invalid!'];
+}
+// ...
+if (!$registered) {
+    $errors[] = ['name' => $name, 'reason' => 'Parameter is not registered!'];
+}
+```
+
+- 只有两种固定错误消息，均为英文硬编码
+- 这些 errors 数组目前**未被实际渲染到前端**（仅在 `validateInput()` 返回，但调用方 `BridgeAbstract::setInput()` 没有使用）
+
+### 12.7 错误输出的三种模式（[error] output 配置）
+
+**文件**：`config.default.ini.php:132-140` + `actions/DisplayAction.php:107-123`
+
+```ini
+[error]
+output = "feed"   ; feed | http | none
+```
+
+| output 模式 | 行为 | 用户看到的内容 |
+|------------|------|--------------|
+| `feed`（默认） | 将异常包装成一个 Feed Item，混入 Feed 输出 | 桥接 Feed 中出现一条特殊的错误条目，标题为 `'Bridge returned error %s! (%s)'`（英文硬编码，见 L152），内容为完整 exception.html.php 渲染结果 |
+| `http` | 直接返回 HTTP 500 + exception.html.php | 完整错误页面（所有英文硬编码） |
+| `none` | 吞掉错误，返回空 Feed | 用户看到空 Feed，无任何错误提示 |
+
+### 12.8 "缺翻译回退"在本项目中的实际情况
+
+由于没有翻译层，不存在"缺翻译"的场景。但存在以下几种等价的"回退"行为：
+
+#### 回退 1：异常消息原样显示
+
+**位置**：`templates/exception.html.php:102-104`
+```php
+<div class="error-message">
+    <strong>Message:</strong> <?= e(sanitize_root($e->getMessage())) ?>
+</div>
+```
+- 桥接抛出的英文异常消息会被 **直接原样输出**，没有任何翻译或转换
+- 例如 `'The URL you provided is invalid!'` → 原封不动显示给用户
+
+#### 回退 2：NHKWorldJapanShowBridge 的标签缺失
+
+**位置**：`bridges/NHKWorldJapanShowBridge.php:303-315`
+```php
+protected function getLocaleString($string)
+{
+    $language = $this->getInput('language');
+    if (isset(self::$labels[$string][$language])) {
+        return self::$labels[$string][$language];   // ← 命中请求语言
+    }
+    if (isset(self::$labels[$string]['en'])) {
+        return self::$labels[$string]['en'];        // ← 回退到英语
+    }
+    return '';                                        // ← 连英语都没有，回退空串
+}
+```
+这是全项目唯一存在"语言回退链"的地方，三级回退：`请求语言 → 英语 → 空字符串`。
+
+#### 回退 3：Feed 输出错误兜底
+
+**位置**：`actions/DisplayAction.php:152`
+```php
+$title = sprintf('Bridge returned error %s! (%s)', $e->getCode(), $uniqueIdentifier);
+```
+当桥接抛异常且 `output=feed` 时，Feed 条目标题固定为此英文格式字符串，错误详情则复用 `exception.html.php` 模板。
+
+### 12.9 错误消息全链路示意图
+
+```
+桥接代码 throwClientException('Invalid username!')
+    ↓
+DisplayAction catch → DEBUG 日志记录
+    ↓
+[error] output 配置判断
+    ├─ feed → createFeedItemFromException()
+    │          ↳ 标题: sprintf('Bridge returned error %s! (%s)', ...)  英文硬编码
+    │          ↳ 内容: render(bridge-error.html.php)
+    │                     ↳ render(exception.html.php)
+    │                         ↳ 按状态码显示对应英文解释文案
+    │                         ↳ 显示 $e->getMessage() 原样英文消息
+    │
+    ├─ http → render(exception.html.php)  → 完整英文错误页
+    │
+    └─ none → 静默空 Feed
+```
+
+---
+
+## 十三、扩展：若要实现真正的 i18n
 
 当前项目无多语言能力。若需接入 i18n，需在以下位置做改造：
 
