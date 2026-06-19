@@ -1538,7 +1538,762 @@ DisplayAction catch → DEBUG 日志记录
 
 ---
 
-## 十三、扩展：若要实现真正的 i18n
+## 十三、Admin 鉴权与 Session 管理代码路径
+
+### 13.1 核心结论：无 Session，鉴权仅靠两种中间件一次性校验
+
+RSS-Bridge **完全没有 Session 管理**，也没有任何登录/登出流程。鉴权仅通过两个中间件在每个请求开始时做一次性无状态校验：
+- **HTTP Basic Auth**（用户名+密码，`BasicAuthMiddleware`）
+- **Token 校验**（URL 参数携带 token，`TokenAuthenticationMiddleware`）
+
+**关键证据**：
+- 全局无 `session_start()` / `$_SESSION` / `session_name()` 等任何 Session 相关代码
+- 无登录表单 / 登录接口 / 登出接口
+- 无 Cookie 设置（`setcookie()`）代码
+- 鉴权是**每个请求独立校验**的无状态模式
+
+### 13.2 中间件栈与执行顺序
+
+**文件**：`lib/RssBridge.php:25-38`
+
+```php
+$middlewares = [
+    new BasicAuthMiddleware(),          // 第 1 层: HTTP Basic Auth
+    new CacheMiddleware($this->container['cache']),
+    new ExceptionMiddleware($this->container['logger']),
+    new SecurityMiddleware(),
+    new MaintenanceMiddleware(),
+    new TokenAuthenticationMiddleware(), // 第 6 层: Token 校验
+];
+```
+
+**执行顺序（洋葱模型）**：
+```
+请求进入
+    ↓
+BasicAuthMiddleware
+    ↓
+CacheMiddleware
+    ↓
+ExceptionMiddleware
+    ↓
+SecurityMiddleware
+    ↓
+MaintenanceMiddleware
+    ↓
+TokenAuthenticationMiddleware
+    ↓
+实际 Action 执行（Frontpage / Display 等）
+```
+
+> 注意：`array_reverse($middlewares)` 是装饰器模式的经典实现，实际执行顺序与数组定义顺序一致。
+
+### 13.3 BasicAuthMiddleware 详细流程
+
+**文件**：`middlewares/BasicAuthMiddleware.php`
+
+```php
+public function __invoke(Request $request, $next): Response
+{
+    // Step 1: 检查是否启用鉴权
+    if (!Configuration::getConfig('authentication', 'enable')) {
+        return $next($request);  // 未启用，直接放行
+    }
+
+    // Step 2: 密码为空配置错误（500 错误，无 i18n）
+    if (Configuration::getConfig('authentication', 'password') === '') {
+        return new Response('The authentication password cannot be the empty string', 500);
+    }
+
+    // Step 3: 从 PHP 全局变量读取 Basic Auth 头
+    $user = $request->server('PHP_AUTH_USER');
+    $password = $request->server('PHP_AUTH_PW');
+
+    // Step 4: 未携带凭证 → 返回 401 触发浏览器弹窗
+    if ($user === null || $password === null) {
+        $html = render(__DIR__ . '/../templates/error.html.php', [
+            'message' => 'Please authenticate in order to access this instance!',
+        ]);
+        return new Response($html, 401, ['WWW-Authenticate' => 'Basic realm="RSS-Bridge"']);
+    }
+
+    // Step 5: 使用 hash_equals() 安全比对密码（防时序攻击）
+    if (
+        (Configuration::getConfig('authentication', 'username') !== $user)
+        || (!hash_equals(Configuration::getConfig('authentication', 'password'), $password))
+    ) {
+        // 用户名或密码错误 → 再次 401
+        $html = render(__DIR__ . '/../templates/error.html.php', [
+            'message' => 'Please authenticate in order to access this instance!',
+        ]);
+        return new Response($html, 401, ['WWW-Authenticate' => 'Basic realm="RSS-Bridge"']);
+    }
+
+    // Step 6: 鉴权通过，放行
+    return $next($request);
+}
+```
+
+**关键设计点**：
+- 使用 `hash_equals()` 而非 `===`，防止时序攻击（timing attack）
+- 直接读取 `$_SERVER['PHP_AUTH_USER']` / `$_SERVER['PHP_AUTH_PW']`，依赖 PHP/Apache 的 Basic Auth 解析
+- 失败时返回 `WWW-Authenticate` 头，触发浏览器原生登录弹窗
+- 用户名/密码**明文存储**在 `config.ini.php` 中，无哈希加密
+
+**配置对应项**（`config.default.ini.php:120-129`）：
+```ini
+[authentication]
+enable = false
+username = "admin"
+password = ""
+```
+
+### 13.4 TokenAuthenticationMiddleware 详细流程
+
+**文件**：`middlewares/TokenAuthenticationMiddleware.php`
+
+```php
+public function __invoke(Request $request, $next): Response
+{
+    // Step 1: 检查是否启用 token 鉴权
+    if (! Configuration::getConfig('authentication', 'token')) {
+        return $next($request);  // 未配置 token，直接放行
+    }
+
+    // Step 2: 从 GET 参数读取 token
+    $token = $request->get('token');
+
+    // Step 3: 无 token → 显示 token 输入表单
+    if (! $token) {
+        return new Response(render(__DIR__ . '/../templates/token.html.php', [
+            'message'   => 'Missing token',
+            'token'     => '',
+        ]), 401);
+    }
+
+    // Step 4: 安全比对 token
+    if (! hash_equals(Configuration::getConfig('authentication', 'token'), $token)) {
+        return new Response(render(__DIR__ . '/../templates/token.html.php', [
+            'message'   => 'Invalid token',
+            'token'     => $token,
+        ]), 401);
+    }
+
+    // Step 5: 鉴权通过，将 token 写入请求属性（方便后续使用）
+    $request = $request->withAttribute('token', $token);
+
+    return $next($request);
+}
+```
+
+**Token 表单模板**（`templates/token.html.php`）：
+```html
+<h1>Authentication with token required</h1>
+<p><?= e($message) ?></p>
+<form action="" method="get" autocomplete="off">
+    <label for="token">Token:</label>
+    <input type="text" name="token" id="token" placeholder="token" value="<?= e($token) ?>">
+    <input type="submit" value="OK">
+</form>
+```
+
+**关键设计点**：
+- token 以 GET 参数形式传递（`?token=xxx`），方便在 Feed URL 中直接携带
+- 提交表单使用 `method="get"`，token 会出现在 URL 中
+- 同样使用 `hash_equals()` 防时序攻击
+- 表单 `autocomplete="off"`，防止浏览器保存敏感 token
+
+**配置对应项**（`config.default.ini.php:130`）：
+```ini
+[authentication]
+token = ""
+```
+
+### 13.5 鉴权校验时序（两种方式同时启用）
+
+```
+用户请求: https://rss-bridge.example.com/?action=display&bridge=YoutubeBridge&u=test&token=mysecrettoken
+    ↓
+index.php → Request::fromGlobals()
+    ↓
+RssBridge::main() 构造中间件链
+    ↓
+BasicAuthMiddleware 检查:
+  [authentication][enable] = true  ✓
+  $_SERVER['PHP_AUTH_USER'] = 'admin'  ✓
+  hash_equals 密码比对通过  ✓
+    ↓
+CacheMiddleware 读缓存 miss  ✓
+    ↓
+ExceptionMiddleware 包装 try/catch  ✓
+    ↓
+SecurityMiddleware 校验 GET 参数都是字符串  ✓
+    ↓
+MaintenanceMiddleware 检查维护模式  ✓
+    ↓
+TokenAuthenticationMiddleware 检查:
+  [authentication][token] = 'mysecrettoken'  ✓
+  $_GET['token'] = 'mysecrettoken'  ✓
+  hash_equals 比对通过  ✓
+  $request = $request->withAttribute('token', 'mysecrettoken')
+    ↓
+DisplayAction 执行，生成 Feed
+```
+
+### 13.6 其他安全相关中间件
+
+#### SecurityMiddleware
+
+**文件**：`middlewares/SecurityMiddleware.php`
+```php
+// 确保所有 GET 参数都是字符串（防数组注入攻击）
+foreach ($request->toArray() as $key => $value) {
+    if (!is_string($value)) {
+        return new Response(render(__DIR__ . '/../templates/error.html.php', [
+            'message' => "Query parameter \"$key\" is not a string.",
+        ]), 400);
+    }
+}
+```
+
+#### MaintenanceMiddleware
+
+**文件**：`middlewares/MaintenanceMiddleware.php`
+```php
+if (!Configuration::getConfig('system', 'enable_maintenance_mode')) {
+    return $next($request);
+}
+return new Response(render(__DIR__ . '/../templates/error.html.php', [
+    'title' => '503 Service Unavailable',
+    'message' => 'RSS-Bridge is down for maintenance.',
+]), 503);
+```
+
+### 13.7 鉴权方式对比
+
+| 特性 | HTTP Basic Auth | Token 鉴权 |
+|-----|----------------|-----------|
+| 配置开关 | `[authentication] enable = true` | `[authentication] token = "xxx"` |
+| 凭证传递 | `Authorization: Basic <base64>` 头 | GET 参数 `?token=xxx` |
+| 浏览器原生支持 | ✅ 自动弹窗 | ❌ 需自定义表单 |
+| 适合场景 | 人工访问浏览器 | 程序/Feed 阅读器订阅 |
+| 凭证记忆 | 浏览器会缓存直到关闭 | 需每次在 URL 中携带 |
+| 防时序攻击 | ✅ `hash_equals()` | ✅ `hash_equals()` |
+| 安全级别 | 中（HTTPS 下安全） | 中（URL 可能被日志记录） |
+| 可同时启用 | ✅ | ✅ |
+
+> 注意：两种鉴权是**逻辑与**关系，同时启用时必须都通过才能访问。
+
+---
+
+## 十四、Bridge 配置文件的序列化方式与 Schema 校验
+
+### 14.1 核心结论：仅使用 PHP 原生 INI 格式，无 Schema 校验框架
+
+RSS-Bridge 的配置系统**完全基于 PHP 原生 `parse_ini_file()` 函数**，使用 INI 格式作为序列化方式。没有使用 JSON Schema、XML Schema、YAML 或任何配置校验库。Schema 校验通过 `Configuration::loadConfiguration()` 中的硬编码 `if` 语句逐字段完成。
+
+### 14.2 配置文件格式与序列化
+
+#### 14.2.1 INI 文件格式规范
+
+**文件**：`config.default.ini.php`（头几行）
+```ini
+<?php
+; This is a comment. Lines starting with semicolon are ignored.
+; Exit if called directly
+if(!defined('RSSBRIDGE')) {
+    die('No direct access allowed!');
+}
+?>
+; <?php exit; ?> DO NOT REMOVE THIS LINE
+
+[system]
+; Defines the environment: dev or prod.
+; "dev" enables debugging and disables caching for most actions.
+; "prod" is the standard mode.
+; Default: "prod"
+env = "prod"
+```
+
+**关键设计**：
+- 文件是 `.ini.php` 扩展名，开头嵌入 PHP 代码防止直接访问
+- 使用标准 INI 格式：`[section]` 段 + `key = value` 键值对
+- 注释以 `;` 开头
+- 字符串值用双引号包裹
+
+#### 14.2.2 解析方式
+
+**文件**：`lib/Configuration.php:23` + `lib/config.php:7`
+```php
+$config = parse_ini_file(
+    __DIR__ . '/../config.default.ini.php',
+    true,                  // process_sections = true → 多维数组
+    INI_SCANNER_TYPED      // 自动类型转换（数字→int，"true"/"false"→bool）
+);
+```
+
+**INI_SCANNER_TYPED 模式下的自动类型转换**：
+
+| INI 中写法 | 解析后 PHP 类型 |
+|-----------|----------------|
+| `env = "prod"` | string `"prod"` |
+| `enable = true` | bool `true` |
+| `timeout = 3600` | int `3600` |
+| `limit = 10.5` | float `10.5` |
+| `enabled_bridges[] = "YoutubeBridge"` | array `["YoutubeBridge", ...]` |
+
+**反序列化/加载完整流程**：
+```
+Configuration::loadConfiguration($customConfig, $env)
+    ↓
+1. parse_ini_file(config.default.ini.php, true, INI_SCANNER_TYPED)
+    → 得到 $config 多维数组
+    ↓
+2. 遍历所有 section/key → setConfig() 存入 self::$config
+    ↓
+3. parse_ini_file(config.ini.php)（如果存在）
+    → 相同键覆盖默认值
+    ↓
+4. file_get_contents(DEBUG) + file_get_contents(whitelist.txt)
+    → 特殊配置项
+    ↓
+5. 遍历 $_ENV / getenv()，匹配 RSSBRIDGE_* 前缀
+    → 再次覆盖（最高优先级）
+    ↓
+6. 硬编码 schema 校验（见 14.3）
+```
+
+#### 14.2.3 序列化反序列化边界
+
+配置系统**只有反序列化（读），没有序列化（写）**。`Configuration::setConfig()` 只写内存不写磁盘。
+
+其他序列化技术在项目中的使用：
+
+| 技术 | 使用场景 | 文件位置 |
+|-----|---------|---------|
+| `parse_ini_file()` | 配置文件加载 | `lib/Configuration.php:23,32` |
+| `serialize()` / `unserialize()` | FileCache / SQLiteCache 存储完整 PHP 对象（Response、Feed 数据） | `caches/FileCache.php:34,60`、`caches/SQLiteCache.php:67,86` |
+| `json_encode()` / `json_decode()` | 缓存 Key 生成、error_reporting 计数、Twitter API 调用 | `lib/utils.php:6-21`、`middlewares/CacheMiddleware.php:24` |
+| `Json::encode/decode()` | 缓存数据 JSON 序列化 | `lib/utils.php:6-21` |
+
+### 14.3 Schema 校验：硬编码逐字段校验
+
+**文件**：`lib/Configuration.php:84-156`
+
+所有校验都是硬编码的 `if` 语句，没有使用任何校验框架。每个可配置项都有对应的校验逻辑。
+
+**完整校验清单**：
+
+| 配置项 | 校验规则 | 代码行号 | 失败处理 |
+|-------|---------|---------|---------|
+| `system.env` | 必须是 `'dev'` 或 `'prod'` | L84-86 | `throwConfigError()` → HTTP 500 + `exit(1)` |
+| `system.enabled_bridges` | 必须是 array 类型 | L88-90 | 同上 |
+| `system.timezone` | 必须是字符串 + 必须在 `timezone_identifiers_list()` 返回值中 | L92-97 | 同上 |
+| `proxy.url` | 必须是字符串 | L99-101 | 同上 |
+| `proxy.by_bridge` | 必须是 bool 类型 | L103-105 | 同上 |
+| `proxy.name` | 必须是字符串 | L107-110 | 同上 |
+| `cache.type` | 必须是字符串 | L112-114 | 同上 |
+| `cache.custom_timeout` | 必须是 bool 类型 | L116-118 | 同上 |
+| `authentication.enable` | 必须是 bool 类型 | L120-122 | 同上 |
+| `authentication.username` | 必须是字符串 | L124-126 | 同上 |
+| `authentication.password` | 必须是字符串 | L128-130 | 同上 |
+| `admin.email` | 非空时必须通过 `FILTER_VALIDATE_EMAIL` | L132-137 | 同上 |
+| `admin.donations` | 必须是 bool 类型 | L139-141 | 同上 |
+| `error.output` | 必须是字符串 + 必须是 `'feed'`/`'http'`/`'none'` | L143-148 | 同上 |
+| `error.report_limit` | 必须是数字 + 必须 >= 1 | L150-155 | 同上 |
+
+**校验失败处理**（`lib/Configuration.php:192-197`）：
+```php
+private static function throwConfigError($section, $key, $message = '')
+{
+    http_response_code(500);
+    print ("Config [$section] => [$key] is invalid. $message");
+    exit(1);  // 直接终止整个程序
+}
+```
+- 英文硬编码错误消息，无翻译
+- 直接 `exit(1)` 终止，不走异常处理系统
+
+### 14.4 环境变量到配置的映射与校验
+
+**文件**：`lib/Configuration.php:55-82`
+
+环境变量名格式：`RSSBRIDGE_<SECTION>_<KEY>`
+
+```php
+foreach ($env as $envName => $envValue) {
+    $nameParts = explode('_', $envName);
+    if ($nameParts[0] === 'RSSBRIDGE') {
+        $header = $nameParts[1];                    // section
+        $key = implode('_', array_slice($nameParts, 2));  // key（下划线重组）
+        $key = strtolower($key);
+
+        // 特殊处理：enabled_bridges 按逗号拆分为数组
+        if ($key === 'enabled_bridges') {
+            $envValue = explode(',', $envValue);
+            $envValue = array_map('trim', $envValue);
+        }
+
+        // 字符串 "true"/"false" → bool 类型转换
+        if ($envValue === 'true' || $envValue === 'false') {
+            $envValue = filter_var($envValue, FILTER_VALIDATE_BOOLEAN);
+        }
+
+        self::setConfig($header, $key, $envValue);
+    }
+}
+```
+
+**示例映射**：
+```
+RSSBRIDGE_SYSTEM_ENV=dev                 → section=system, key=env, value='dev'
+RSSBRIDGE_SYSTEM_ENABLED_BRIDGES=YoutubeBridge,TelegramBridge
+                                        → section=system, key=enabled_bridges, value=['YoutubeBridge','TelegramBridge']
+RSSBRIDGE_ADMIN_DONATIONS=true          → section=admin, key=donations, value=true (bool)
+RSSBRIDGE_CACHE_CUSTOM_TIMEOUT=false    → section=cache, key=custom_timeout, value=false (bool)
+```
+
+> 注意：环境变量先被 `setConfig()` 写入内存，然后**一起**在 L84-156 做 schema 校验。校验发生在环境变量加载之后。
+
+### 14.5 桥接级 CONFIGURATION 的校验机制
+
+桥接自定义配置（`const CONFIGURATION`）的校验**不在 Configuration 类中**，而是在每个桥接首次加载时由 `BridgeAbstract::loadConfiguration()` 完成。
+
+**文件**：`lib/BridgeAbstract.php:119-148`
+```php
+public function loadConfiguration()
+{
+    foreach (static::CONFIGURATION as $optionName => $optionValue) {
+        $section = $this->getShortName();
+        $configurationOption = Configuration::getConfig($section, $optionName);
+
+        if ($configurationOption !== null) {
+            $this->configuration[$optionName] = $configurationOption;
+        } elseif (isset($optionValue['required']) && $optionValue['required'] === true) {
+            // 校验: required=true 但配置缺失 → 抛异常
+            throw new \Exception(sprintf('Missing configuration option: %s', $optionName));
+        } elseif (isset($optionValue['defaultValue'])) {
+            $this->configuration[$optionName] = $optionValue['defaultValue'];
+        }
+    }
+}
+```
+
+**校验逻辑非常简单**：
+- 只校验 `required` 字段是否存在
+- **不校验数据类型**（字符串/数字/布尔等）
+- 不校验值范围（最大/最小值）
+- 不校验格式（URL、邮箱等）
+- 缺失且非 required → 用 `defaultValue`，或留空
+
+### 14.6 用户参数 PARAMETERS 的校验
+
+**文件**：`lib/ParameterValidator.php:8-59`
+
+用户表单提交的参数（PARAMETERS）在 `BridgeAbstract::setInput()` 中由 `ParameterValidator` 校验：
+
+```php
+public function validateInput(array &$input, array $parameters): array
+{
+    foreach ($input as $name => $value) {
+        // Step 1: 检查参数是否已注册（防止未注册参数注入）
+        if (!$registered) {
+            $errors[] = ['name' => $name, 'reason' => 'Parameter is not registered!'];
+            continue;
+        }
+
+        // Step 2: 按 type 做类型校验
+        switch ($contextParameters[$name]['type']) {
+            case 'number':
+                $input[$name] = filter_var($value, FILTER_VALIDATE_INT);
+                break;
+            case 'checkbox':
+                $input[$name] = filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+                break;
+            case 'list':
+                // 检查值是否在 values 枚举列表中
+                if (!in_array($filteredValue, $expectedValues)) {
+                    return null;
+                }
+                break;
+            case 'text':
+                if (isset($pattern)) {
+                    $input[$name] = filter_var($value, FILTER_VALIDATE_REGEXP, [
+                        'options' => ['regexp' => '/^' . $pattern . '$/']
+                    ]);
+                }
+                break;
+        }
+
+        // Step 3: required 字段校验
+        if (is_null($input[$name]) && ...required...) {
+            $errors[] = ['name' => $name, 'reason' => 'Parameter is invalid!'];
+        }
+    }
+    return $errors;
+}
+```
+
+**校验能力对比**：
+
+| 校验能力 | Configuration（管理员配置） | PARAMETERS（用户参数） |
+|---------|----------------------------|----------------------|
+| required 必填 | ✅ 桥接级检查 | ✅ |
+| 类型校验（int/bool/string） | ❌ 仅在系统级配置硬编码 | ✅ 基于 type 字段 |
+| 正则 pattern 校验 | ❌ | ✅ text 类型 |
+| 枚举值校验 | ❌ | ✅ list 类型 |
+| 邮箱/URL 格式校验 | ✅ 仅 admin.email 特殊处理 | ❌ |
+| 值范围校验（min/max） | ❌ | ❌ |
+
+### 14.7 序列化与校验全链路图
+
+```
+管理员编辑 config.ini.php
+    ↓ 写入磁盘
+[system]
+env = "prod"
+enabled_bridges[] = YoutubeBridge
+enabled_bridges[] = TelegramBridge
+
+[TelegramBridge]
+max_pages = 5
+    ↓
+用户请求到达
+    ↓
+lib/config.php:
+    $config = parse_ini_file(config.default.ini.php, true, INI_SCANNER_TYPED)
+    $customConfig = parse_ini_file(config.ini.php, true, INI_SCANNER_TYPED)
+    Configuration::loadConfiguration($customConfig, getenv())
+    ↓
+Configuration::loadConfiguration():
+    1. 加载 default.ini → setConfig() 存入内存
+    2. 加载 custom.ini → 覆盖
+    3. 加载 DEBUG / whitelist.txt → 覆盖
+    4. 加载环境变量 RSSBRIDGE_* → 覆盖
+    5. Schema 校验（15 个硬编码 if）
+        → 全部通过 → 继续
+        → 任一失败 → throwConfigError() → HTTP 500 exit
+    ↓
+DisplayAction:
+    $bridge->loadConfiguration()
+        → 读取 [TelegramBridge] max_pages = 5
+        → 桥接级 required 校验
+        → 成功存入 $this->configuration
+    ↓
+    $bridge->setInput($input)
+        → ParameterValidator::validateInput()
+        → 按 PARAMETERS 的 type/pattern/required 校验
+        → 成功存入 $this->inputs
+    ↓
+    $bridge->collectData() → 生成 Feed
+```
+
+---
+
+## 十五、CLI 命令的国际化处理及 Web 翻译资源复用
+
+### 15.1 核心结论：CLI 模式复用 Web 全部代码路径，同样无国际化
+
+RSS-Bridge 的 CLI 模式**完全复用 Web 模式的所有代码**，包括错误消息、模板渲染、异常处理等。因此 CLI 与 Web 一样，**没有任何国际化处理**，所有输出均为英文硬编码，不存在"复用 Web 翻译资源"的问题——因为 Web 端本身就没有翻译资源。
+
+### 15.2 CLI 入口与代码路径
+
+**文件**：`index.php:63-69`
+
+```php
+$argv = $argv ?? null;
+if ($argv) {
+    // CLI 模式: 解析命令行参数为 GET 参数
+    parse_str(implode('&', array_slice($argv, 1)), $cliArgs);
+    $request = Request::fromCli($cliArgs);
+} else {
+    // Web 模式: 从 $_GET/$_SERVER 读取
+    $request = Request::fromGlobals();
+}
+
+// 后续流程完全相同
+$rssBridge = new RssBridge($container);
+$response = $rssBridge->main($request);
+$response->send();
+```
+
+**命令行用法**（`docs/02_CLI/index.md`）：
+```bash
+php index.php action=display bridge=DansTonChat format=Json
+php index.php action=list
+php index.php action=display bridge=YoutubeBridge u=LinusTechTips format=Atom
+```
+
+### 15.3 Request 对象的两种构造方式
+
+**文件**：`lib/http.php:210-224`
+
+```php
+// Web 模式
+public static function fromGlobals(): self
+{
+    $self = new self();
+    $self->get = $_GET;
+    $self->server = $_SERVER;
+    $self->attributes = [];
+    return $self;
+}
+
+// CLI 模式
+public static function fromCli(array $cliArgs): self
+{
+    $self = new self();
+    $self->get = $cliArgs;
+    // $self->server 未设置 → 始终为 null
+    return $self;
+}
+```
+
+**CLI 模式的限制**：
+- `$self->server` 属性为空数组，所有 `$request->server()` 调用返回 `null`
+- 依赖 `$_SERVER` 的功能在 CLI 下会失效
+
+### 15.4 两种模式下鉴权中间件的行为差异
+
+由于 CLI 模式下 `$request->server()` 返回 null，鉴权中间件行为不同：
+
+#### BasicAuthMiddleware 在 CLI 下的行为
+
+```php
+$user = $request->server('PHP_AUTH_USER');     // CLI 下 → null
+$password = $request->server('PHP_AUTH_PW');   // CLI 下 → null
+
+if ($user === null || $password === null) {
+    // 即使在 config.ini.php 中开启了 authentication.enable
+    // CLI 下也会触发 401 错误！
+    $html = render(__DIR__ . '/../templates/error.html.php', [
+        'message' => 'Please authenticate in order to access this instance!',
+    ]);
+    return new Response($html, 401, ['WWW-Authenticate' => 'Basic realm="RSS-Bridge"']);
+}
+```
+
+> **CLI 陷阱**：如果启用了 HTTP Basic Auth，CLI 调用会直接失败，因为无法传递 `PHP_AUTH_USER` 环境变量。需要先设置 `$_SERVER['PHP_AUTH_USER']` 和 `$_SERVER['PHP_AUTH_PW']` 全局变量。
+
+#### TokenAuthenticationMiddleware 在 CLI 下的行为
+
+Token 鉴权从 GET 参数读取，CLI 下**正常工作**：
+```bash
+php index.php action=display bridge=YoutubeBridge u=test format=Json token=mysecrettoken
+```
+
+### 15.5 Response::send() 在 CLI 下的行为
+
+**文件**：`lib/http.php:379-388`
+
+```php
+public function send(): void
+{
+    http_response_code($this->code);       // CLI 下无效，但不报错
+    foreach ($this->headers as $name => $values) {
+        foreach ($values as $value) {
+            header(sprintf('%s: %s', $name, $value));  // CLI 下会输出到 stderr 警告
+        }
+    }
+    print $this->body;                       // CLI 下正常输出到 stdout
+}
+```
+
+**CLI 下的输出问题**：
+- `http_response_code()` 在 CLI 模式下无效（无 HTTP 协议）
+- `header()` 会产生 PHP Warning：`Cannot modify header information - headers already sent`
+- `print $this->body` 正常输出 Feed 内容到 stdout
+- 如果输出的是 HTML 格式错误页，CLI 下会看到完整 HTML 标签
+
+### 15.6 CLI 与 Web 代码复用对比
+
+| 组件 | Web 模式 | CLI 模式 | 是否复用 |
+|-----|---------|---------|---------|
+| `RssBridge::main()` | ✅ | ✅ | ✅ 完全复用 |
+| 中间件栈（6 个中间件） | ✅ | ✅ | ✅ 完全复用（行为有差异） |
+| 所有 Action（Frontpage/Display 等） | ✅ | ✅ | ✅ 完全复用 |
+| 错误消息文案 | 英文硬编码 | 英文硬编码 | ✅ 完全复用 |
+| 异常模板 exception.html.php | ✅ | ✅ | ✅ 完全复用 |
+| `Configuration::loadConfiguration()` | ✅ | ✅ | ✅ 完全复用 |
+| `BridgeAbstract::loadConfiguration()` | ✅ | ✅ | ✅ 完全复用 |
+| `ParameterValidator` | ✅ | ✅ | ✅ 完全复用 |
+| 桥接 `collectData()` 逻辑 | ✅ | ✅ | ✅ 完全复用 |
+| Feed 格式渲染（Atom/JSON/RSS 等） | ✅ | ✅ | ✅ 完全复用 |
+| `$request->server('PHP_AUTH_*')` | ✅ 可用 | ❌ 返回 null | ❌ 不复用 |
+| HTTP 响应头（`header()`） | ✅ 发送到浏览器 | ❌ 产生 Warning | ❌ 不复用 |
+
+### 15.7 CLI 模式下的错误消息示例
+
+**示例 1：参数缺失**
+```bash
+$ php index.php action=display bridge=YoutubeBridge format=Json
+```
+输出（完整 HTML）：
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>RSS-Bridge</title>
+</head>
+<body>
+    <h1>Missing parameter</h1>
+    <p>You must specify either:
+ - YouTube username (?u=...)
+ - Channel id (?c=...)
+ - Playlist id (?p=...)
+ - Search (?s=...)</p>
+</body>
+</html>
+```
+> 错误消息是桥接抛出的英文硬编码 `throwClientException()` 内容，经 `templates/exception.html.php` 渲染。
+
+**示例 2：鉴权失败（Basic Auth 已启用）**
+```bash
+$ php index.php action=list
+```
+输出：
+```html
+<!DOCTYPE html>
+<html lang="en">
+<body>
+    <p>Please authenticate in order to access this instance!</p>
+</body>
+</html>
+```
+> 同样是英文硬编码，与 Web 端完全相同。
+
+### 15.8 CLI 模式下的"国际化"现状
+
+**结论**：与 Web 端完全一致，无任何 i18n 能力。
+
+| 检查项 | Web 模式 | CLI 模式 |
+|-------|---------|---------|
+| 翻译函数 `__()` / `t()` | ❌ | ❌ |
+| 多语言包文件 | ❌ | ❌ |
+| 语言 GET 参数 | ❌ | ❌ |
+| Accept-Language 解析 | ❌ | ❌（无 HTTP 头） |
+| 日期/时间本地化 | 仅 UTC 或配置时区 | 仅 UTC 或配置时区 |
+| 错误消息语言 | 英文硬编码 | 英文硬编码 |
+| 模板 lang 属性 | `<html lang="en">` | `<html lang="en">` |
+
+### 15.9 CLI 下 Response send 的技术细节
+
+由于 CLI 模式下没有 HTTP 协议层，`Response::send()` 会产生一些副作用：
+
+1. **`http_response_code()`**：在 CLI 下调用不会影响实际退出码（始终为 0），也不会产生警告
+2. **`header()`**：会产生 `PHP Warning: Cannot modify header information - headers already sent`，输出到 stderr
+3. **退出码**：无论 Response code 是 200/400/404/500，PHP 进程退出码始终为 0
+4. **内容类型**：不会设置 Content-Type，输出直接是原始 body（可能是 HTML/XML/JSON 等）
+
+**如果要在脚本中正确处理 CLI 调用，应避免使用 `$response->send()`，改为**：
+```bash
+php index.php action=display bridge=YoutubeBridge u=test format=Json 2>/dev/null
+```
+重定向 stderr 以忽略 header() 警告。
+
+---
+
+## 十六、扩展：若要实现真正的 i18n
 
 当前项目无多语言能力。若需接入 i18n，需在以下位置做改造：
 
