@@ -2293,7 +2293,569 @@ php index.php action=display bridge=YoutubeBridge u=test format=Json 2>/dev/null
 
 ---
 
-## 十六、扩展：若要实现真正的 i18n
+## 十六、Admin 导入导出 Bridge 配置的批量校验
+
+### 16.1 核心结论：无 Web 导入导出界面，仅支持 ini 文件批量配置
+
+RSS-Bridge **没有 Web 管理后台，也没有"导入/导出"功能**。桥接的批量启用/禁用通过编辑 `config.ini.php` 中的 `[system] enabled_bridges` 数组来完成。批量校验逻辑在 `BridgeFactory` 构造函数中完成，无独立校验框架。
+
+### 16.2 批量配置方式
+
+#### 方式一：全部启用（通配符）
+
+**文件**：`config.default.ini.php:30`
+```ini
+[system]
+enabled_bridges[] = *
+```
+
+`*` 是特殊通配符，表示启用 `bridges/` 目录下所有的桥接类（通过 `scandir()` 扫描）。
+
+#### 方式二：逐个列出
+
+**文件**：`config.default.ini.php:14-29`
+```ini
+[system]
+enabled_bridges[] = CssSelectorBridge
+enabled_bridges[] = FeedMerge
+enabled_bridges[] = Filter
+enabled_bridges[] = Youtube
+; ...
+```
+
+桥接名称支持大小写不敏感，且可以省略 `Bridge` 后缀（见 16.4 名称规范化）。
+
+#### 方式三：whitelist.txt 白名单文件
+
+**文件**：`lib/Configuration.php:46-51`
+```php
+if (file_exists(__DIR__ . '/../whitelist.txt')) {
+    $enabledBridges = trim(file_get_contents(__DIR__ . '/../whitelist.txt'));
+    if ($enabledBridges === '*') {
+        self::setConfig('system', 'enabled_bridges', ['*']);
+    } else {
+        self::setConfig('system', 'enabled_bridges', array_filter(array_map('trim', explode("\n", $enabledBridges))));
+    }
+}
+```
+
+每行一个桥接名，文件级白名单。存在时会覆盖 ini 配置中的 `enabled_bridges`。
+
+#### 方式四：环境变量
+
+**文件**：`lib/Configuration.php:71-74`
+```bash
+export RSSBRIDGE_SYSTEM_ENABLED_BRIDGES="YoutubeBridge,TelegramBridge,Reddit"
+```
+按逗号分隔，自动拆分为数组。环境变量优先级最高。
+
+### 16.3 批量校验逻辑（BridgeFactory 构造函数）
+
+**文件**：`lib/BridgeFactory.php:11-42`
+
+```php
+public function __construct(CacheInterface $cache, Logger $logger)
+{
+    // Step 1: 扫描 bridges/ 目录，获取所有可用桥接类名
+    foreach (scandir(__DIR__ . '/../bridges/') as $file) {
+        if (preg_match('/^([^.]+Bridge)\.php$/U', $file, $m)) {
+            $this->bridgeClassNames[] = $m[1];
+        }
+    }
+
+    // Step 2: 读取配置中的 enabled_bridges
+    $enabledBridges = Configuration::getConfig('system', 'enabled_bridges');
+    if ($enabledBridges === null) {
+        throw new \Exception('No bridges are enabled...');
+    }
+
+    // Step 3: 逐个校验 & 规范化
+    foreach ($enabledBridges as $enabledBridge) {
+        if ($enabledBridge === '*') {
+            // 通配符：全部启用，直接复制数组并 break
+            $this->enabledBridges = $this->bridgeClassNames;
+            break;
+        }
+        $bridgeClassName = $this->createBridgeClassName($enabledBridge);
+        if ($bridgeClassName) {
+            // 校验通过：加入已启用列表
+            $this->enabledBridges[] = $bridgeClassName;
+        } else {
+            // 校验失败：加入缺失列表 + INFO 日志，不抛出异常
+            $this->missingEnabledBridges[] = $enabledBridge;
+            $this->logger->info(sprintf('Bridge not found: %s', $enabledBridge));
+        }
+    }
+}
+```
+
+**关键设计决策**：
+- **容错而非阻断**：不存在的桥接名只是记录到 `missingEnabledBridges` 并打日志，不会导致整个系统 500
+- **大小写不敏感**：名称比较时统一转小写
+- **静默降级**：`FrontpageAction` 首页会显示警告（`Warning : Bridge "xxx" not found`），但功能正常
+
+### 16.4 桥接名称规范化算法
+
+**文件**：`lib/BridgeFactory.php:54-75`
+
+```php
+public function createBridgeClassName(string $bridgeName): ?string
+{
+    $name = self::normalizeBridgeName($bridgeName);
+    $namesLoweredCase = array_map('strtolower', $this->bridgeClassNames);
+    $nameLoweredCase = strtolower($name);
+    if (! in_array($nameLoweredCase, $namesLoweredCase)) {
+        return null;  // 未找到
+    }
+    $index = array_search($nameLoweredCase, $namesLoweredCase);
+    return $this->bridgeClassNames[$index];  // 返回原始大小写形式
+}
+
+public static function normalizeBridgeName(string $name)
+{
+    // 去掉 .php 后缀
+    if (preg_match('/(.+)(?:\.php)/', $name, $matches)) {
+        $name = $matches[1];
+    }
+    // 自动补全 Bridge 后缀
+    if (!preg_match('/(Bridge)$/i', $name)) {
+        $name = sprintf('%sBridge', $name);
+    }
+    return $name;
+}
+```
+
+**规范化示例**：
+
+| 输入 | normalize 后 | 查找结果 |
+|-----|-------------|---------|
+| `Youtube` | `YoutubeBridge` | ✅ YoutubeBridge |
+| `youtube` | `youtubeBridge` | ✅ YoutubeBridge（大小写不敏感匹配） |
+| `YoutubeBridge` | `YoutubeBridge` | ✅ YoutubeBridge |
+| `YouTube` | `YouTubeBridge` | ✅ （模糊匹配） |
+| `youtube.php` | `youtubeBridge` | ✅ |
+| `NonExistent` | `NonExistentBridge` | ❌ null |
+
+### 16.5 系统级 schema 校验
+
+**文件**：`lib/Configuration.php:88-90`
+```php
+if (!is_array(self::getConfig('system', 'enabled_bridges'))) {
+    self::throwConfigError('system', 'enabled_bridges', 'Is not an array');
+}
+```
+- 仅校验**类型是否为数组**，不校验每个元素是否存在
+- 元素存在性校验在 `BridgeFactory` 中做（见 16.3）
+
+### 16.6 桥接级 CONFIGURATION 的批量加载与校验
+
+每个桥接的专属配置（`const CONFIGURATION`）不在 `Configuration` 类中批量校验，而是**按需延迟加载**：
+
+```
+用户请求 action=display&bridge=TelegramBridge
+    ↓
+DisplayAction::__invoke()
+    ↓
+$bridge->loadConfiguration()
+    ↓
+遍历 static::CONFIGURATION（TelegramBridge::CONFIGURATION）
+    ├─ 从 Configuration::getConfig('TelegramBridge', 'max_pages') 读取
+    ├─ required=true 且缺失 → 抛异常
+    └─ 有 defaultValue → 使用默认值
+```
+
+**无批量预校验**：只有当某个桥接被实际请求时，才会校验它的 CONFIGURATION。未被请求的桥接即使配置错误也不会被发现。
+
+### 16.7 导入导出的等价操作
+
+由于没有真正的"导入导出"功能，管理员通过以下方式实现批量配置管理：
+
+| 操作 | 等价命令 |
+|-----|---------|
+| 导出当前桥接列表 | `ls bridges/ | grep Bridge.php` 或访问 `?action=list`（JSON） |
+| 导入启用列表 | 编辑 `config.ini.php` 的 `enabled_bridges[]` 数组 |
+| 批量禁用 | 注释掉对应的 `enabled_bridges[] = xxx` 行 |
+| 全部启用 | `enabled_bridges[] = *` |
+
+`ListAction` 提供 JSON 格式的桥接元数据导出（`actions/ListAction.php:13-35`）：
+```json
+{
+    "bridges": {
+        "YoutubeBridge": {
+            "status": "active",
+            "uri": "https://www.youtube.com",
+            "name": "YouTube",
+            "parameters": { ... },
+            "description": "..."
+        }
+    },
+    "total": 400
+}
+```
+但没有对应的"导入"API。
+
+---
+
+## 十七、API 端点鉴权在公开 Bridge 与私有 Bridge 间的差异化处理
+
+### 17.1 核心结论：无"公开/私有"桥接分级，鉴权是全站一刀切
+
+RSS-Bridge **没有"公开桥接"和"私有桥接"的分级概念**。鉴权（HTTP Basic Auth / Token）是全站级别的开关——要么所有桥接都需要鉴权，要么所有桥接都不需要。
+
+唯一的"分级"机制是 **`enabled_bridges` 白名单**：未启用的桥接不能访问，但这是功能开关而非鉴权分级。
+
+### 17.2 鉴权与桥接可用性的两层控制
+
+```
+用户请求 action=display&bridge=XxxBridge
+    ↓
+第一层：鉴权中间件（全站通用，与具体桥接无关）
+    ├─ BasicAuthMiddleware → 未通过 → 401 错误页
+    └─ TokenAuthenticationMiddleware → 未通过 → 401 token 表单
+    ↓
+第二层：桥接白名单校验（DisplayAction 内）
+    └─ BridgeFactory::isEnabled() 检查 → 未启用 → 400 "This bridge is not whitelisted"
+    ↓
+正常生成 Feed
+```
+
+### 17.3 各 Action 对桥接白名单的处理
+
+| Action | 是否检查 isEnabled | 未启用时的行为 |
+|-------|-------------------|--------------|
+| `FrontpageAction`（首页） | ✅ 是（L31） | 不渲染该桥接的卡片，完全隐藏 |
+| `DisplayAction`（Feed 生成） | ✅ 是（L36） | 返回 400 错误：`'This bridge is not whitelisted'` |
+| `ListAction`（JSON 列表） | ✅ 是（L23） | 仍列出，但 `status: "inactive"` |
+| `FindfeedAction`（发现 Feed） | ✅ 是（L32） | 跳过该桥接，不参与检测 |
+| `DetectAction`（自动检测） | ❌ 否（自动检测） | - |
+| `ConnectivityAction`（连通性） | ❌ 否（运维用） | - |
+| `HealthAction`（健康检查） | ❌ 否（运维用） | - |
+
+#### FrontpageAction 的白名单表现
+
+**文件**：`actions/FrontpageAction.php:29-36`
+```php
+foreach ($bridgeClassNames as $bridgeClassName) {
+    if ($this->bridgeFactory->isEnabled($bridgeClassName)) {
+        $bridge = $this->bridgeFactory->create($bridgeClassName);
+        $body .= self::render($bridge, $bridgeClassName, $token);
+        $activeBridges++;
+    }
+}
+```
+- 未启用的桥接**不显示在首页**，用户看不到任何痕迹
+- 首页计数只统计 active 桥接数
+
+#### DisplayAction 的白名单表现
+
+**文件**：`actions/DisplayAction.php:36-38`
+```php
+if (!$this->bridgeFactory->isEnabled($bridgeClassName)) {
+    return new Response(render(__DIR__ . '/../templates/error.html.php', [
+        'message' => 'This bridge is not whitelisted'
+    ]), 400);
+}
+```
+- 直接访问未启用桥接的 display 端点 → 返回 400 HTTP 错误
+- 错误消息为英文硬编码
+
+### 17.4 鉴权中间件与桥接的关系
+
+**两个鉴权中间件对所有请求一视同仁**，不区分具体桥接：
+
+```
+所有请求（无论 bridge= 是什么）
+    ↓
+BasicAuthMiddleware
+    ↓ 检查 [authentication] enable = true/false
+    ↓ 如启用，校验 PHP_AUTH_USER / PHP_AUTH_PW
+    ↓ 不通过 → 401，不会进入后续逻辑
+    ↓
+TokenAuthenticationMiddleware
+    ↓ 检查 [authentication] token 是否配置
+    ↓ 如配置，校验 $_GET['token']
+    ↓ 不通过 → 401，不会进入后续逻辑
+    ↓
+DisplayAction 才开始检查具体桥接是否在白名单中
+```
+
+> 鉴权和白名单是**两个独立的控制层**：
+> - 鉴权 = "你能不能访问这个网站"
+> - 白名单 = "这个网站上有没有这个桥接"
+>
+> 未鉴权用户看不到任何桥接；鉴权但白名单外的桥接返回 400。
+
+### 17.5 不存在的"私有桥接"特性
+
+常见的"私有桥接"预期功能在本项目中均不存在：
+
+| 预期的私有桥接特性 | 本项目是否支持 |
+|------------------|--------------|
+| 某些桥接需要登录才能访问 | ❌ 鉴权是全站的，不能按桥接单独设置 |
+| 每个桥接有独立的访问密码 | ❌ 只有一个全局用户名/密码 / token |
+| 不同用户看到不同的桥接列表 | ❌ 无用户系统，只有一个 admin 账户 |
+| 桥接访问审计日志 | ❌ 无访问日志（仅有错误日志） |
+| 按 IP 限制桥接访问 | ❌ 无 IP 黑白名单 |
+
+### 17.6 白名单与鉴权的组合效果
+
+| 场景 | 鉴权状态 | 桥接白名单 | 结果 |
+|-----|---------|-----------|------|
+| 未启用鉴权 + 白名单=`*` | - | 全部启用 | 所有桥接公开访问 |
+| 未启用鉴权 + 白名单=部分 | - | 仅启用部分 | 公开访问部分桥接，其他报 400 |
+| 启用鉴权 + 白名单=`*` | 未通过 | - | 401 登录弹窗 |
+| 启用鉴权 + 白名单=`*` | 已通过 | 全部启用 | 可访问所有桥接 |
+| 启用鉴权 + 白名单=部分 | 已通过 | 仅启用部分 | 可访问白名单内的桥接，其他 400 |
+
+### 17.7 间接实现"私有桥接"的变通方式
+
+虽然没有原生支持，但管理员可以通过以下方式近似实现：
+
+#### 方式一：通过 enabled_bridges 隐藏敏感桥接
+
+```ini
+[system]
+; 只启用"安全"的桥接，隐藏需要凭证的桥接
+enabled_bridges[] = Youtube
+enabled_bridges[] = Reddit
+; TelegramBridge 不启用，通过内部文档告知用户手动添加
+```
+
+缺点：完全不启用就完全不能用，等于禁用而非"私有"。
+
+#### 方式二：反向代理按路径鉴权
+
+在 Nginx/Caddy 等反向代理层针对特定 bridge 的 URL 做额外鉴权：
+```nginx
+location ~* bridge=TelegramBridge {
+    auth_basic "Restricted";
+    auth_basic_user_file /etc/nginx/.htpasswd-telegram;
+    proxy_pass http://rss-bridge;
+}
+```
+
+这是项目外部的实现，与 RSS-Bridge 代码无关。
+
+---
+
+## 十八、定时任务跑批失败的恢复路径与重试上限
+
+### 18.1 核心结论：无内置定时任务系统，仅在 HTTP 请求级有重试
+
+RSS-Bridge **没有内置的定时任务（cron/job/queue）系统**，也没有"跑批"概念。所有桥接都是**按需触发**——用户请求时才执行抓取，失败就失败，没有后台重试任务。
+
+项目中存在的重试机制只有两层：
+1. **curl 请求级重试**：单次 HTTP 请求失败后的立即重试（`[http] retries` 配置）
+2. **错误报告阈值**：错误累计到 `report_limit` 次才显示给用户（避免偶发错误打扰用户）
+
+### 18.2 curl 请求级重试机制
+
+**文件**：`lib/http.php:170-192`
+
+```php
+// This retry logic is a bit hard to understand, but it works
+$tries = 0;
+while (true) {
+    $tries++;
+    $body = curl_exec($ch);
+    if ($body !== false) {
+        // 请求成功，跳出循环
+        break;
+    }
+    if ($tries <= $config['retries']) {
+        // 未达上限，继续循环（立即重试）
+        continue;
+    }
+    // 达到重试上限，抛出异常
+    $curl_error = curl_error($ch);
+    $curl_errno = curl_errno($ch);
+    throw new HttpException(sprintf(
+        'cURL error %s: %s (%s) for %s',
+        $curl_error,
+        $curl_errno,
+        'https://curl.haxx.se/libcurl/c/libcurl-errors.html',
+        $url
+    ));
+}
+```
+
+**关键特性**：
+- **重试触发条件**：仅当 `curl_exec() === false` 时重试（即网络层错误，如连接超时、DNS 解析失败、连接拒绝等）
+- **不重试的情况**：HTTP 状态码错误（404/500 等）**不会触发重试**，因为 `curl_exec` 仍返回 body（非 false）
+- **重试次数配置**：`[http] retries`，默认 `1`（`config.default.ini.php:48-49`）
+- **重试间隔**：**无间隔，立即重试**（无 backoff、无 sleep）
+- **最大尝试次数** = `retries + 1`（首次 + N 次重试）
+  - `retries=1` → 最多尝试 2 次
+  - `retries=3` → 最多尝试 4 次
+
+**重试流程图**：
+```
+调用 getContents() / getSimpleHTMLDOM()
+    ↓
+CurlHttpClient::request()
+    ↓
+curl_exec()
+    ├─ 成功 (body !== false) → 返回 Response
+    └─ 失败 (body === false)
+        ├─ tries <= retries → 立即重试（continue）
+        └─ tries > retries → 抛 HttpException
+```
+
+### 18.3 重试配置的传递链
+
+```
+config.default.ini.php [http] retries = 1
+    ↓
+Configuration::getConfig('http', 'retries')
+    ↓
+getContents() 构造 $config 数组（lib/contents.php:55）
+    ↓
+CurlHttpClient::request($url, $config)
+    ↓
+$defaultConfig = ['retries' => 2, ...]  ← 默认值
+$config = array_merge($defaultConfig, $config);  ← 配置覆盖默认
+    ↓
+实际 retries 值 = min(配置文件值, 代码默认值)？不，是配置覆盖代码默认
+```
+
+> 注意：`CurlHttpClient` 代码中 `retries` 默认值为 `2`（L76），但 `getContents()` 会从配置读取覆盖它（L55），所以最终以 `config.default.ini.php` 中的 `retries = 1` 为准。
+
+### 18.4 错误报告阈值（report_limit）
+
+**文件**：`actions/DisplayAction.php:107-123, 172-191`
+
+这不是"重试机制"，而是**错误抑制机制**——偶发错误不立即显示给用户，累计到一定次数后才报告。
+
+```php
+$reportLimit = Configuration::getConfig('error', 'report_limit');
+$errorCount = 1;
+if ($reportLimit > 1) {
+    $errorCount = $this->logBridgeError($bridge->getName(), $e->getCode());
+}
+// 达到报告阈值才显示错误
+if ($errorCount >= $reportLimit) {
+    if ($errorOutput === 'feed') {
+        $items = [$this->createFeedItemFromException($e, $bridge)];
+    } elseif ($errorOutput === 'http') {
+        return new Response(render('exception.html.php', ['e' => $e]), 500);
+    } elseif ($errorOutput === 'none') {
+        // 静默
+    }
+}
+```
+
+#### logBridgeError 计数逻辑
+
+**文件**：`actions/DisplayAction.php:172-191`
+```php
+private function logBridgeError($bridgeName, $code)
+{
+    $cacheKey = 'error_reporting_' . $bridgeName . '_' . $code;
+    $report = $this->cache->get($cacheKey);
+    if ($report) {
+        $report = Json::decode($report);
+        $report['time'] = time();
+        $report['count']++;      // 计数 +1
+    } else {
+        $report = [
+            'error' => $code,
+            'time' => time(),
+            'count' => 1,        // 首次
+        ];
+    }
+    $ttl = 86400 * 5;   // 5 天 TTL
+    $this->cache->set($cacheKey, Json::encode($report), $ttl);
+    return $report['count'];
+}
+```
+
+**计数器特性**：
+- 存储在**缓存系统**中（FileCache/SQLite 等），key = `error_reporting_{bridgeName}_{errorCode}`
+- TTL = 5 天（86400 * 5 秒）
+- 每次错误刷新 `time` 字段（重置 TTL 倒计时）
+- 按**桥接名 + 错误码**分别计数
+- 5 天内无错误则计数器自动过期消失
+
+**与用户感知的关系**：
+- `report_limit = 1`（默认）：第一次出错就显示给用户（无抑制）
+- `report_limit = 3`：前两次出错用户看到空 Feed，第三次才显示错误条目
+- 目的：避免偶发的、自动恢复的错误（如短暂网络波动）打扰用户
+
+### 18.5 错误后的"恢复"路径
+
+项目中没有显式的"失败恢复"机制，但存在以下几种自然恢复方式：
+
+#### 恢复方式 1：下次请求自动重试
+
+由于桥接是**按需执行**的，每次用户请求都是一次全新的抓取：
+```
+请求 1: YoutubeBridge → 网络超时 → 错误缓存计数 +1 → 空 Feed / 错误条目
+请求 2: 5 分钟后用户刷新 → 重新抓取 → 成功 → 正常 Feed
+```
+每次请求都是独立的，失败不会导致后续请求被阻塞。
+
+#### 恢复方式 2：缓存回退（304 Not Modified）
+
+**文件**：`lib/contents.php:73-89`
+
+如果之前有成功的缓存，且源站返回 304，会复用缓存内容：
+```php
+$cachedResponse = $cache->get($cacheKey);
+if ($cachedResponse) {
+    $lastModified = $cachedResponse->getHeader('last-modified');
+    if ($lastModified) {
+        $config['if_not_modified_since'] = $lastModified->getTimestamp();
+    }
+    $etag = $cachedResponse->getHeader('etag');
+    if ($etag) {
+        $httpHeadersNormalized['if-none-match'] = $etag;
+    }
+}
+// ...
+$response = $httpClient->request($url, $config);
+// 304 Not Modified → 使用缓存
+case 304:
+    $response = $response->withBody($cachedResponse->getBody());
+    break;
+```
+
+但这需要源站支持 304，且缓存未过期。
+
+#### 恢复方式 3：错误计数过期重置
+
+如果错误是偶发的，5 天后计数自动过期消失，相当于"自动恢复"：
+```
+Day 1: 错误 3 次 → 达到 report_limit=3 → 向用户显示错误
+Day 2-6: 没有新请求 → 计数器 TTL 5 天后过期
+Day 7: 新请求 → 重新计数，首次错误不显示（如果 report_limit>1）
+```
+
+### 18.6 无定时任务系统的佐证
+
+全局搜索无以下相关代码：
+- `cron` / `schedule` / `job` / `task`（定时任务相关）
+- `max_retries` / `retry_count` / `backoff`（批处理重试）
+- `queue` / `worker` / `daemon`（队列/守护进程）
+- `pcntl_fork` / `exec` / `shell_exec`（进程管理）
+
+Docker 入口脚本 `docker-entrypoint.sh` 也只是设置文件权限和启动 Apache，无 cron 配置。
+
+### 18.7 社区常见的定时任务实现方式（项目外）
+
+虽然项目本身没有，但 RSS-Bridge 的用户社区通常通过外部工具实现定时刷新：
+
+| 方式 | 说明 |
+|-----|------|
+| `cron + curl` | 定时 curl 抓取 Feed URL，触发缓存更新 |
+| `systemd timer` | 类似 cron 的 systemd 单元 |
+| Feed 阅读器 | 读者的 RSS 阅读器定期拉取，自然触发 |
+| `watchtower` / 类似工具 | 监控更新通知 |
+
+这些都在 RSS-Bridge 代码库之外。
+
+---
+
+## 十九、扩展：若要实现真正的 i18n
 
 当前项目无多语言能力。若需接入 i18n，需在以下位置做改造：
 
