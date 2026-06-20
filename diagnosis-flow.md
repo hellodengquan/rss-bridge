@@ -227,6 +227,66 @@ middlewares/CacheMiddleware.php:14-63
 
 **文件：** `actions/DisplayAction.php`
 
+### 4.0 代理服务器配置注入链路
+
+代理配置从 `config.ini.php` 到 curl 执行的完整路径分三层传递，每层都有开关条件：
+
+```
+config.default.ini.php:93-106  [proxy] 配置段
+  ├─ proxy.url       = ""      // 代理地址，如 "tcp://192.168.0.1:8080"
+  ├─ proxy.name      = "Hidden proxy name"  // 前端显示名
+  └─ proxy.by_bridge = false   // 是否允许用户单请求关闭代理
+       │
+       ▼
+Configuration::loadConfiguration()
+  └─ 校验 proxy.url 必须为 string、proxy.by_bridge 必须为 bool、proxy.name 必须为 string
+       │
+       ▼
+DisplayAction::__invoke() 前置开关 (actions/DisplayAction.php:40-48)
+  if (proxy.url 配置了          // 有代理
+      && proxy.by_bridge=true   // 允许用户关
+      && _noproxy 参数存在)     // 用户明确要求跳过
+  {
+      define('NOPROXY', true);  // 定义常量，全局生效
+  }
+       │
+       ▼
+getContents() 函数注入 (lib/contents.php:100-102)
+  if (Configuration::getConfig('proxy', 'url') && !defined('NOPROXY')) {
+      $config['proxy'] = Configuration::getConfig('proxy', 'url');
+  }
+  // 注意：这里 proxy.url 为空时即使定义了 NOPROXY 也不会走代理（双重保险）
+       │
+       ▼
+CurlHttpClient::request() 默认值合并 (lib/http.php:69-74)
+  'proxy' => null,  // 默认不使用代理，被上面 $config 覆盖
+       │
+       ▼
+cURL 选项设置 (lib/http.php:133-134)
+  if ($config['proxy']) {
+      curl_setopt($ch, CURLOPT_PROXY, $config['proxy']);
+  }
+```
+
+**三个关键边界条件（任意一个不满足就不走代理）：**
+
+| 条件 | 说明 | 控制方 |
+|-----|------|-------|
+| `Configuration::getConfig('proxy', 'url')` 非空 | 运维必须在 config.ini.php 配置了代理地址 | 运维/服务器管理员 |
+| `!defined('NOPROXY')` | 当前请求没有被定义为跳过代理 | 用户 + 运维共同控制 |
+| `proxy.by_bridge = true` 时才接受 `_noproxy` 参数 | 运维可以锁死所有请求必须走代理 | 运维 |
+
+**对桥接器抓取链路的影响：**
+- **全链路生效**：`getContents()` / `getSimpleHTMLDOM()` / `getSimpleHTMLDOMCached()` 三个 API 都走同一套配置，不存在"某个请求不走代理"的可能（桥接器代码中绕过 getContents 自建 curl 的除外）
+- **缓存与代理解耦**：缓存 key 是 `server_{url}`，不包含代理地址。**这意味着切换代理配置后，旧缓存会被直接复用，不会重新抓取。** 如果需要强制换新代理抓，必须手动清理缓存或改 URL 参数。
+- **特殊桥接器（PixivBridge）**：PixivBridge 的 `proxy_url` 配置项是**图像代理**，不是 HTTP 请求代理。它用于将 `https://i.pximg.net/xxx.png` 重写为 `https://proxy.example.com/xxx.png`，解决图片防盗链问题，与 CURLOPT_PROXY 的 HTTP CONNECT 隧道代理是两套机制。
+
+**前端 UI 开关（FrontpageAction）：**
+```
+actions/FrontpageAction.php:62-72
+```
+只有当 `proxy.url` 和 `proxy.by_bridge` 同时为 true 时，才会在桥接器表单上渲染一个 `_noproxy` 复选框，显示名为 `Disable proxy ({proxy.name})`。用户勾选后会在请求参数里带上 `_noproxy=on`。
+
 ### 4.1 桥接器执行与错误分类
 
 ```
@@ -271,6 +331,105 @@ actions/DisplayAction.php:107, 114-123
 - **`http`**：直接返回 HTTP 500 错误页面
 
 - **`none`**：静默，返回空 feed
+
+### 4.3.1 错误反馈链接：GitHub Issue URL 生成、脱敏与提交流程
+
+当 `error.output = feed` 时，错误条目中会内嵌"Find similar bugs"和"Create GitHub Issue"两个按钮。这两个链接的完整生成与脱敏链路如下：
+
+```
+DisplayAction::createFeedItemFromException()  (actions/DisplayAction.php:146-170)
+  │
+  ├─ 嵌套渲染 bridge-error.html.php 模板
+  │    ├─ $error    = 渲染 exception.html.php（异常详情）
+  │    ├─ $searchUrl = createGithubSearchUrl()
+  │    ├─ $issueUrl  = createGithubIssueUrl()
+  │    └─ $maintainer = $bridge->getMaintainer()
+  │
+  ▼
+DisplayAction::createGithubSearchUrl()  (actions/DisplayAction.php:223-229)
+  return 'https://github.com/RSS-Bridge/rss-bridge/issues?q='
+       . urlencode('is:issue is:open ' . $bridge->getName())
+  // 构造搜索条件：只搜索该桥接器名称相关的 open issue
+  // 注意：这里 bridge->getName() 来自桥接器类定义，不含用户输入
+       │
+       ▼
+DisplayAction::createGithubIssueUrl()  (actions/DisplayAction.php:193-221)
+  │
+  ├─ 提取维护者列表（逗号分隔，trim 去空白）
+  │
+  ├─ 组装 GitHub /issues/new query：
+  │    ├─ title  = "{BridgeName} failed with: {异常消息}"
+  │    ├─ labels = "Bridge-Broken"
+  │    ├─ assignee = 第一个维护者的 GitHub handle
+  │    └─ body（核心脱敏流程，见下）
+  │
+  └─ return 'https://github.com/RSS-Bridge/rss-bridge/issues/new?'
+          . http_build_query($query)
+```
+
+**body 内容的脱敏与组装清单（按写入顺序）：**
+
+| 字段 | 来源 | 脱敏处理 | 说明 |
+|-----|------|---------|------|
+| 异常消息 | `create_sane_exception_message($e)` | `sanitize_root()` 移除服务器绝对路径 | lib/utils.php:53-64 |
+| 调用栈 | `trace_to_call_points(trace_from_exception($e))` | 每帧 file 路径都经 `sanitize_root()` 脱敏 | lib/utils.php:72-122 |
+| Query String | `$_SERVER['QUERY_STRING']` | **直接写入，无脱敏** ⚠️ | 可能包含用户敏感参数 |
+| 版本号 | `Configuration::getVersion()` | 系统常量，无敏感 | |
+| 操作系统 | `PHP_OS_FAMILY` | 系统常量，无敏感 | |
+| PHP 版本 | `phpversion()` | 系统常量，无敏感 | |
+| 维护者 | `$bridge->getMaintainer()` | 来自桥接器类定义，无用户输入 | 以 `@user` 格式引用 |
+
+**模板层的二次转义保护：**
+
+错误条目最终嵌入 feed 条目 content，经过两层转义：
+
+```
+第一层：exception.html.php 模板
+  templates/exception.html.php:103 - <?= e(sanitize_root($e->getMessage())) ?>
+  templates/exception.html.php:107 - <?= e(sanitize_root($e->getFile())) ?>
+  // e() = htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+  // sanitize_root() = 移除项目根目录绝对路径前缀
+
+第二层：bridge-error.html.php 模板
+  templates/bridge-error.html.php:2  - <?= raw($error) ?>        // raw() 不转义（因为上层已经 e() 过）
+  templates/bridge-error.html.php:4  - <?= raw($searchUrl) ?>    // URL 经 urlencode() 过
+  templates/bridge-error.html.php:8  - <?= raw($issueUrl) ?>     // URL 经 http_build_query() 过
+  templates/bridge-error.html.php:13 - <?= e($maintainer) ?>     // 维护者名字仍转义
+```
+
+**用户输入的参数在错误反馈中的流转（完整链路）：**
+
+```
+用户 URL 参数（如 ?bridge=X&user=secret&password=123）
+    │
+    ├─ 存入 Request 对象 → DisplayAction 传给 bridge
+    │
+    ├─ 异常抛出时：异常消息可能包含参数（由桥接器自行决定）
+    │   └─ 经 sanitize_root() + e() 转义后显示在异常页面
+    │
+    ├─ $_SERVER['QUERY_STRING'] 原样进入 GitHub Issue body
+    │   └─ ⚠️ 如果 URL 中包含敏感参数（如 API token），
+    │       用户点击 "Create GitHub Issue" 时会带到 GitHub issue
+    │       用户可在提交前手动修改/删除
+    │
+    └─ 缓存层不存：错误计数缓存 key 是 error_reporting_{bridgeName}_{errorCode}，
+                    不含用户参数，不会将用户输入持久化
+```
+
+**ParameterValidator 层的输入验证（桥接器参数层面）：**
+```
+lib/ParameterValidator.php:8-59
+```
+桥接器声明的参数（PARAMETERS 常量）在被 bridge 使用前，会经 `ParameterValidator::validateInput()` 校验：
+
+| 参数类型 | 校验方式 | 非法处理 |
+|---------|---------|---------|
+| text | `filter_var($value)` 或正则匹配 | → null |
+| number | `FILTER_VALIDATE_INT` | → null |
+| checkbox | `FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE` | → null |
+| list | `filter_var` + `in_array($expectedValues)` | → null |
+
+校验失败的参数会置 null 并加入错误列表，但**不会阻止异常消息中携带原始用户输入**（异常抛出在校验之前/之外）。
 
 ### 4.4 响应缓存写入
 
@@ -667,11 +826,181 @@ DisplayAction 缓存 TTL 决策 (actions/DisplayAction.php:57-63)
 
 ---
 
-## 七、辅助工具函数
+## 七、输出格式系统（RSS / Atom / MRSS 切换
+
+**文件：** `lib/FormatFactory.php`, `lib/FormatAbstract.php`, `formats/`
+
+### 7.1 格式选择与注入入口
+
+格式切换从 URL 参数 `format=` 进入，到渲染输出的完整链路：
+
+```
+DisplayAction::createResponse()  (actions/DisplayAction.php:126-143)
+  │
+  ├─ $format = $request->get('format')   // 从 URL 参数提取
+  │
+  ├─ $formatFactory = new FormatFactory()
+  │    └─ 构造时扫描 formats/ 目录，匹配 *Format.php 文件
+  │
+  ├─ $format = $formatFactory->create($format)
+  │    │
+  │    ├─ 正则校验：/^[a-zA-Z0-9-]*$/（非法字符直接 InvalidArgumentException）
+  │    ├─ sanitizeName():
+  │    │    ├─ ucfirst(strtolower($name))  // 大小写不敏感
+  │    │    ├─ 去掉尾缀 .php 或 Format
+  │    │    └─ 与已知格式名白名单对比
+  │    └─ 匹配成功 → 实例化 \XxxFormat::class
+  │    └─ 不匹配 → throw "Unknown format given"
+  │
+  ├─ $format->setItems($items)          // 写入 items（FeedItem[]）
+  ├─ $format->setFeed($bridge->getFeed())
+  ├─ $format->setLastModified(time())
+  │
+  ├─ Response Headers:
+  │    ├─ Content-Type: {format->getMimeType()}; charset=UTF-8
+  │    └─ Last-Modified: {GMT时间}
+  │
+  └─ $body = $format->render()            // 各格式自定义渲染
+```
+
+**FormatFactory 的白名单来源：
+```
+lib/FormatFactory.php:9-16
+```
+- 扫描 `formats/` 目录，正则 `/^([^.]+)Format\.php$/U`
+- 自动发现所有 *Format.php 文件，排序后作为可用格式列表
+- 当前 6 种格式：Atom / Html / Json / Mrss / Plaintext / Sfeed
+
+### 7.2 六种格式实现对比与差异分支
+
+所有格式继承自 FormatAbstract，共享 setFeed/setItems/setLastModified，差异仅在 render() 方法。
+
+| 格式 | MIME Type | 输出结构 | 特有分支逻辑 |
+|-----|-----------|----------|-------------|
+| **MrssFormat** | `application/rss+xml` | RSS 2.0 + Media RSS 命名空间 | 根节点 `<rss version="2.0">` → `<channel>` → `<item>` |
+| **AtomFormat** | `application/atom+xml` | RFC 4287 Atom | 根节点 `<feed xmlns="http://www.w3.org/2005/Atom">` → `<entry>` |
+| **JsonFormat** | `application/json` | JSON Feed 1.0 | 字段映射：title→title, uri→url, categories→tags, enclosures→attachments |
+| **HtmlFormat** | `text/html` | HTML 网页 | 渲染 html-format.html.php 模板，还会列出其他所有格式的链接 |
+| **PlaintextFormat** | `text/plain` | PHP print_r 调试输出 | `print_r($feed, true)`，最简单的字符串 |
+| **SfeedFormat** | `text/plain` | Sfeed 制表符分隔 | `timestamp\ttitle\turi\tcontent\thtml\t\tenclosure\tauthor\tenclosure\tcategories` 一行一条 |
+
+### 7.3 MrssFormat 与 AtomFormat 核心差异分支
+
+**MRSS（RSS 2.0 + Media RSS）：
+
+**A. 命名空间声明差异：
+
+```
+MrssFormat.php:40-44
+  <rss version="2.0" xmlns:atom="..." xmlns:media="http://search.yahoo.com/mrss/">
+    <channel>
+AtomFormat.php:24-26
+  <feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="...">
+```
+
+**B. 日期格式差异：**
+
+```
+MrssFormat.php:169-171  pubDate → gmdate(DATE_RFC2822, $timestamp)
+  // 例: Mon, 15 Aug 2005 15:16:00 +0000
+
+AtomFormat.php:130-139  published / updated → gmdate(DATE_ATOM, $timestamp)
+  // 例: 2005-08-15T15:16:00+00:00
+```
+
+**C. 条目 ID 处理分支：
+
+```
+MrssFormat.php:120-129  <guid isPermaLink="false">
+  ├─ uid 存在 → 直接使用 uid，isPermaLink="false"
+  ├─ uid 不存在但有 uri → 用 uri，isPermaLink="true"
+  └─ 都没有 → sha1(title + content)
+
+AtomFormat.php:96-108  <id>
+  ├─ uid 存在 → urn:sha1:{uid}
+  ├─ 有 uri → 直接用 uri
+  └─ 都没有 → urn:sha1:{hash(title+content)}
+```
+
+**D. Feed 级 icon 分支：
+
+```
+MrssFormat.php:82-96  icon 映射到 <image><url><title><link>（RSS 标准 image 元素
+  AtomFormat.php:38-46  icon → <icon> + <logo> 两个独立元素
+```
+
+**E. enclosure 分支（两者的 enclosure 都用 Media RSS 命名空间：**
+
+```
+MrssFormat.php:180-185  <media:content url="..." type="..."> （MRSS 支持多 enclosure）
+AtomFormat.php:181-187  <link rel="enclosure" type="..." href="..."> （Atom 原生 enclosure）
+```
+
+**两者共同点（相同字段缺失降级：**
+- 两者都支持 iTunes 播客扩展（itunes 命名空间 + enclosure 属性
+- thumbnail 字段有值时都注入 `xmlns:media="http://search.yahoo.com/mrss/
+
+### 7.4 特殊字段的条件分支
+
+**iTunes 播客命名空间（条件触发：**
+
+仅当 Feed 或 item 中存在 `itunes` 字段时，两种格式都会动态添加 `xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd` 命名空间：
+
+```
+MrssFormat.php:97-103 (channel级 itunes 字段 → 加命名空间 + 逐项输出
+MrssFormat.php:140-155  item  item 级 itunes 字段
+AtomFormat.php:62-64 + 146-159 同理
+```
+
+注意：AtomFormat 的 Feed 级 itunes 字段的 `// todo: skip? 注释说明这部分可能还没实现暂未渲染，仅 item 级 itunes 有效。
+
+**thumbnail 缩略图：**
+
+item 有 thumbnail 字段时：
+- MrssFormat：目前未单独输出（代码中没有 thumbnail 逻辑缺失（看 item 没有缩略图目前两个格式都支持但 AtomFormat.php:195-199 `<media:thumbnail url="...">
+
+### 7.5 FeedItem 字段过滤与容错
+
+FeedItem 类是格式的 setter 自带严格过滤，会过滤后传给所有格式共享：
+
+```
+lib/FeedItem.php
+```
+
+| 字段 | 输入过滤逻辑 |
+|-----|---------|
+| uri | 必须 `https?:// 开头，否则丢弃 |
+| title | truncate() 截断到 150 字符 |
+| timestamp | 数字或 strtotime() 解析失败则丢弃 |
+| author | 仅字符串直接用 |
+| content | HTML DOM 节点自动转 string |
+| enclosures | 必须通过 FILTER_VALIDATE_URL |
+| uid | 已有 sha1 原样保留，否则对输入做 sha1 哈希 |
+| 其他字段 | 存入 misc 数组，JSON 格式单独输出 |
+
+JsonFormat 的额外的 misc 字段单独输出为 `_rssbridge` vendor 前缀命名空间；XML 格式通过 `toArray()['misc']` 合并输出。
+
+### 7.6 Content-Type 与输出
+
+最终通过 `$format->getMimeType()`：
+
+- `FormatAbstract` 通过 `static::MIME_TYPE` 常量定义，各格式覆盖：
+
+| 格式 | MIME |
+|-----|------|
+| Mrss | application/rss+xml |
+| Atom | application/atom+xml |
+| Json | application/json |
+| Html | text/html |
+| Plaintext/Sfeed | text/plain |
+
+---
+
+## 八、辅助工具函数
 
 **文件：** `lib/utils.php`
 
-### 7.1 路径脱敏
+### 8.1 路径脱敏
 
 ```
 lib/utils.php:129-140
@@ -679,7 +1008,7 @@ lib/utils.php:129-140
 
 `sanitize_root()` - 移除文件路径中的项目根目录前缀，避免泄露服务器路径信息。
 
-### 7.2 异常栈格式化
+### 8.2 异常栈格式化
 
 ```
 lib/utils.php:72-122
@@ -689,7 +1018,7 @@ lib/utils.php:72-122
 - `trace_to_call_points()` - 将栈帧转换为可读的调用点字符串数组
 - `frame_to_call_point()` - 单帧格式化：`文件(行号): 类->方法()`
 
-### 7.3 异常类型
+### 8.3 异常类型
 
 ```
 lib/utils.php:250-283
@@ -702,7 +1031,7 @@ lib/utils.php:250-283
 
 ---
 
-## 八、完整调用链路总结
+## 九、完整调用链路总结
 
 ```
 HTTP 请求
@@ -729,15 +1058,30 @@ index.php
        ▼
   DisplayAction
     ├─ 校验参数
+    ├─ ★ 代理前置开关：proxy.url + proxy.by_bridge + _noproxy 参数
+    │   └─ 命中 → define('NOPROXY', true)  后续所有 getContents 跳过代理
     ├─ 创建 Bridge 实例
     ├─ try { bridge->collectData() }
-    │   ├─ 成功 → 渲染 feed → 写入缓存
+    │   ├─ 成功：
+    │   │   ├─ items 传入 FeedItem（字段 URI/标题/时间等严格过滤）
+    │   │   └─ ★ 格式切换：format= 参数 → FormatFactory 白名单校验 → 实例化对应 Format
+    │   │       ├─ setItems/setFeed/setLastModified
+    │   │       ├─ Response Header: Content-Type = Format::MIME_TYPE
+    │   │       └─ $format->render()  (Mrss / Atom / Json / Html / Plaintext / Sfeed)
+    │   │           └─ 写入缓存（200 响应 + TTL）
     │   └─ 失败 → 按异常类型分级处理
     │       ├─ ClientException → DEBUG 日志
     │       ├─ RateLimitException → DEBUG 日志 + 429
     │       ├─ HttpException(429/503) → DEBUG 日志 + 对应状态码
     │       └─ 其他 → ERROR 日志 + 错误报告计数
-    │           └─ 达阈值 → 按 error.output 策略输出
+    │           └─ 达阈值 → 按 error.output 策略
+    │               ├─ feed：包装为 FeedItem
+    │               │   └─ ★ 错误反馈：createGithubIssueUrl() 生成 issue 链接
+    │               │       ├─ 异常消息 + 调用栈（sanitize_root() 脱敏）
+    │               │       ├─ $_SERVER['QUERY_STRING']（原样无脱敏 ⚠️）
+    │               │       └─ 版本/OS/PHP/维护者信息
+    │               ├─ http：500 异常页面
+    │               └─ none：静默空 feed
     └─ 返回 Response
        │
        ▼
@@ -751,7 +1095,7 @@ index.php
 
 ---
 
-## 九、关键配置项速查
+## 十、关键配置项速查
 
 | 配置项 | 默认值 | 说明 |
 |-------|-------|------|
@@ -773,3 +1117,7 @@ index.php
 | `SQLiteCache.enable_purge` | `true` | prune() 是否真正执行 DELETE SQL |
 | `MemcachedCache.host` | `localhost` | Memcached 服务地址 |
 | `MemcachedCache.port` | `11211` | Memcached 服务端口 |
+| `proxy.url` | `""` | HTTP 代理地址，如 "tcp://192.168.0.1:8080"。空表示不使用代理。通过 CURLOPT_PROXY 注入所有桥接器请求 |
+| `proxy.name` | `"Hidden proxy name"` | 前端 UI 上显示的代理名称，仅用于 FrontpageAction 的 _noproxy 复选框文案 |
+| `proxy.by_bridge` | `false` | 是否允许用户单请求关闭代理。true 时 URL 上带 `_noproxy=on` 即可跳过代理 |
+
