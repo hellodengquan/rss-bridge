@@ -443,11 +443,196 @@ actions/DisplayAction.php:50, 56-64
 
 ---
 
-## 五、缓存系统详解
+## 五、桥接器体系：开发骨架、调用频率与监控告警
+
+**文件：** `lib/BridgeAbstract.php`, `lib/XPathAbstract.php`, `actions/HealthAction.php`, `actions/ConnectivityAction.php`
+
+### 5.1 自定义 Bridge 开发骨架
+
+所有桥接器继承自 `BridgeAbstract` 抽象基类，没有独立的 Interface 接口。开发一个新 bridge 的最小骨架与可选扩展如下：
+
+**必须实现的唯一抽象方法：**
+```
+lib/BridgeAbstract.php:50
+  abstract public function collectData();
+```
+这是唯一强制要求实现的方法。核心逻辑在这里完成，最后把结果 push 到 `$this->items[]` 数组中。
+
+**类常量（全部可选，有默认值）：**
+
+| 常量 | 默认值 | 作用 |
+|-----|-------|------|
+| `NAME` | null（回退到类名） | feed 标题 / 前端显示名 |
+| `URI` | null（回退到 GitHub 仓库） | 源站 URL / feed 的 link 字段 |
+| `DESCRIPTION` | `'No description provided'` | 前端桥接器卡片描述 |
+| `MAINTAINER` | `'No maintainer'` | 维护者 GitHub 用户名（逗号分隔多个） |
+| `CACHE_TIMEOUT` | `3600`（1 小时） | 响应缓存 TTL（秒） |
+| `DONATION_URI` | `''` | 捐赠链接（需 admin.donations 开启才显示） |
+| `CONFIGURATION` | `[]` | 桥接器级配置项（从 config.ini.php 对应 section 读取） |
+| `PARAMETERS` | `[]` | 用户可配置参数（前端表单渲染 + 后端校验） |
+| `TEST_DETECT_PARAMETERS` | `[]` | feed 自动检测测试用参数 |
+
+**构造函数依赖注入：**
+```
+lib/BridgeAbstract.php:42-48
+```
+构造时自动注入两个服务，桥接器代码可直接使用：
+- `$this->cache` - `CacheInterface` 实例，用于桥接器内部缓存
+- `$this->logger` - `Logger` 实例，用于记录日志
+
+**可直接调用的受保护/公共方法（钩子与工具）：**
+
+| 方法 | 作用 | 典型场景 |
+|-----|------|---------|
+| `$this->getInput($name)` | 获取用户输入参数（已校验+默认值已填充） | 读取用户配置 |
+| `$this->loadCacheValue($key, $default)` | 读取桥接器内部缓存（key 自动加桥接短名前缀） | 持久化状态数据 |
+| `$this->saveCacheValue($key, $value, $ttl)` | 写入桥接器内部缓存，默认 TTL 86400 秒 | 存储 token、分页游标等 |
+| `$this->getKey($input)` | 获取 list 类型参数的 key（不是 value） | 处理枚举类型参数 |
+| `$this->getOption($name)` | 读取 CONFIGURATION 中声明的配置项 | 读取桥接器级配置 |
+| `$this->getShortName()` | 获取类名短名（ReflectionClass） | 用于日志、缓存 key |
+| `$this->detectParameters($url)` | 自动检测 feed 参数（FrontendAction 用） | 从 URL 自动识别 |
+
+**PARAMETERS 声明规范（前端表单 + 后端校验共用）：**
+
+```
+lib/ParameterValidator.php  四种参数类型：
+  ├─ text      → 字符串，可配 pattern 正则校验
+  ├─ number    → 整数，FILTER_VALIDATE_INT
+  ├─ checkbox  → 布尔，FILTER_VALIDATE_BOOLEAN
+  └─ list      → 枚举，值必须在 values 白名单内
+```
+
+支持 `global` 上下文 + 多上下文（context），global 参数所有上下文共享。
+
+**基类选择：BridgeAbstract vs XPathAbstract**
+
+除了直接继承 `BridgeAbstract`，还可以继承 `XPathAbstract`（又一层基类），只需声明 XPath 表达式常量就能生成 feed，无需手写 collectData：
+
+```
+lib/XPathAbstract.php:18-100+
+  ├─ FEED_SOURCE_URL              → 源站 URL
+  ├─ XPATH_EXPRESSION_ITEM        → 条目列表 XPath
+  ├─ XPATH_EXPRESSION_ITEM_TITLE  → 标题 XPath
+  ├─ XPATH_EXPRESSION_ITEM_CONTENT → 内容 XPath
+  ├─ XPATH_EXPRESSION_ITEM_URI    → 链接 XPath
+  ├─ XPATH_EXPRESSION_ITEM_AUTHOR → 作者 XPath
+  └─ XPATH_EXPRESSION_ITEM_TIMESTAMP → 时间 XPath
+```
+所有 getExpression*() 方法都可 override 实现动态 XPath。
+
+**桥接器生命周期完整调用顺序：**
+```
+DisplayAction::__invoke()
+  ├─ bridgeFactory->create()      → new XxxBridge($cache, $logger)
+  ├─ $bridge->loadConfiguration()  → 读取 CONFIGURATION 对应 section 的配置
+  │                                   （required 配置缺失直接抛异常）
+  ├─ $bridge->setInput($input)    → ParameterValidator 校验参数
+  │                                   → 推断 context → 填充默认值 → 存入 $this->inputs
+  └─ $bridge->collectData()       → 核心采集逻辑，向 $this->items 添加条目
+      └─ 内部可调用 getContents() / getSimpleHTMLDOM() / loadCacheValue() 等
+```
+
+### 5.2 调用频率限制与并发控制
+
+**结论：系统层面没有全局频率限制和并发控制机制。** 两者都完全依赖缓存层的 TTL 来天然节流。
+
+**A. 无全局频率限制中间件**
+- `middlewares/` 目录下 6 个中间件，没有 RateLimitMiddleware
+- 没有按 IP 限流、按用户限流、按桥接器限流的任何代码
+- `RateLimitException` 完全是桥接器自己抛的，不是框架层拦截的
+
+**B. 无并发控制**
+- 没有信号量（semaphore）、互斥锁（mutex）、文件锁、数据库锁
+- 没有"同一 bridge 同一参数同一时刻只允许一个请求抓取"的保护
+- 高并发场景下可能出现缓存击穿：缓存过期瞬间多个请求同时穿透到源站
+
+**C. 天然的频率控制：缓存 TTL**
+唯一的频率限制来自缓存机制：
+```
+响应缓存 TTL（CACHE_TIMEOUT）→ TTL 内所有请求都命中缓存，不触达源站
+HTTP 请求内容缓存 TTL（10 天） → 相同 URL 10 天内不会重复请求
+```
+缓存命中率高时，实际到源站的请求频率 = `1 / TTL`（每桥接器每参数）。
+
+**D. 桥接器自定义限流（软熔断模式）**
+部分对限流敏感的桥接器自己实现了软熔断机制，统一模式为：
+
+```
+模式：失败 → 写缓存标记 + TTL → 下次请求先查缓存 → 有标记直接抛 RateLimitException
+
+典型实现：
+  SpotifyBridge:  429 响应 → 读 Retry-After 头 → 缓存 spotify_rate_limit
+  RedditBridge:   检测 X-Ratelimit-Remaining=0 → 缓存 reddit_rate_limit 61 分钟
+  Vk2Bridge:      连续失败计数阶梯式缓存 5 秒/30 分钟
+```
+这些都是**桥接器各自实现**的，框架层不提供统一封装。
+
+**E. 潜在的并发问题：缓存击穿**
+- 缓存过期瞬间，N 个并发请求同时穿透到源站
+- 没有 single-flight / 锁机制来合并请求
+- 对于高流量站点，可能在缓存到期瞬间触发对方限流
+- 缓解方式：CacheMiddleware 中 5~15 分钟随机 TTL（对错误响应），以及桥接器可以自己加随机抖动
+
+### 5.3 告警与监控：Health Endpoint 与日志
+
+系统提供**两个健康检查入口**，但**没有 Sentry / NewRelic / Datadog 等 APM 集成**。所有监控完全依赖日志输出。
+
+**A. Health Action（健康检查端点）**
+```
+actions/HealthAction.php:5-14
+  URL: ?action=health
+  响应: {"code":200,"message":"all is good"}
+  状态码: 200
+  Content-Type: application/json
+```
+- **极简实现**：不检查缓存、不检查数据库、不检查任何依赖
+- 只表示 PHP 进程还活着、能正常响应请求
+- 可用于 K8s livenessProbe / 负载均衡健康检查
+- 没有鉴权，公开访问
+
+**B. Connectivity Action（桥接器连通性检测）**
+```
+actions/ConnectivityAction.php:13-66
+  URL: ?action=Connectivity            → 返回连通性检测页面（JS 逐个检测）
+  URL: ?action=Connectivity&bridge=Xxx → 检测单个桥接器的源站连通性
+  权限: 仅 dev 环境可用（prod 环境返回 403）
+```
+单个桥接器检测逻辑：
+1. 用 `getContents($bridge::URI, [], [CURLOPT_CONNECTTIMEOUT => 5], true)` 发请求
+2. 200 状态码 → `successful = true`
+3. 其他状态码或异常 → `successful = false`，返回 http_code
+4. 结果以 JSON 返回
+- 仅检测**首页连通性**，不验证桥接器功能是否正常
+- 连接超时固定 5 秒，不受 `http.timeout` 配置影响
+
+**C. 无 Sentry / APM 集成**
+- 代码中搜索不到任何 `sentry` / `newrelic` / `datadog` / `statsd` / `prometheus` 引用
+- 没有异常自动上报第三方服务的机制
+- 所有告警只能通过日志系统（error_log 或文件日志）对接外部监控
+
+**D. 错误报告阈值（伪告警）**
+```
+actions/DisplayAction.php:108-112 + error.report_limit 配置
+```
+`error.report_limit` 可以控制错误向**终端用户**展示的阈值（比如连续 3 次失败才显示错误），但这是面向用户的展示策略，不是面向运维的告警机制。
+
+**E. 日志即告警**
+运维侧告警的唯一接入点是 Logger：
+```
+lib/logger.php: SimpleLogger + StreamHandler
+  ├─ ERROR 级别 → 桥接器崩溃、未捕获异常
+  ├─ WARNING 级别 → 缓存反序列化失败、缓存写入失败、PHP 运行时警告
+  └─ INFO/DEBUG 级别 → 正常业务信息
+```
+可以通过配置 `logging.file_path` + `logging.file_level` 把日志写到文件，再用 Filebeat/Fluentd 采集到 ELK/Loki 等系统设置告警规则。
+
+---
+
+## 六、缓存系统详解
 
 **文件：** `lib/CacheInterface.php`, `lib/CacheFactory.php`, `caches/`
 
-### 5.1 缓存接口
+### 6.1 缓存接口
 
 ```
 lib/CacheInterface.php:3-14
@@ -460,7 +645,7 @@ lib/CacheInterface.php:3-14
 - `clear()` - 清空全部
 - `prune()` - 清理过期项
 
-### 5.2 缓存工厂
+### 6.2 缓存工厂
 
 ```
 lib/CacheFactory.php:15-110
@@ -473,7 +658,7 @@ lib/CacheFactory.php:15-110
 - `memcached` → `MemcachedCache` - Memcached 分布式缓存
 - `array` → `ArrayCache` - 内存数组缓存（单次请求内有效）
 
-### 5.3 FileCache 实现
+### 6.3 FileCache 实现
 
 ```
 caches/FileCache.php
@@ -500,7 +685,7 @@ caches/FileCache.php
 - 检查过期时间，删除已过期文件
 - 反序列化失败的文件也会被清理
 
-### 5.4 缓存的三种使用场景
+### 6.4 缓存的四种使用场景
 
 **场景 1：HTTP 响应缓存**（CacheMiddleware + DisplayAction）
 - Key 格式：`http_{请求参数JSON}`
@@ -522,7 +707,7 @@ caches/FileCache.php
 - Key 格式：`error_reporting_{bridgeName}_{errorCode}`
 - TTL：5 天
 
-### 5.5 缓存键失效与强制刷新的完整触发条件
+### 6.5 缓存键失效与强制刷新的完整触发条件
 
 系统中缓存失效分为 **自然过期**、**被动清理**、**主动清理**、**不写入即不缓存** 四种模式。以下是所有触发条件的完整清单：
 
@@ -648,7 +833,7 @@ bridges/Vk2Bridge.php:196-323
 ```
 这些缓存条目的失效 = 下次可以正常请求，是"软熔断"机制。它们的 TTL 由对方服务的响应头决定，不是配置文件的固定值。
 
-### 5.6 五种缓存实现的行为差异汇总
+### 6.6 五种缓存实现的行为差异汇总
 
 | 维度 | NullCache | ArrayCache | FileCache | SQLiteCache | MemcachedCache |
 |-----|----------|-----------|-----------|-------------|----------------|
@@ -663,11 +848,11 @@ bridges/Vk2Bridge.php:196-323
 
 ---
 
-## 六、HTTP 层：请求与错误
+## 七、HTTP 层：请求与错误
 
 **文件：** `lib/http.php`, `lib/contents.php`
 
-### 6.1 HTTP 异常体系
+### 7.1 HTTP 异常体系
 
 ```
 lib/http.php:6-56
@@ -681,7 +866,7 @@ lib/http.php:6-56
 - 通过响应体中的 `<title>` 标签判断
 - 识别标题："Just a moment..."、"Please Wait..."、"Attention Required!" 等
 
-### 6.2 getContents 缓存逻辑
+### 7.2 getContents 缓存逻辑
 
 ```
 lib/contents.php:36-138
@@ -698,7 +883,7 @@ lib/contents.php:36-138
 - 301/302/303：暂不缓存（todo）
 - 其他：抛出 `HttpException`
 
-### 6.3 CurlHttpClient 超时与重试的完整代码路径
+### 7.3 CurlHttpClient 超时与重试的完整代码路径
 
 桥接器通过 `getContents()` / `getSimpleHTMLDOM()` / `getSimpleHTMLDOMCached()` 发起 HTTP 请求，超时与重试参数从配置到 curl 执行的完整链路如下：
 
@@ -787,7 +972,7 @@ bridges/RedditBridge.php:119-137  // 类似模式：检测 X-Ratelimit-Remaining
 bridges/Vk2Bridge.php:196-323     // 限流标记缓存 5 秒/30 分钟两级
 ```
 
-### 6.4 缓存超时 TTL 的完整传递路径
+### 7.4 缓存超时 TTL 的完整传递路径
 
 除了 HTTP 请求超时，**缓存超时（TTL）** 也是另一个"时间"相关的关键参数。它控制缓存条目多久后失效：
 
@@ -826,11 +1011,11 @@ DisplayAction 缓存 TTL 决策 (actions/DisplayAction.php:57-63)
 
 ---
 
-## 七、输出格式系统（RSS / Atom / MRSS 切换
+## 八、输出格式系统（RSS / Atom / MRSS 切换
 
 **文件：** `lib/FormatFactory.php`, `lib/FormatAbstract.php`, `formats/`
 
-### 7.1 格式选择与注入入口
+### 8.1 格式选择与注入入口
 
 格式切换从 URL 参数 `format=` 进入，到渲染输出的完整链路：
 
@@ -871,7 +1056,7 @@ lib/FormatFactory.php:9-16
 - 自动发现所有 *Format.php 文件，排序后作为可用格式列表
 - 当前 6 种格式：Atom / Html / Json / Mrss / Plaintext / Sfeed
 
-### 7.2 六种格式实现对比与差异分支
+### 8.2 六种格式实现对比与差异分支
 
 所有格式继承自 FormatAbstract，共享 setFeed/setItems/setLastModified，差异仅在 render() 方法。
 
@@ -884,7 +1069,7 @@ lib/FormatFactory.php:9-16
 | **PlaintextFormat** | `text/plain` | PHP print_r 调试输出 | `print_r($feed, true)`，最简单的字符串 |
 | **SfeedFormat** | `text/plain` | Sfeed 制表符分隔 | `timestamp\ttitle\turi\tcontent\thtml\t\tenclosure\tauthor\tenclosure\tcategories` 一行一条 |
 
-### 7.3 MrssFormat 与 AtomFormat 核心差异分支
+### 8.3 MrssFormat 与 AtomFormat 核心差异分支
 
 **MRSS（RSS 2.0 + Media RSS）：
 
@@ -940,7 +1125,7 @@ AtomFormat.php:181-187  <link rel="enclosure" type="..." href="..."> （Atom 原
 - 两者都支持 iTunes 播客扩展（itunes 命名空间 + enclosure 属性
 - thumbnail 字段有值时都注入 `xmlns:media="http://search.yahoo.com/mrss/
 
-### 7.4 特殊字段的条件分支
+### 8.4 特殊字段的条件分支
 
 **iTunes 播客命名空间（条件触发：**
 
@@ -959,7 +1144,7 @@ AtomFormat.php:62-64 + 146-159 同理
 item 有 thumbnail 字段时：
 - MrssFormat：目前未单独输出（代码中没有 thumbnail 逻辑缺失（看 item 没有缩略图目前两个格式都支持但 AtomFormat.php:195-199 `<media:thumbnail url="...">
 
-### 7.5 FeedItem 字段过滤与容错
+### 8.5 FeedItem 字段过滤与容错
 
 FeedItem 类是格式的 setter 自带严格过滤，会过滤后传给所有格式共享：
 
@@ -980,7 +1165,7 @@ lib/FeedItem.php
 
 JsonFormat 的额外的 misc 字段单独输出为 `_rssbridge` vendor 前缀命名空间；XML 格式通过 `toArray()['misc']` 合并输出。
 
-### 7.6 Content-Type 与输出
+### 8.6 Content-Type 与输出
 
 最终通过 `$format->getMimeType()`：
 
@@ -996,11 +1181,11 @@ JsonFormat 的额外的 misc 字段单独输出为 `_rssbridge` vendor 前缀命
 
 ---
 
-## 八、辅助工具函数
+## 九、辅助工具函数
 
 **文件：** `lib/utils.php`
 
-### 8.1 路径脱敏
+### 9.1 路径脱敏
 
 ```
 lib/utils.php:129-140
@@ -1008,7 +1193,7 @@ lib/utils.php:129-140
 
 `sanitize_root()` - 移除文件路径中的项目根目录前缀，避免泄露服务器路径信息。
 
-### 8.2 异常栈格式化
+### 9.2 异常栈格式化
 
 ```
 lib/utils.php:72-122
@@ -1018,7 +1203,7 @@ lib/utils.php:72-122
 - `trace_to_call_points()` - 将栈帧转换为可读的调用点字符串数组
 - `frame_to_call_point()` - 单帧格式化：`文件(行号): 类->方法()`
 
-### 8.3 异常类型
+### 9.3 异常类型
 
 ```
 lib/utils.php:250-283
@@ -1031,7 +1216,7 @@ lib/utils.php:250-283
 
 ---
 
-## 九、完整调用链路总结
+## 十、完整调用链路总结
 
 ```
 HTTP 请求
@@ -1095,7 +1280,7 @@ index.php
 
 ---
 
-## 十、关键配置项速查
+## 十一、关键配置项速查
 
 | 配置项 | 默认值 | 说明 |
 |-------|-------|------|
